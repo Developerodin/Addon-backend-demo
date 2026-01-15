@@ -1,14 +1,38 @@
 {
   "apps": [
     {
-      "name": "app",
+      "name": "addon-backend",
       "script": "src/index.js",
       "instances": 1,
       "autorestart": true,
       "watch": false,
+      "max_memory_restart": "1G",
       "time": true,
+      "error_file": "./logs/pm2-error.log",
+      "out_file": "./logs/pm2-out.log",
+      "log_date_format": "YYYY-MM-DD HH:mm:ss Z",
+      "merge_logs": true,
       "env": {
+        "NODE_ENV": "production"
+      },
+      "env_development": {
         "NODE_ENV": "development"
+      }
+    },
+    {
+      "name": "ngrok-tunnel",
+      "script": "ngrok",
+      "args": "http 3003 --log=stdout",
+      "instances": 1,
+      "autorestart": true,
+      "watch": false,
+      "time": true,
+      "error_file": "./logs/ngrok-error.log",
+      "out_file": "./logs/ngrok-out.log",
+      "log_date_format": "YYYY-MM-DD HH:mm:ss Z",
+      "merge_logs": true,
+      "env": {
+        "NGROK_AUTHTOKEN": ""
       }
     }
   ]
