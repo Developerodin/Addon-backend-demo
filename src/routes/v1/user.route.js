@@ -1,0 +1,594 @@
+import express from 'express';
+import auth from '../../middlewares/auth.js';
+import validate from '../../middlewares/validate.js';
+import * as userValidation from '../../validations/user.validation.js';
+import * as userController from '../../controllers/user.controller.js';
+
+const router = express.Router();
+
+router
+  .route('/')
+  .post(auth('manageUsers'), validate(userValidation.createUser), userController.createUser)
+  .get(auth('getUsers'), validate(userValidation.getUsers), userController.getUsers);
+
+router
+  .route('/me')
+  .get(auth(), userController.getCurrentUser);
+
+router
+  .route('/:userId')
+  .get(auth('getUsers'), validate(userValidation.getUser), userController.getUser)
+  .patch(auth('manageUsers'), validate(userValidation.updateUser), userController.updateUser)
+  .delete(auth('manageUsers'), validate(userValidation.deleteUser), userController.deleteUser);
+
+router
+  .route('/:userId/navigation')
+  .patch(auth('manageUsers'), validate(userValidation.updateUserNavigation), userController.updateUserNavigation);
+
+  export default router;
+
+/**
+ * @swagger
+ * tags:
+ *   name: Users
+ *   description: User management and retrieval
+ */
+
+/**
+ * @swagger
+ * /users:
+ *   post:
+ *     summary: Create a user
+ *     description: Only admins can create other users.
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - name
+ *               - email
+ *               - password
+ *               - role
+ *             properties:
+ *               name:
+ *                 type: string
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 description: must be unique
+ *               password:
+ *                 type: string
+ *                 format: password
+ *                 minLength: 8
+ *                 description: At least one number and one letter
+ *               role:
+ *                  type: string
+ *                  enum: [user, admin]
+ *               phoneNumber:
+ *                 type: string
+ *               profilePicture:
+ *                 type: string
+ *               dateOfBirth:
+ *                 type: string
+ *                 format: date
+ *               gender:
+ *                 type: string
+ *                 enum: [Male, Female, Other]
+ *               country:
+ *                 type: string
+ *               timezone:
+ *                 type: string
+ *                 default: UTC
+ *               navigation:
+ *                 type: object
+ *                 description: User navigation permissions
+ *                 properties:
+ *                   Dashboard:
+ *                     type: boolean
+ *                   Catalog:
+ *                     type: object
+ *                     properties:
+ *                       Items:
+ *                         type: boolean
+ *                       Categories:
+ *                         type: boolean
+ *                       'Raw Material':
+ *                         type: boolean
+ *                       Processes:
+ *                         type: boolean
+ *                       Attributes:
+ *                         type: boolean
+ *                       Machines:
+ *                         type: boolean
+ *                   Sales:
+ *                     type: object
+ *                     properties:
+ *                       'All Sales':
+ *                         type: boolean
+ *                       'Master Sales':
+ *                         type: boolean
+ *                   Stores:
+ *                     type: boolean
+ *                   Analytics:
+ *                     type: boolean
+ *                   'Replenishment Agent':
+ *                     type: boolean
+ *                   'File Manager':
+ *                     type: boolean
+ *                   Users:
+ *                     type: boolean
+ *                   'Production Planning':
+ *                     type: object
+ *                     properties:
+ *                       'Production Orders':
+ *                         type: boolean
+ *                       'Knitting Floor':
+ *                         type: boolean
+ *                       'Linking Floor':
+ *                         type: boolean
+ *                       'Checking Floor':
+ *                         type: boolean
+ *                       'Washing Floor':
+ *                         type: boolean
+ *                       'Boarding Floor':
+ *                         type: boolean
+ *                       'Final Checking Floor':
+ *                         type: boolean
+ *                       'Branding Floor':
+ *                         type: boolean
+ *                       'Warehouse Floor':
+ *                         type: boolean
+ *             example:
+ *               name: fake name
+ *               email: fake@example.com
+ *               password: password1
+ *               role: user
+ *               navigation:
+ *                 Dashboard: true
+ *                 Catalog:
+ *                   Items: true
+ *                   Categories: false
+ *                   'Raw Material': false
+ *                   Processes: false
+ *                   Attributes: false
+ *                   Machines: false
+ *                 Sales:
+ *                   'All Sales': true
+ *                   'Master Sales': false
+ *                 Stores: false
+ *                 Analytics: true
+ *                 'Replenishment Agent': false
+ *                 'File Manager': false
+ *                 Users: false
+ *                 'Production Planning':
+ *                   'Production Orders': false
+ *                   'Knitting Floor': false
+ *                   'Linking Floor': false
+ *                   'Checking Floor': false
+ *                   'Washing Floor': false
+ *                   'Boarding Floor': false
+ *                   'Final Checking Floor': false
+ *                   'Branding Floor': false
+ *                   'Warehouse Floor': false
+ *     responses:
+ *       "201":
+ *         description: Created
+ *         content:
+ *           application/json:
+ *             schema:
+ *                $ref: '#/components/schemas/User'
+ *       "400":
+ *         $ref: '#/components/responses/DuplicateEmail'
+ *       "401":
+ *         $ref: '#/components/responses/Unauthorized'
+ *       "403":
+ *         $ref: '#/components/responses/Forbidden'
+ *
+ *   get:
+ *     summary: Get all users
+ *     description: Only admins can retrieve all users.
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: name
+ *         schema:
+ *           type: string
+ *         description: User name
+ *       - in: query
+ *         name: role
+ *         schema:
+ *           type: string
+ *         description: User role
+ *       - in: query
+ *         name: sortBy
+ *         schema:
+ *           type: string
+ *         description: sort by query in the form of field:desc/asc (ex. name:asc)
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *         default: 10
+ *         description: Maximum number of users
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           default: 1
+ *         description: Page number
+ *     responses:
+ *       "200":
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 results:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/User'
+ *                 page:
+ *                   type: integer
+ *                   example: 1
+ *                 limit:
+ *                   type: integer
+ *                   example: 10
+ *                 totalPages:
+ *                   type: integer
+ *                   example: 1
+ *                 totalResults:
+ *                   type: integer
+ *                   example: 1
+ *       "401":
+ *         $ref: '#/components/responses/Unauthorized'
+ *       "403":
+ *         $ref: '#/components/responses/Forbidden'
+ */
+
+/**
+ * @swagger
+ * /users/me:
+ *   get:
+ *     summary: Get current user
+ *     description: Get the current logged-in user's information from JWT token
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       "200":
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *                $ref: '#/components/schemas/User'
+ *       "401":
+ *         $ref: '#/components/responses/Unauthorized'
+ *       "404":
+ *         $ref: '#/components/responses/NotFound'
+ */
+
+/**
+ * @swagger
+ * /users/{id}:
+ *   get:
+ *     summary: Get a user
+ *     description: Logged in users can fetch only their own user information. Only admins can fetch other users.
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User id
+ *     responses:
+ *       "200":
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *                $ref: '#/components/schemas/User'
+ *       "401":
+ *         $ref: '#/components/responses/Unauthorized'
+ *       "403":
+ *         $ref: '#/components/responses/Forbidden'
+ *       "404":
+ *         $ref: '#/components/responses/NotFound'
+ *
+ *   patch:
+ *     summary: Update a user
+ *     description: Logged in users can only update their own information. Only admins can update other users.
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User id
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *               email:
+ *                 type: string
+ *                 format: email
+ *                 description: must be unique
+ *               password:
+ *                 type: string
+ *                 format: password
+ *                 minLength: 8
+ *                 description: At least one number and one letter
+ *               phoneNumber:
+ *                 type: string
+ *               profilePicture:
+ *                 type: string
+ *               dateOfBirth:
+ *                 type: string
+ *                 format: date
+ *               gender:
+ *                 type: string
+ *                 enum: [Male, Female, Other]
+ *               country:
+ *                 type: string
+ *               timezone:
+ *                 type: string
+ *               role:
+ *                 type: string
+ *                 enum: [user, admin]
+ *               navigation:
+ *                 type: object
+ *                 description: User navigation permissions
+ *                 properties:
+ *                   Dashboard:
+ *                     type: boolean
+ *                   Catalog:
+ *                     type: object
+ *                     properties:
+ *                       Items:
+ *                         type: boolean
+ *                       Categories:
+ *                         type: boolean
+ *                       'Raw Material':
+ *                         type: boolean
+ *                       Processes:
+ *                         type: boolean
+ *                       Attributes:
+ *                         type: boolean
+ *                       Machines:
+ *                         type: boolean
+ *                   Sales:
+ *                     type: object
+ *                     properties:
+ *                       'All Sales':
+ *                         type: boolean
+ *                       'Master Sales':
+ *                         type: boolean
+ *                   Stores:
+ *                     type: boolean
+ *                   Analytics:
+ *                     type: boolean
+ *                   'Replenishment Agent':
+ *                     type: boolean
+ *                   'File Manager':
+ *                     type: boolean
+ *                   Users:
+ *                     type: boolean
+ *                   'Production Planning':
+ *                     type: object
+ *                     properties:
+ *                       'Production Orders':
+ *                         type: boolean
+ *                       'Knitting Floor':
+ *                         type: boolean
+ *                       'Linking Floor':
+ *                         type: boolean
+ *                       'Checking Floor':
+ *                         type: boolean
+ *                       'Washing Floor':
+ *                         type: boolean
+ *                       'Boarding Floor':
+ *                         type: boolean
+ *                       'Final Checking Floor':
+ *                         type: boolean
+ *                       'Branding Floor':
+ *                         type: boolean
+ *                       'Warehouse Floor':
+ *                         type: boolean
+ *             example:
+ *               name: fake name
+ *               email: fake@example.com
+ *               password: password1
+ *               navigation:
+ *                 Users: false
+ *                 Dashboard: true
+ *                 Catalog:
+ *                   Items: true
+ *                   Categories: false
+ *     responses:
+ *       "200":
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *                $ref: '#/components/schemas/User'
+ *       "400":
+ *         $ref: '#/components/responses/DuplicateEmail'
+ *       "401":
+ *         $ref: '#/components/responses/Unauthorized'
+ *       "403":
+ *         $ref: '#/components/responses/Forbidden'
+ *       "404":
+ *         $ref: '#/components/responses/NotFound'
+ *
+ *   delete:
+ *     summary: Delete a user
+ *     description: Logged in users can delete only themselves. Only admins can delete other users.
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User id
+ *     responses:
+ *       "200":
+ *         description: No content
+ *       "401":
+ *         $ref: '#/components/responses/Unauthorized'
+ *       "403":
+ *         $ref: '#/components/responses/Forbidden'
+ *       "404":
+ *         $ref: '#/components/responses/NotFound'
+ */
+
+/**
+ * @swagger
+ * /users/{id}/navigation:
+ *   patch:
+ *     summary: Update user navigation permissions
+ *     description: Only admins can update user navigation permissions.
+ *     tags: [Users]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: User id
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - navigation
+ *             properties:
+ *               navigation:
+ *                 type: object
+ *                 description: User navigation permissions
+ *                 properties:
+ *                   Dashboard:
+ *                     type: boolean
+ *                   Catalog:
+ *                     type: object
+ *                     properties:
+ *                       Items:
+ *                         type: boolean
+ *                       Categories:
+ *                         type: boolean
+ *                       'Raw Material':
+ *                         type: boolean
+ *                       Processes:
+ *                         type: boolean
+ *                       Attributes:
+ *                         type: boolean
+ *                       Machines:
+ *                         type: boolean
+ *                   Sales:
+ *                     type: object
+ *                     properties:
+ *                       'All Sales':
+ *                         type: boolean
+ *                       'Master Sales':
+ *                         type: boolean
+ *                   Stores:
+ *                     type: boolean
+ *                   Analytics:
+ *                     type: boolean
+ *                   'Replenishment Agent':
+ *                     type: boolean
+ *                   'File Manager':
+ *                     type: boolean
+ *                   Users:
+ *                     type: boolean
+ *                   'Production Planning':
+ *                     type: object
+ *                     properties:
+ *                       'Production Orders':
+ *                         type: boolean
+ *                       'Knitting Floor':
+ *                         type: boolean
+ *                       'Linking Floor':
+ *                         type: boolean
+ *                       'Checking Floor':
+ *                         type: boolean
+ *                       'Washing Floor':
+ *                         type: boolean
+ *                       'Boarding Floor':
+ *                         type: boolean
+ *                       'Final Checking Floor':
+ *                         type: boolean
+ *                       'Branding Floor':
+ *                         type: boolean
+ *                       'Warehouse Floor':
+ *                         type: boolean
+ *             example:
+ *               navigation:
+ *                 Dashboard: true
+ *                 Catalog:
+ *                   Items: true
+ *                   Categories: false
+ *                   'Raw Material': false
+ *                   Processes: false
+ *                   Attributes: false
+ *                   Machines: false
+ *                 Sales:
+ *                   'All Sales': true
+ *                   'Master Sales': false
+ *                 Stores: false
+ *                 Analytics: true
+ *                 'Replenishment Agent': false
+ *                 'File Manager': false
+ *                 Users: false
+ *                 'Production Planning':
+ *                   'Production Orders': false
+ *                   'Knitting Floor': false
+ *                   'Linking Floor': false
+ *                   'Checking Floor': false
+ *                   'Washing Floor': false
+ *                   'Boarding Floor': false
+ *                   'Final Checking Floor': false
+ *                   'Branding Floor': false
+ *                   'Warehouse Floor': false
+ *     responses:
+ *       "200":
+ *         description: OK
+ *         content:
+ *           application/json:
+ *             schema:
+ *                $ref: '#/components/schemas/User'
+ *       "400":
+ *         $ref: '#/components/responses/BadRequest'
+ *       "401":
+ *         $ref: '#/components/responses/Unauthorized'
+ *       "403":
+ *         $ref: '#/components/responses/Forbidden'
+ *       "404":
+ *         $ref: '#/components/responses/NotFound'
+ */
