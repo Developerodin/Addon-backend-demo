@@ -15,6 +15,7 @@ export const createCall = async (callBody) => {
   // Create call record in MongoDB
   const call = await Call.create({
     ...callBody,
+    fromPhoneNumber: callBody.fromPhoneNumber || null,
     status: 'initiated',
     startedAt: new Date(),
   });
@@ -83,7 +84,7 @@ export const createCall = async (callBody) => {
       location = callBody.location || callBody.city || '';
     }
     
-    // Initiate call directly via Bolna AI API
+    // Initiate call directly via Bolna AI API (bolnaAccount = which Bolna account: US or IN, from contact call modal)
     const bolnaResponse = await bolnaService.initiateCall({
       phone: callBody.phone,
       business_name: callBody.businessName,
@@ -98,6 +99,7 @@ export const createCall = async (callBody) => {
       language: callBody.language || 'en',
       provider_id: callBody.providerId,
       from_phone_number: callBody.fromPhoneNumber,
+      bolnaAccount: callBody.bolnaAccount,
       fromPhoneNumber: callBody.fromPhoneNumber,
     });
 

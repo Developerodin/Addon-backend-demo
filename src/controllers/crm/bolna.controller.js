@@ -303,6 +303,9 @@ export const syncAllExecutions = catchAsync(async (req, res) => {
       const telephonyData = executionData.telephony_data || {};
       const recordingUrl = telephonyData.recording_url || executionData.recording_url;
       const transcript = executionData.transcript || executionData.transcription;
+      // Extract from phone number (caller ID) from execution data
+      const fromPhoneNumber = telephonyData.from_number || executionData.agent_number || null;
+      
       // Check both status and smart_status fields (Bolna sends both)
       let status = executionData.status || executionData.smart_status || call.status;
       
@@ -350,6 +353,10 @@ export const syncAllExecutions = catchAsync(async (req, res) => {
       if (status && status !== call.status) {
         callUpdateData.status = status.toLowerCase();
         logger.info(`🔄 Status change detected in sync: ${call.status} → ${status} for call ${call._id}`);
+      }
+      // Update from phone number if available and missing or different
+      if (fromPhoneNumber && (!call.fromPhoneNumber || fromPhoneNumber !== call.fromPhoneNumber)) {
+        callUpdateData.fromPhoneNumber = fromPhoneNumber;
       }
       if (recordingUrl && recordingUrl !== call.recordingUrl) {
         callUpdateData.recordingUrl = recordingUrl;
@@ -590,62 +597,60 @@ export const updateAllAgentsToUsePlivo = catchAsync(async (req, res) => {
   
   const agentIdEnglish = config.bolna?.agentIdEnglish;
   const agentIdHindi = config.bolna?.agentIdHindi;
+  const agentIdUsEnglish = config.bolna?.us?.agentIdEnglish;
+  const agentIdUsHindi = config.bolna?.us?.agentIdHindi;
 
   const results = [];
   const errors = [];
 
-  // Update English agent if configured
+  // --- India account agents ---
   if (agentIdEnglish) {
     try {
-      logger.info(`Updating English agent ${agentIdEnglish} to use Plivo...`);
-      const englishResult = await bolnaService.updateAgentToUsePlivo(agentIdEnglish);
-      results.push({
-        agentId: agentIdEnglish,
-        language: 'English',
-        success: true,
-        agent: englishResult,
-      });
+      logger.info(`Updating India English agent ${agentIdEnglish} to use Plivo...`);
+      const englishResult = await bolnaService.updateAgentToUsePlivo(agentIdEnglish, 'IN');
+      results.push({ agentId: agentIdEnglish, account: 'IN', language: 'English', success: true, agent: englishResult });
     } catch (error) {
-      logger.error(`Failed to update English agent: ${error.message}`);
-      errors.push({
-        agentId: agentIdEnglish,
-        language: 'English',
-        error: error.message,
-      });
+      logger.error(`Failed to update India English agent: ${error.message}`);
+      errors.push({ agentId: agentIdEnglish, account: 'IN', language: 'English', error: error.message });
     }
   } else {
-    errors.push({
-      agentId: null,
-      language: 'English',
-      error: 'AGENT_ID_ENGLISH not configured',
-    });
+    errors.push({ agentId: null, account: 'IN', language: 'English', error: 'AGENT_ID_ENGLISH not configured' });
   }
 
-  // Update Hindi agent if configured
   if (agentIdHindi) {
     try {
-      logger.info(`Updating Hindi agent ${agentIdHindi} to use Plivo...`);
-      const hindiResult = await bolnaService.updateAgentToUsePlivo(agentIdHindi);
-      results.push({
-        agentId: agentIdHindi,
-        language: 'Hindi',
-        success: true,
-        agent: hindiResult,
-      });
+      logger.info(`Updating India Hindi agent ${agentIdHindi} to use Plivo...`);
+      const hindiResult = await bolnaService.updateAgentToUsePlivo(agentIdHindi, 'IN');
+      results.push({ agentId: agentIdHindi, account: 'IN', language: 'Hindi', success: true, agent: hindiResult });
     } catch (error) {
-      logger.error(`Failed to update Hindi agent: ${error.message}`);
-      errors.push({
-        agentId: agentIdHindi,
-        language: 'Hindi',
-        error: error.message,
-      });
+      logger.error(`Failed to update India Hindi agent: ${error.message}`);
+      errors.push({ agentId: agentIdHindi, account: 'IN', language: 'Hindi', error: error.message });
     }
   } else {
-    errors.push({
-      agentId: null,
-      language: 'Hindi',
-      error: 'AGENT_ID_HINDI not configured',
-    });
+    errors.push({ agentId: null, account: 'IN', language: 'Hindi', error: 'AGENT_ID_HINDI not configured' });
+  }
+
+  // --- US account agents ---
+  if (agentIdUsEnglish) {
+    try {
+      logger.info(`Updating US English agent ${agentIdUsEnglish} to use Plivo...`);
+      const englishResult = await bolnaService.updateAgentToUsePlivo(agentIdUsEnglish, 'US');
+      results.push({ agentId: agentIdUsEnglish, account: 'US', language: 'English', success: true, agent: englishResult });
+    } catch (error) {
+      logger.error(`Failed to update US English agent: ${error.message}`);
+      errors.push({ agentId: agentIdUsEnglish, account: 'US', language: 'English', error: error.message });
+    }
+  }
+
+  if (agentIdUsHindi) {
+    try {
+      logger.info(`Updating US Hindi agent ${agentIdUsHindi} to use Plivo...`);
+      const hindiResult = await bolnaService.updateAgentToUsePlivo(agentIdUsHindi, 'US');
+      results.push({ agentId: agentIdUsHindi, account: 'US', language: 'Hindi', success: true, agent: hindiResult });
+    } catch (error) {
+      logger.error(`Failed to update US Hindi agent: ${error.message}`);
+      errors.push({ agentId: agentIdUsHindi, account: 'US', language: 'Hindi', error: error.message });
+    }
   }
 
   res.status(httpStatus.OK).send({
@@ -694,47 +699,49 @@ export const checkAllAgentsPlivoConfig = catchAsync(async (req, res) => {
   
   const agentIdEnglish = config.bolna?.agentIdEnglish;
   const agentIdHindi = config.bolna?.agentIdHindi;
+  const agentIdUsEnglish = config.bolna?.us?.agentIdEnglish;
+  const agentIdUsHindi = config.bolna?.us?.agentIdHindi;
 
   const results = [];
   const errors = [];
 
-  // Check English agent if configured
+  // India account agents
   if (agentIdEnglish) {
     try {
-      const englishConfig = await bolnaService.checkAgentPlivoConfig(agentIdEnglish);
-      results.push({
-        agentId: agentIdEnglish,
-        language: 'English',
-        ...englishConfig,
-      });
+      const englishConfig = await bolnaService.checkAgentPlivoConfig(agentIdEnglish, 'IN');
+      results.push({ agentId: agentIdEnglish, account: 'IN', language: 'English', ...englishConfig });
     } catch (error) {
-      errors.push({
-        agentId: agentIdEnglish,
-        language: 'English',
-        error: error.message,
-      });
+      errors.push({ agentId: agentIdEnglish, account: 'IN', language: 'English', error: error.message });
     }
   }
-
-  // Check Hindi agent if configured
   if (agentIdHindi) {
     try {
-      const hindiConfig = await bolnaService.checkAgentPlivoConfig(agentIdHindi);
-      results.push({
-        agentId: agentIdHindi,
-        language: 'Hindi',
-        ...hindiConfig,
-      });
+      const hindiConfig = await bolnaService.checkAgentPlivoConfig(agentIdHindi, 'IN');
+      results.push({ agentId: agentIdHindi, account: 'IN', language: 'Hindi', ...hindiConfig });
     } catch (error) {
-      errors.push({
-        agentId: agentIdHindi,
-        language: 'Hindi',
-        error: error.message,
-      });
+      errors.push({ agentId: agentIdHindi, account: 'IN', language: 'Hindi', error: error.message });
     }
   }
 
-  const allConfigured = results.every((r) => r.isPlivoConfigured);
+  // US account agents
+  if (agentIdUsEnglish) {
+    try {
+      const englishConfig = await bolnaService.checkAgentPlivoConfig(agentIdUsEnglish, 'US');
+      results.push({ agentId: agentIdUsEnglish, account: 'US', language: 'English', ...englishConfig });
+    } catch (error) {
+      errors.push({ agentId: agentIdUsEnglish, account: 'US', language: 'English', error: error.message });
+    }
+  }
+  if (agentIdUsHindi) {
+    try {
+      const hindiConfig = await bolnaService.checkAgentPlivoConfig(agentIdUsHindi, 'US');
+      results.push({ agentId: agentIdUsHindi, account: 'US', language: 'Hindi', ...hindiConfig });
+    } catch (error) {
+      errors.push({ agentId: agentIdUsHindi, account: 'US', language: 'Hindi', error: error.message });
+    }
+  }
+
+  const allConfigured = results.length > 0 && results.every((r) => r.isPlivoConfigured);
 
   res.status(httpStatus.OK).send({
     success: true,

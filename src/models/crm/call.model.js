@@ -17,6 +17,11 @@ const callSchema = mongoose.Schema(
       required: true,
       trim: true,
     },
+    fromPhoneNumber: {
+      type: String,
+      trim: true,
+      default: null,
+    },
     businessName: {
       type: String,
       required: true,

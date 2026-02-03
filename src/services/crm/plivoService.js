@@ -6,18 +6,56 @@ import httpStatus from 'http-status';
 import logger from '../../config/logger.js';
 
 /**
- * Get Plivo client instance
+ * Detect country code from phone number
+ * @param {string} phoneNumber - Phone number in any format
+ * @returns {string|null} 'US', 'IN', or null if unable to detect
+ */
+export const detectCountryFromPhoneNumber = (phoneNumber) => {
+  if (!phoneNumber) return null;
+  
+  const normalized = phoneNumber.replace(/\D/g, '');
+  
+  // Check for US numbers (+1XXXXXXXXXX or 1XXXXXXXXXX with 11 digits)
+  if (normalized.startsWith('1') && normalized.length === 11) return 'US';
+  if (phoneNumber.startsWith('+1')) return 'US';
+  
+  // Check for Indian numbers (+91XXXXXXXXXX or 91XXXXXXXXXX)
+  if (normalized.startsWith('91')) return 'IN';
+  if (phoneNumber.startsWith('+91')) return 'IN';
+  
+  // Default to IN for backward compatibility
+  return null;
+};
+
+/**
+ * Get Plivo client instance for a specific country
+ * @param {string} countryCode - Country code ('US' or 'IN'), defaults to 'IN'
  * @returns {plivo.Client} Plivo client
  */
-const getPlivoClient = () => {
-  const authId = config.plivo?.authId;
-  const authToken = config.plivo?.authToken;
-
-  if (!authId || !authToken) {
-    throw new ApiError(
-      httpStatus.INTERNAL_SERVER_ERROR,
-      'Plivo credentials not configured. Please set PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN in .env file.'
-    );
+const getPlivoClient = (countryCode = 'IN') => {
+  let authId, authToken;
+  
+  if (countryCode === 'US') {
+    authId = config.plivo?.us?.authId;
+    authToken = config.plivo?.us?.authToken;
+    
+    if (!authId || !authToken) {
+      throw new ApiError(
+        httpStatus.INTERNAL_SERVER_ERROR,
+        'Plivo US credentials not configured. Please set PLIVO_US_AUTH_ID and PLIVO_US_AUTH_TOKEN in .env file.'
+      );
+    }
+  } else {
+    // Default to India account
+    authId = config.plivo?.authId;
+    authToken = config.plivo?.authToken;
+    
+    if (!authId || !authToken) {
+      throw new ApiError(
+        httpStatus.INTERNAL_SERVER_ERROR,
+        'Plivo credentials not configured. Please set PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN in .env file.'
+      );
+    }
   }
 
   // Plivo SDK uses Client constructor with authId and authToken
@@ -27,11 +65,12 @@ const getPlivoClient = () => {
 /**
  * Get account balance
  * Uses account details to get cash credits
+ * @param {string} countryCode - Country code ('US' or 'IN'), defaults to 'IN'
  * @returns {Promise<Object>} Account balance information
  */
-export const getAccountBalance = async () => {
+export const getAccountBalance = async (countryCode = 'IN') => {
   try {
-    const client = getPlivoClient();
+    const client = getPlivoClient(countryCode);
     
     // Get account details which includes cash_credits
     // Plivo SDK: client.account.get() (singular, not accounts)
@@ -58,7 +97,7 @@ export const getAccountBalance = async () => {
     return {
       balance: balance,
       currency: 'USD',
-      accountId: account.auth_id || config.plivo?.authId || '',
+      accountId: account.auth_id || (countryCode === 'US' ? config.plivo?.us?.authId : config.plivo?.authId) || '',
     };
   } catch (error) {
     if (error instanceof ApiError) {
@@ -80,11 +119,12 @@ export const getAccountBalance = async () => {
 
 /**
  * Get account information
+ * @param {string} countryCode - Country code ('US' or 'IN'), defaults to 'IN'
  * @returns {Promise<Object>} Account information
  */
-export const getAccountInfo = async () => {
+export const getAccountInfo = async (countryCode = 'IN') => {
   try {
-    const client = getPlivoClient();
+    const client = getPlivoClient(countryCode);
     
     // Get account details from Plivo API
     // Plivo SDK: client.account.get() (singular, not accounts)
@@ -142,11 +182,12 @@ export const getAccountInfo = async () => {
 /**
  * Update account details
  * @param {Object} updates - Account update parameters (name, city, state, address, timezone)
+ * @param {string} countryCode - Country code ('US' or 'IN'), defaults to 'IN'
  * @returns {Promise<Object>} Update result
  */
-export const updateAccount = async (updates = {}) => {
+export const updateAccount = async (updates = {}, countryCode = 'IN') => {
   try {
-    const client = getPlivoClient();
+    const client = getPlivoClient(countryCode);
     
     const params = {};
     
@@ -235,11 +276,12 @@ export const getUsageSummary = async (startDate, endDate) => {
  * Get recent usage records
  * Uses Plivo Calls API to get recent call records as usage data
  * @param {number} limit - Maximum number of records to return
+ * @param {string} countryCode - Country code ('US' or 'IN'), defaults to 'IN'
  * @returns {Promise<Array>} Recent usage records
  */
-export const getRecentUsage = async (limit = 50) => {
+export const getRecentUsage = async (limit = 50, countryCode = 'IN') => {
   try {
-    const client = getPlivoClient();
+    const client = getPlivoClient(countryCode);
     
     // Get recent calls from Plivo API
     // Filter for completed calls only to get billing data
@@ -492,7 +534,9 @@ const getCountryName = (code) => {
  */
 export const getCountryInfo = async (countryCode) => {
   try {
-    const client = getPlivoClient();
+    // Use appropriate account based on country code
+    const accountCountryCode = (countryCode === 'US') ? 'US' : 'IN';
+    const client = getPlivoClient(accountCountryCode);
     
     if (!countryCode) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Country code is required');
@@ -581,8 +625,13 @@ const getCountryPricing = async (countryCode) => {
       return cached.data;
     }
 
-    const authId = config.plivo?.authId;
-    const authToken = config.plivo?.authToken;
+    // Use appropriate account based on country code
+    const authId = countryCode === 'US' 
+      ? config.plivo?.us?.authId 
+      : config.plivo?.authId;
+    const authToken = countryCode === 'US' 
+      ? config.plivo?.us?.authToken 
+      : config.plivo?.authToken;
     
     if (!authId || !authToken) {
       throw new Error('Plivo credentials not configured');
@@ -641,7 +690,9 @@ const getCountryPricing = async (countryCode) => {
  */
 export const searchAvailableNumbers = async (countryCode, type, filters = {}) => {
   try {
-    const client = getPlivoClient();
+    // Use appropriate account based on country code
+    const accountCountryCode = (countryCode === 'US') ? 'US' : 'IN';
+    const client = getPlivoClient(accountCountryCode);
     
     if (!countryCode) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Country code (country_iso) is required');
@@ -1067,7 +1118,9 @@ export const searchAvailableNumbers = async (countryCode, type, filters = {}) =>
  */
 export const purchasePhoneNumber = async (phoneNumber, options = {}) => {
   try {
-    const client = getPlivoClient();
+    // Detect country from phone number
+    const countryCode = detectCountryFromPhoneNumber(phoneNumber) || 'IN';
+    const client = getPlivoClient(countryCode);
     
     if (!phoneNumber) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Phone number is required');
@@ -1247,98 +1300,37 @@ export const purchasePhoneNumber = async (phoneNumber, options = {}) => {
 /**
  * Get list of owned phone numbers
  * @param {number} limit - Maximum number of numbers to return
+ * @param {string} countryCode - Optional country code filter ('US' | 'IN'). If not provided, returns numbers from both accounts
  * @returns {Promise<Array>} List of owned phone numbers
  */
-export const getOwnedNumbers = async (limit = 50) => {
+export const getOwnedNumbers = async (limit = 50, countryCode = null) => {
   try {
-    const client = getPlivoClient();
+    let allNumbers = [];
     
-    const numbers = [];
-    let offset = 0;
-    const pageLimit = Math.min(limit, 20); // Plivo limit is 20 per page
-    
-    // Fetch numbers in pages
-    while (numbers.length < limit) {
-      const response = await client.numbers.list({
-        limit: Math.min(pageLimit, limit - numbers.length),
-        offset,
-      });
-      
-      // Log response structure for debugging
-      logger.info(`Plivo list numbers response: ${JSON.stringify({
-        hasObjects: !!response.objects,
-        isArray: Array.isArray(response),
-        responseKeys: response ? Object.keys(response) : [],
-        objectsLength: response?.objects?.length || 0,
-        meta: response?.meta
-      })}`);
-      
-      // Handle different response structures
-      let responseObjects = [];
-      if (Array.isArray(response)) {
-        responseObjects = response;
-        logger.info(`Response is directly an array with ${responseObjects.length} items`);
-      } else if (response && Array.isArray(response.objects)) {
-        responseObjects = response.objects;
-        logger.info(`Response has objects property with ${responseObjects.length} items`);
-      } else if (response && response.data && Array.isArray(response.data)) {
-        responseObjects = response.data;
-        logger.info(`Response has data property with ${responseObjects.length} items`);
-      } else {
-        logger.warn(`Unexpected response structure for list numbers: ${JSON.stringify({
-          type: typeof response,
-          isArray: Array.isArray(response),
-          keys: response ? Object.keys(response) : []
-        })}`);
-      }
-      
-      if (!responseObjects || responseObjects.length === 0) {
-        logger.info(`No more numbers to fetch. Total fetched: ${numbers.length}`);
-        break;
-      }
-      
-      const mappedNumbers = responseObjects.map(num => ({
-        sid: num.number || num.phone_number || '',
-        phoneNumber: num.number || num.phone_number || '',
-        friendlyName: num.alias || num.number || '',
-        alias: num.alias || null,
-        capabilities: {
-          voice: num.voice_enabled !== false,
-          sms: num.sms_enabled === true,
-          mms: num.mms_enabled === true || num.sms_enabled === true,
-          fax: false,
-        },
-        status: num.active !== false ? 'active' : 'inactive',
-        dateCreated: num.added_on || null,
-        dateUpdated: num.modified_on || null,
-        uri: num.resource_uri || null,
-        // Additional fields for display
-        city: num.city || null,
-        region: num.region || null,
-        country: num.country || null,
-        type: num.type || num.sub_type || 'local',
-        appId: num.app_id || null,
-        appName: num.application?.name || null,
-        voiceUrl: num.voice_url || null,
-        smsUrl: num.sms_url || null,
-      }));
-      
-      numbers.push(...mappedNumbers);
-      
-      logger.info(`Fetched ${mappedNumbers.length} numbers (total: ${numbers.length}/${limit})`);
-      
-      // Check if there are more pages
-      const responseMeta = response.meta || {};
-      if (!responseMeta.next || numbers.length >= limit) {
-        logger.info(`Reached end of pagination or limit. Total numbers: ${numbers.length}`);
-        break;
-      }
-      
-      offset += pageLimit;
+    if (countryCode) {
+      // Fetch from specific account
+      const client = getPlivoClient(countryCode);
+      const numbers = await fetchNumbersFromAccount(client, limit);
+      allNumbers = numbers;
+    } else {
+      // Fetch from both accounts and combine
+      const [usNumbers, inNumbers] = await Promise.all([
+        fetchNumbersFromAccount(getPlivoClient('US'), limit).catch(() => []),
+        fetchNumbersFromAccount(getPlivoClient('IN'), limit).catch(() => []),
+      ]);
+      allNumbers = [...usNumbers, ...inNumbers];
     }
     
-    logger.info(`Returning ${numbers.length} owned numbers`);
-    return numbers.slice(0, limit);
+    // Filter by country if countryCode provided, otherwise return all
+    if (countryCode) {
+      allNumbers = allNumbers.filter(num => {
+        const numCountry = detectCountryFromPhoneNumber(num.phoneNumber || num.number);
+        return numCountry === countryCode;
+      });
+    }
+    
+    logger.info(`Returning ${allNumbers.length} owned numbers${countryCode ? ` for ${countryCode}` : ' (all accounts)'}`);
+    return allNumbers.slice(0, limit);
   } catch (error) {
     if (error instanceof ApiError) {
       throw error;
@@ -1352,6 +1344,77 @@ export const getOwnedNumbers = async (limit = 50) => {
 };
 
 /**
+ * Helper function to fetch numbers from a Plivo account
+ * @param {plivo.Client} client - Plivo client instance
+ * @param {number} limit - Maximum number of numbers to return
+ * @returns {Promise<Array>} List of phone numbers
+ */
+const fetchNumbersFromAccount = async (client, limit = 50) => {
+  const numbers = [];
+  let offset = 0;
+  const pageLimit = Math.min(limit, 20); // Plivo limit is 20 per page
+  
+  // Fetch numbers in pages
+  while (numbers.length < limit) {
+    const response = await client.numbers.list({
+      limit: Math.min(pageLimit, limit - numbers.length),
+      offset,
+    });
+    
+    // Handle different response structures
+    let responseObjects = [];
+    if (Array.isArray(response)) {
+      responseObjects = response;
+    } else if (response && Array.isArray(response.objects)) {
+      responseObjects = response.objects;
+    } else if (response && response.data && Array.isArray(response.data)) {
+      responseObjects = response.data;
+    }
+    
+    if (!responseObjects || responseObjects.length === 0) {
+      break;
+    }
+    
+    const mappedNumbers = responseObjects.map(num => ({
+      sid: num.number || num.phone_number || '',
+      phoneNumber: num.number || num.phone_number || '',
+      friendlyName: num.alias || num.number || '',
+      alias: num.alias || null,
+      capabilities: {
+        voice: num.voice_enabled !== false,
+        sms: num.sms_enabled === true,
+        mms: num.mms_enabled === true || num.sms_enabled === true,
+        fax: false,
+      },
+      status: num.active !== false ? 'active' : 'inactive',
+      dateCreated: num.added_on || null,
+      dateUpdated: num.modified_on || null,
+      uri: num.resource_uri || null,
+      city: num.city || null,
+      region: num.region || null,
+      country: num.country || null,
+      type: num.type || num.sub_type || 'local',
+      appId: num.app_id || null,
+      appName: num.application?.name || null,
+      voiceUrl: num.voice_url || null,
+      smsUrl: num.sms_url || null,
+    }));
+    
+    numbers.push(...mappedNumbers);
+    
+    // Check if there are more pages
+    const responseMeta = response.meta || {};
+    if (!responseMeta.next || numbers.length >= limit) {
+      break;
+    }
+    
+    offset += pageLimit;
+  }
+  
+  return numbers;
+};
+
+/**
  * Unrent/delete a phone number from your account
  * This operation cannot be undone
  * @param {string} phoneNumber - Phone number in E.164 format
@@ -1359,7 +1422,9 @@ export const getOwnedNumbers = async (limit = 50) => {
  */
 export const deletePhoneNumber = async (phoneNumber) => {
   try {
-    const client = getPlivoClient();
+    // Detect country from phone number
+    const countryCode = detectCountryFromPhoneNumber(phoneNumber) || 'IN';
+    const client = getPlivoClient(countryCode);
     
     if (!phoneNumber) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Phone number is required');
@@ -1400,12 +1465,14 @@ export const deletePhoneNumber = async (phoneNumber) => {
 
 /**
  * Get all live calls
- * @param {Object} filters - Optional filters (call_direction, number)
+ * @param {Object} filters - Optional filters (call_direction, number, countryCode)
  * @returns {Promise<Object>} List of live calls
  */
 export const getLiveCalls = async (filters = {}) => {
   try {
-    const client = getPlivoClient();
+    // Use countryCode from filters if provided, otherwise default to IN
+    const countryCode = filters.countryCode || 'IN';
+    const client = getPlivoClient(countryCode);
     
     const params = {
       status: 'live',
@@ -1458,11 +1525,12 @@ export const getLiveCalls = async (filters = {}) => {
 
 /**
  * Get all queued calls
+ * @param {string} countryCode - Country code ('US' or 'IN'), defaults to 'IN'
  * @returns {Promise<Object>} List of queued call UUIDs
  */
-export const getQueuedCalls = async () => {
+export const getQueuedCalls = async (countryCode = 'IN') => {
   try {
-    const client = getPlivoClient();
+    const client = getPlivoClient(countryCode);
     
     const response = await client.calls.listQueuedCalls();
     
@@ -1529,12 +1597,13 @@ export const getQueuedCallDetails = async (callUuid) => {
 /**
  * Start recording a call
  * @param {string} callUuid - Call UUID
- * @param {Object} options - Recording options
+ * @param {Object} options - Recording options (including countryCode)
  * @returns {Promise<Object>} Recording details
  */
 export const startCallRecording = async (callUuid, options = {}) => {
   try {
-    const client = getPlivoClient();
+    const countryCode = options.countryCode || 'IN';
+    const client = getPlivoClient(countryCode);
     
     if (!callUuid) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Call UUID is required');
@@ -1601,11 +1670,12 @@ export const startCallRecording = async (callUuid, options = {}) => {
  * Stop recording a call
  * @param {string} callUuid - Call UUID
  * @param {string} recordUrl - Optional record URL to stop specific recording
+ * @param {string} countryCode - Country code ('US' or 'IN'), defaults to 'IN'
  * @returns {Promise<Object>} Stop recording result
  */
-export const stopCallRecording = async (callUuid, recordUrl = null) => {
+export const stopCallRecording = async (callUuid, recordUrl = null, countryCode = 'IN') => {
   try {
-    const client = getPlivoClient();
+    const client = getPlivoClient(countryCode);
     
     if (!callUuid) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Call UUID is required');
@@ -1648,7 +1718,9 @@ export const stopCallRecording = async (callUuid, recordUrl = null) => {
  */
 export const getNumberDetails = async (phoneNumber) => {
   try {
-    const client = getPlivoClient();
+    // Detect country from phone number
+    const countryCode = detectCountryFromPhoneNumber(phoneNumber) || 'IN';
+    const client = getPlivoClient(countryCode);
     
     if (!phoneNumber) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Phone number is required');
@@ -1708,7 +1780,9 @@ export const getNumberDetails = async (phoneNumber) => {
  */
 export const updateNumber = async (phoneNumber, updates = {}) => {
   try {
-    const client = getPlivoClient();
+    // Detect country from phone number
+    const countryCode = detectCountryFromPhoneNumber(phoneNumber) || 'IN';
+    const client = getPlivoClient(countryCode);
     
     if (!phoneNumber) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Phone number is required');
@@ -1780,7 +1854,11 @@ export const updateNumber = async (phoneNumber, updates = {}) => {
  */
 export const addNumberFromCarrier = async (numbers, carrier, region, options = {}) => {
   try {
-    const client = getPlivoClient();
+    // Detect country from first number
+    const numbersArray = Array.isArray(numbers) ? numbers : numbers.split(',');
+    const firstNumber = numbersArray[0]?.trim();
+    const countryCode = detectCountryFromPhoneNumber(firstNumber) || 'IN';
+    const client = getPlivoClient(countryCode);
     
     if (!numbers || (Array.isArray(numbers) && numbers.length === 0)) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'At least one phone number is required');

@@ -31,4 +31,4 @@ export {
     s3Config as s3,
     testS3Connection
 };
-export { S3Client }; 
+export { S3Client };

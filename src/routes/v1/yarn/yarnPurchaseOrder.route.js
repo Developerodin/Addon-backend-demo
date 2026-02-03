@@ -30,6 +30,21 @@ router
     yarnPurchaseOrderController.updateLotStatusAndQcApprove
   );
 
+// By PO number (must be before /:purchaseOrderId so "by-po" is not treated as ID)
+router
+  .route('/by-po/:poNumber')
+  .get(
+    validate(yarnPurchaseOrderValidation.getPurchaseOrderByPoNumber),
+    yarnPurchaseOrderController.getPurchaseOrderByPoNumber
+  );
+
+router
+  .route('/by-po/:poNumber/status')
+  .get(
+    validate(yarnPurchaseOrderValidation.getPurchaseOrderStatusByPoNumber),
+    yarnPurchaseOrderController.getPurchaseOrderStatusByPoNumber
+  );
+
 router
   .route('/:purchaseOrderId')
   .get(

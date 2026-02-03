@@ -21,6 +21,7 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
         // 2. Failed/error calls to get error details, transcripts, recordings that might have arrived later
         // 3. Completed calls without duration to get duration, transcripts, recordings (especially for Hindi calls)
         // 4. Recently completed calls (last 2 hours) to get any late-arriving data
+        // 5. Calls without fromPhoneNumber (to backfill caller ID from Bolna execution data)
         const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
         const inProgressCalls = await callService.queryCalls(
           { 
@@ -32,9 +33,15 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
               { status: 'completed', duration: null },
               // Recently completed calls (might have late-arriving duration/transcripts)
               { status: 'completed', completedAt: { $gte: twoHoursAgo } },
+              // Calls without fromPhoneNumber (backfill caller ID from Bolna)
+              { fromPhoneNumber: { $exists: false } },
+              { fromPhoneNumber: null },
+              { fromPhoneNumber: '' },
             ],
-            // Only sync calls from the last 24 hours to avoid syncing very old calls
-            createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+            // Only sync calls from the last 30 days to backfill recent calls
+            createdAt: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+            // Must have executionId to fetch from Bolna
+            executionId: { $exists: true, $ne: null }
           },
           { limit: 1000, page: 1 }
         );
@@ -121,6 +128,9 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
               const recordingUrl = telephonyData.recording_url || executionData.recording_url;
               const transcript = executionData.transcript || executionData.transcription;
               
+              // Extract from phone number (caller ID) from execution data
+              const fromPhoneNumber = telephonyData.from_number || executionData.agent_number || null;
+              
               // Always update status if it's different from Bolna, regardless of other data
               // This ensures status stays in sync with Bolna dashboard
               const statusChanged = status && status !== call.status;
@@ -128,11 +138,12 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
               const hasNewData = (executionData.error_message && executionData.error_message !== call.errorMessage) ||
                                  (recordingUrl && recordingUrl !== call.recordingUrl) ||
                                  (transcript && transcript !== call.transcription) ||
-                                 (conversationDuration !== null && conversationDuration !== call.duration);
+                                 (conversationDuration !== null && conversationDuration !== call.duration) ||
+                                 (fromPhoneNumber && fromPhoneNumber !== call.fromPhoneNumber);
               
               // Always update if status changed (even if call already has complete data)
               // OR if terminal call has new data
-              if (statusChanged || (isTerminalCall && hasNewData)) {
+              if (statusChanged || (isTerminalCall && hasNewData) || (fromPhoneNumber && !call.fromPhoneNumber)) {
                 const updateData = {};
                 
                 // Always update status if it changed - this ensures sync with Bolna dashboard
@@ -140,6 +151,11 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
                 if (statusChanged) {
                   updateData.status = status;
                   logger.info(`🔄 Status change detected: ${call.status} → ${status} for call ${call._id}`);
+                }
+
+                // Update from phone number if available and missing
+                if (fromPhoneNumber && (!call.fromPhoneNumber || fromPhoneNumber !== call.fromPhoneNumber)) {
+                  updateData.fromPhoneNumber = fromPhoneNumber;
                 }
 
                 // Always update duration if available (especially important for Hindi calls)

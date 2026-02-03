@@ -221,12 +221,20 @@ export const queryYarnCatalogs = async (filter, options) => {
   
   // Convert yarnName to regex for partial/fuzzy search (case-insensitive)
   // Escape special regex characters to allow matching of special characters like ( ) / - etc.
-  if (mongooseFilter.yarnName) {
+  // Only convert yarnName to regex when it's a string (single search). Support $in for filtering by supplier's yarn list.
+  if (mongooseFilter.yarnName && typeof mongooseFilter.yarnName === 'string') {
     const yarnNameValue = String(mongooseFilter.yarnName).trim();
-    // Escape special regex characters: . * + ? ^ $ { } [ ] \ | ( )
-    // This allows searching for yarn names with special characters like "70/2-Black (New)-Black (New)-Nylon/Nylon"
     const escapedYarnName = yarnNameValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     mongooseFilter.yarnName = { $regex: escapedYarnName, $options: 'i' };
+  }
+  
+  // Filter by size/count when provided (e.g. "33/2/120") — match countSize.name so same product with different count/size can be found
+  if (mongooseFilter.sizeCount != null && mongooseFilter.sizeCount !== '') {
+    const sizeCountVal = String(mongooseFilter.sizeCount).trim();
+    if (sizeCountVal) {
+      mongooseFilter['countSize.name'] = sizeCountVal;
+      delete mongooseFilter.sizeCount;
+    }
   }
   
   const yarnCatalogs = await YarnCatalog.paginate(mongooseFilter, options);

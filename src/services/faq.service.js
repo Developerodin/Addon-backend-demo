@@ -3,6 +3,7 @@ import FaqVector from '../models/faqVector.model.js';
 import ApiError from '../utils/ApiError.js';
 import config from '../config/config.js';
 import * as aiToolService from './aiToolService.js';
+import * as conversationService from './conversation.service.js';
 import * as blendService from './yarnManagement/blend.service.js';
 import * as yarnTypeService from './yarnManagement/yarnType.service.js';
 import * as countSizeService from './yarnManagement/countSize.service.js';
@@ -357,9 +358,10 @@ const fetchContextData = async (category) => {
 /**
  * Ask question with AI tool calling and FAQ vector search
  * @param {string} question - User's question
+ * @param {Object} options - { sessionId?: string } for confirmation guardrails
  * @returns {Promise<Object>} Response object
  */
-export const askQuestion = async (question) => {
+export const askQuestion = async (question, options = {}) => {
   try {
     if (!question || typeof question !== 'string') {
       throw new ApiError(400, 'Question is required and must be a string');
@@ -369,7 +371,81 @@ export const askQuestion = async (question) => {
     if (normalizedQuestion.length === 0) {
       throw new ApiError(400, 'Question cannot be empty');
     }
+
+    const { sessionId, context, conversationHistory } = options;
+
+    // When user is in "choose supplier" flow, treat short reply as supplier name (e.g. "wampum", "allen solley")
+    if (context?.lastOrderWizardPrompt === 'choose_supplier') {
+      const isShowList = /show\s+(?:me\s+)?(?:the\s+)?supplier\s+list|supplier\s+list|see\s+(?:the\s+)?supplier\s+list|option\s*2|choose\s+from\s+(?:the\s+)?list|show\s+list/i.test(normalizedQuestion);
+      if (!isShowList && normalizedQuestion.length >= 2 && normalizedQuestion.length <= 80) {
+        try {
+          const aiResponse = await aiToolService.executeAITool(
+            { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion }, confidence: 0.95 },
+            { sessionId }
+          );
+          const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
+          const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+          const responsePayload = isWizardPayload
+            ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+            : isPromptPayload
+              ? {
+                  response: aiResponse.html,
+                  orderWizardPrompt: aiResponse.orderWizardPrompt,
+                  ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
+                  ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
+                }
+              : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
+          return {
+            type: 'ai_tool',
+            intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion } },
+            ...responsePayload,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true
+          };
+        } catch (contextErr) {
+          console.warn('Context createYarnPurchaseOrder failed, falling back to normal flow:', contextErr.message);
+        }
+      }
+    }
+
+    // Resolve pending confirmation first when session has a pending action (yes/no/y/n/confirm/cancel or re-prompt)
+    if (sessionId) {
+      const resolved = await aiToolService.resolvePendingConfirmation(sessionId, normalizedQuestion);
+      if (resolved.resolved && resolved.response != null) {
+        return {
+          type: 'ai_tool',
+          intent: { action: 'confirm_or_cancel' },
+          response: resolved.response,
+          confidence: 1,
+          source: 'ai_tool_service',
+          confirmationResolved: true
+        };
+      }
+    }
     
+    // Run order-action intent (delete/update order) before FAQ so they are never overridden by FAQ match
+    const orderActionPattern = /\b(delete|cancel|remove|update|mark|set)\b.*\b(?:purchase\s+)?order\b.*(?:po-?)?[\w\-]+/i;
+    if (orderActionPattern.test(normalizedQuestion)) {
+      const orderIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+      if (orderIntent && (orderIntent.action === 'deleteYarnPurchaseOrder' || orderIntent.action === 'updateYarnPurchaseOrder')) {
+        try {
+          const aiResponse = await aiToolService.executeAITool(orderIntent, { sessionId });
+          const responsePayload = typeof aiResponse === 'string' ? { response: aiResponse } : { response: aiResponse?.html ?? String(aiResponse) };
+          return {
+            type: 'ai_tool',
+            intent: orderIntent,
+            ...responsePayload,
+            confidence: orderIntent.confidence ?? 0.95,
+            source: 'ai_tool_service',
+            orderActionHandled: true
+          };
+        } catch (orderErr) {
+          console.warn('Order action execution failed, continuing to FAQ:', orderErr?.message);
+        }
+      }
+    }
+
     // Check for slash commands (e.g., /commands, /help)
     if (normalizedQuestion.startsWith('/')) {
       const command = normalizedQuestion.toLowerCase();
@@ -502,16 +578,19 @@ Please provide a helpful response based on this FAQ knowledge.`
     if (isCapabilityQuestion) {
       console.log('Capability question detected, checking AI tool intent for:', normalizedQuestion);
       
-      const aiIntent = await aiToolService.detectIntent(normalizedQuestion);
-      
+    const aiIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+    
       if (aiIntent && aiIntent.action === 'getCapabilities') {
         try {
-          const aiResponse = await aiToolService.executeAITool(aiIntent);
-          
+          let aiResponse = await aiToolService.executeAITool(aiIntent, { sessionId });
+          const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
+          const responsePayload = isWizardPayload
+            ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
           return {
             type: 'ai_tool',
             intent: aiIntent,
-            response: aiResponse,
+            ...responsePayload,
             confidence: aiIntent.confidence,
             source: 'ai_tool_service'
           };
@@ -525,19 +604,31 @@ Please provide a helpful response based on this FAQ knowledge.`
     // Step 3: If no good FAQ match and not a capability question, check AI tool intent for data/analytics requests
     console.log('No good FAQ match found, checking AI tool intent for:', normalizedQuestion);
     
-    const aiIntent = await aiToolService.detectIntent(normalizedQuestion);
+    const aiIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
     
     if (aiIntent && aiIntent.action !== 'getCapabilities') {
       console.log('AI Tool Intent Detected:', aiIntent);
       
       try {
-        // Execute AI tool and return HTML response
-        const aiResponse = await aiToolService.executeAITool(aiIntent);
-        
+        // Execute AI tool and return HTML response (sessionId enables confirmation guardrails for update/delete)
+        let aiResponse = await aiToolService.executeAITool(aiIntent, { sessionId });
+        // Normalize: createYarnPurchaseOrder can return wizard data, choose_supplier, choose_yarn_for_supplier, or disambiguate_supplier
+        const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
+        const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+        const responsePayload = isWizardPayload
+          ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+          : isPromptPayload
+            ? {
+                response: aiResponse.html,
+                orderWizardPrompt: aiResponse.orderWizardPrompt,
+                ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
+                ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
+              }
+            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
         return {
           type: 'ai_tool',
           intent: aiIntent,
-          response: aiResponse,
+          ...responsePayload,
           confidence: aiIntent.confidence,
           source: 'ai_tool_service'
         };

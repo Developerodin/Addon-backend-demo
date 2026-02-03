@@ -75,6 +75,20 @@ export const getPurchaseOrderById = {
   }),
 };
 
+const poNumberParam = Joi.string().trim().required().max(64);
+
+export const getPurchaseOrderByPoNumber = {
+  params: Joi.object().keys({
+    poNumber: poNumberParam,
+  }),
+};
+
+export const getPurchaseOrderStatusByPoNumber = {
+  params: Joi.object().keys({
+    poNumber: poNumberParam,
+  }),
+};
+
 export const deletePurchaseOrder = {
   params: Joi.object().keys({
     purchaseOrderId: Joi.string().custom(objectId).required(),

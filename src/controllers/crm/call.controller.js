@@ -171,6 +171,13 @@ export const updateCallStatus = catchAsync(async (req, res) => {
                       payload.errorMessage ||
                       payload.data?.error_message;
   
+  // Extract from phone number (caller ID) from webhook payload
+  const fromPhoneNumber = payload.telephony_data?.from_number || 
+                          payload.agent_number ||
+                          payload.data?.telephony_data?.from_number ||
+                          payload.data?.agent_number ||
+                          null;
+  
   const completedAt = payload.completed_at || 
                       payload.completedAt ||
                       payload.data?.completed_at ||
@@ -250,6 +257,9 @@ export const updateCallStatus = catchAsync(async (req, res) => {
   }
   if (agentId !== undefined && agentId !== null && agentId !== '') {
     updateData.agentId = String(agentId);
+  }
+  if (fromPhoneNumber !== undefined && fromPhoneNumber !== null && fromPhoneNumber !== '') {
+    updateData.fromPhoneNumber = String(fromPhoneNumber);
   }
   
   logger.info(`📝 Update data (${Object.keys(updateData).length} fields):`, JSON.stringify(updateData, null, 2));

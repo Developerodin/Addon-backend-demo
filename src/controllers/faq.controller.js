@@ -35,7 +35,7 @@ const trainFaq = catchAsync(async (req, res) => {
  * @returns {Object} 200 - Relevant answer with metadata
  */
 const askQuestion = catchAsync(async (req, res) => {
-  const { question } = req.body;
+  const { question, sessionId, context, conversationHistory } = req.body;
   
   if (!question || typeof question !== 'string' || question.trim().length === 0) {
     return res.status(httpStatus.BAD_REQUEST).json({
@@ -44,7 +44,11 @@ const askQuestion = catchAsync(async (req, res) => {
     });
   }
   
-  const result = await faqService.askQuestion(question.trim());
+  const result = await faqService.askQuestion(question.trim(), {
+    sessionId: sessionId || undefined,
+    context: context || undefined,
+    conversationHistory: conversationHistory || undefined
+  });
   
   res.status(httpStatus.OK).json({
     status: 'success',

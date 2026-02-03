@@ -31,6 +31,34 @@ export const getPurchaseOrder = catchAsync(async (req, res) => {
   res.status(httpStatus.OK).send(purchaseOrder);
 });
 
+/**
+ * Fetch full order data by PO number (e.g. PO-2025-001).
+ */
+export const getPurchaseOrderByPoNumber = catchAsync(async (req, res) => {
+  const { poNumber } = req.params;
+  const order = await yarnPurchaseOrderService.getPurchaseOrderByPoNumber(poNumber);
+
+  if (!order) {
+    return res.status(httpStatus.NOT_FOUND).send({ message: `Purchase order not found for PO number: ${poNumber}` });
+  }
+
+  res.status(httpStatus.OK).send(order);
+});
+
+/**
+ * Get only the status of an order by PO number (lightweight).
+ */
+export const getPurchaseOrderStatusByPoNumber = catchAsync(async (req, res) => {
+  const { poNumber } = req.params;
+  const result = await yarnPurchaseOrderService.getPurchaseOrderStatusByPoNumber(poNumber);
+
+  if (!result) {
+    return res.status(httpStatus.NOT_FOUND).send({ message: `Purchase order not found for PO number: ${poNumber}` });
+  }
+
+  res.status(httpStatus.OK).send(result);
+});
+
 export const deletePurchaseOrder = catchAsync(async (req, res) => {
   const { purchaseOrderId } = req.params;
   await yarnPurchaseOrderService.deletePurchaseOrderById(purchaseOrderId);

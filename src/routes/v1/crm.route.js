@@ -478,6 +478,28 @@ router
     plivoController.stopCallRecording
   );
 
+// Plivo US Account routes
+router
+  .route('/plivo/us/balance')
+  .get(
+    auth(),
+    plivoController.getBalanceUS
+  );
+
+router
+  .route('/plivo/us/account-info')
+  .get(
+    auth(),
+    plivoController.getAccountInfoUS
+  );
+
+router
+  .route('/plivo/us/recent-usage')
+  .get(
+    auth(),
+    plivoController.getRecentUsageUS
+  );
+
 // Exotel routes
 router
   .route('/exotel/balance')

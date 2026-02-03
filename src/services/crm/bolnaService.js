@@ -6,32 +6,57 @@ import logger from '../../config/logger.js';
 import { normalizePhone, validatePhone } from '../../utils/phone.js';
 import { validateLanguage } from '../../utils/validators.js';
 import { getTemplateData } from '../../utils/callTemplates.js';
+import { detectCountryFromPhoneNumber } from './plivoService.js';
 
 /**
- * Get agent ID based on user-selected language
- * @param {string} language - User-selected language ('en' or 'hi')
- * @returns {string} Agent ID for the selected language
+ * Get Bolna config for a given country (India = default, US = second account)
+ * @param {string} countryCode - 'US' or 'IN'. Default 'IN'
+ * @returns {{ apiKey: string, apiBase: string, agentIdEnglish: string, agentIdHindi: string }}
  */
-const getAgentId = (language) => {
+const getBolnaConfig = (countryCode = 'IN') => {
+  if (countryCode === 'US' && config.bolna?.us?.apiKey) {
+    return {
+      apiKey: config.bolna.us.apiKey,
+      apiBase: config.bolna.us.apiBase || 'https://api.bolna.ai',
+      agentIdEnglish: config.bolna.us.agentIdEnglish,
+      agentIdHindi: config.bolna.us.agentIdHindi,
+    };
+  }
+  return {
+    apiKey: config.bolna?.apiKey,
+    apiBase: config.bolna?.apiBase || 'https://api.bolna.ai',
+    agentIdEnglish: config.bolna?.agentIdEnglish,
+    agentIdHindi: config.bolna?.agentIdHindi,
+  };
+};
+
+/**
+ * Get agent ID based on user-selected language and country (India vs US Bolna account)
+ * @param {string} language - User-selected language ('en' or 'hi')
+ * @param {string} countryCode - 'US' or 'IN'. Default 'IN'
+ * @returns {string} Agent ID for the selected language and account
+ */
+const getAgentId = (language, countryCode = 'IN') => {
   if (!language) {
     throw new ApiError(httpStatus.BAD_REQUEST, "Language selection is required. User must choose 'en' or 'hi'.");
   }
 
+  const bolnaConfig = getBolnaConfig(countryCode);
   const normalizedLang = language.toLowerCase().trim();
   const languageMap = {
-    'en': config.bolna.agentIdEnglish,
-    'english': config.bolna.agentIdEnglish,
-    'eng': config.bolna.agentIdEnglish,
-    'hi': config.bolna.agentIdHindi,
-    'hindi': config.bolna.agentIdHindi,
-    'hin': config.bolna.agentIdHindi,
+    'en': bolnaConfig.agentIdEnglish,
+    'english': bolnaConfig.agentIdEnglish,
+    'eng': bolnaConfig.agentIdEnglish,
+    'hi': bolnaConfig.agentIdHindi,
+    'hindi': bolnaConfig.agentIdHindi,
+    'hin': bolnaConfig.agentIdHindi,
   };
 
   const agentId = languageMap[normalizedLang];
   if (!agentId) {
     throw new ApiError(
       httpStatus.BAD_REQUEST,
-      `Invalid language: '${language}'. Must be 'en' (English) or 'hi' (Hindi).`
+      `Invalid language: '${language}'. Must be 'en' (English) or 'hi' (Hindi). ${countryCode === 'US' ? 'Ensure US Bolna agent IDs are configured (AGENT_ID_US_ENGLISH, AGENT_ID_US_HINDI).' : ''}`
     );
   }
 
@@ -45,13 +70,6 @@ const getAgentId = (language) => {
  */
 export const initiateCall = async (callData) => {
   try {
-    const apiKey = config.bolna?.apiKey;
-    const apiBase = config.bolna?.apiBase || 'https://api.bolna.ai';
-
-    if (!apiKey) {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'BOLNA_API_KEY is not configured');
-    }
-
     // Validate required fields (phone and language are required, service_type and location can be empty)
     if (!callData.phone) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Missing required field: phone');
@@ -60,6 +78,35 @@ export const initiateCall = async (callData) => {
     if (!callData.language) {
       throw new ApiError(httpStatus.BAD_REQUEST, 'Missing required field: language');
     }
+
+    // Normalize phone number to E.164 format
+    const phoneNumber = normalizePhone(callData.phone);
+    if (!phoneNumber || !validatePhone(phoneNumber)) {
+      throw new ApiError(httpStatus.BAD_REQUEST, 'Invalid phone number format');
+    }
+
+    // Determine which Bolna account to use: explicit bolnaAccount (from contact call modal) > caller ID > recipient phone
+    const callerIdToUse = callData.from_phone_number || callData.fromPhoneNumber || config.bolna?.callerId;
+    const countryCode = (callData.bolnaAccount && (callData.bolnaAccount === 'US' || callData.bolnaAccount === 'IN'))
+      ? callData.bolnaAccount
+      : (callerIdToUse && detectCountryFromPhoneNumber(normalizePhone(callerIdToUse)))
+        || detectCountryFromPhoneNumber(phoneNumber)
+        || 'IN';
+
+    const bolnaConfig = getBolnaConfig(countryCode);
+    const apiKey = bolnaConfig.apiKey;
+    const apiBase = bolnaConfig.apiBase;
+
+    if (!apiKey) {
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        countryCode === 'US'
+          ? 'BOLNA_US_API_KEY is not configured. Add your US Bolna account API key for US number calling.'
+          : 'BOLNA_API_KEY is not configured'
+      );
+    }
+
+    logger.info(`Using Bolna ${countryCode} account for call to ${phoneNumber}${callerIdToUse ? ` with caller ID ${callerIdToUse}` : ''}`);
 
     // Validate language
     const language = callData.language?.toLowerCase() || 'en';
@@ -81,14 +128,8 @@ export const initiateCall = async (callData) => {
     // Get provider name from request
     const providerName = callData.business_name || callData.businessName || callData.provider_name || 'Business';
 
-    // Normalize phone number to E.164 format
-    const phoneNumber = normalizePhone(callData.phone);
-    if (!phoneNumber || !validatePhone(phoneNumber)) {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'Invalid phone number format');
-    }
-
-    // Get agent ID based on user's explicit language choice
-    const agentId = getAgentId(normalizedLanguage);
+    // Get agent ID based on user's explicit language choice and country (India vs US Bolna account)
+    const agentId = getAgentId(normalizedLanguage, countryCode);
 
     // Get template data for the service type
     const serviceType = callData.service_type || callData.serviceType || '';
@@ -143,16 +184,16 @@ export const initiateCall = async (callData) => {
 
     // Only add caller ID if configured (optional)
     // Priority: from_phone_number/fromPhoneNumber from request > configured CALLER_ID
-    const callerIdToUse = callData.from_phone_number || callData.fromPhoneNumber || config.bolna?.callerId;
+    const callerIdForPayload = callData.from_phone_number || callData.fromPhoneNumber || config.bolna?.callerId;
     
-    if (callerIdToUse) {
-      const normalizedCallerId = normalizePhone(callerIdToUse);
+    if (callerIdForPayload) {
+      const normalizedCallerId = normalizePhone(callerIdForPayload);
       if (normalizedCallerId && validatePhone(normalizedCallerId)) {
         // Check if agent is configured to use Plivo (REQUIRED for custom caller IDs)
         // Note: If you've configured Plivo in the dashboard, this check may fail due to API limitations
         // The call will still proceed with from_phone_number if the number is valid
         try {
-          const plivoConfig = await checkAgentPlivoConfig(agentId);
+          const plivoConfig = await checkAgentPlivoConfig(agentId, countryCode);
           if (!plivoConfig.isPlivoConfigured) {
             logger.warn(`⚠️  Agent ${agentId} shows as not configured with Plivo via API check.`);
             logger.warn(`Current: input_provider=${plivoConfig.inputProvider}, output_provider=${plivoConfig.outputProvider}`);
@@ -168,9 +209,9 @@ export const initiateCall = async (callData) => {
           logger.warn(`If you've set Plivo in the Bolna dashboard, the call should work.`);
         }
 
-        // Validate that the caller ID is registered in Bolna account and is a Plivo number
+        // Validate that the caller ID is registered in the correct Bolna account (India or US) and is a Plivo number
         try {
-          const validation = await validateCallerId(normalizedCallerId);
+          const validation = await validateCallerId(normalizedCallerId, countryCode);
           if (validation.valid) {
             if (!validation.isPlivo) {
               logger.warn(`Caller ID ${normalizedCallerId} is registered but may not be a Plivo number. Custom caller ID may not work.`);
@@ -362,37 +403,84 @@ export const getCallStatus = async (executionId) => {
 */
 
 /**
- * Get execution details directly from Bolna API
+ * Get execution details from a specific Bolna account (India or US)
  * @param {string} executionId - Execution ID
+ * @param {string} countryCode - 'IN' or 'US'. Uses that account's API.
  * @returns {Promise<Object>} Execution details
  */
-export const getExecutionDetails = async (executionId) => {
+const getExecutionDetailsFromAccount = async (executionId, countryCode = 'IN') => {
+  const bolnaConfig = getBolnaConfig(countryCode);
+  const { apiKey, apiBase } = bolnaConfig;
+  if (!apiKey) {
+    return null;
+  }
+  const response = await fetch(`${apiBase}/executions/${executionId}`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 30000,
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    const message = errorData.message || errorData.error || response.statusText;
+    throw new ApiError(
+      response.status || httpStatus.INTERNAL_SERVER_ERROR,
+      message
+    );
+  }
+  return response.json();
+};
+
+/**
+ * Get execution details directly from Bolna API
+ * Tries India account first; if 404 or "Agent not found", tries US account (so sync works for both accounts).
+ * @param {string} executionId - Execution ID
+ * @param {string} countryCode - Optional. 'IN' or 'US'. If not set, tries IN then US on failure.
+ * @returns {Promise<Object>} Execution details
+ */
+export const getExecutionDetails = async (executionId, countryCode = null) => {
+  const tryAccount = async (code) => {
+    const bolnaConfig = getBolnaConfig(code);
+    if (!bolnaConfig.apiKey) return null;
+    return getExecutionDetailsFromAccount(executionId, code);
+  };
+
   try {
-    const apiKey = config.bolna?.apiKey;
-    const apiBase = config.bolna?.apiBase || 'https://api.bolna.ai';
-
-    if (!apiKey) {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'BOLNA_API_KEY is not configured');
+    if (countryCode === 'US' || countryCode === 'IN') {
+      const data = await tryAccount(countryCode);
+      if (!data) {
+        throw new ApiError(httpStatus.BAD_REQUEST, countryCode === 'US' ? 'BOLNA_US_API_KEY is not configured' : 'BOLNA_API_KEY is not configured');
+      }
+      return data;
     }
 
-    const response = await fetch(`${apiBase}/executions/${executionId}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 30000,
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new ApiError(
-        response.status || httpStatus.INTERNAL_SERVER_ERROR,
-        errorData.message || errorData.error || 'Failed to get execution details from Bolna API'
-      );
+    // Try India first (default)
+    try {
+      const data = await tryAccount('IN');
+      if (data) return data;
+    } catch (indiaError) {
+      const msg = (indiaError.message || '').toLowerCase();
+      const isNotFound = indiaError.statusCode === 404 || msg.includes('not found') || msg.includes('agent not found');
+      if (!isNotFound) throw indiaError;
+      logger.info(`Execution ${executionId} not found on India Bolna account, trying US account...`);
     }
 
-    return await response.json();
+    // Try US account (e.g. execution was from US Bolna)
+    try {
+      const data = await tryAccount('US');
+      if (data) {
+        logger.info(`Execution ${executionId} found on US Bolna account`);
+        return data;
+      }
+    } catch (usError) {
+      const msg = (usError.message || '').toLowerCase();
+      const isNotFound = usError.statusCode === 404 || msg.includes('not found') || msg.includes('agent not found');
+      if (!isNotFound) throw usError;
+    }
+
+    throw new ApiError(httpStatus.NOT_FOUND, `Execution ${executionId} not found in India or US Bolna account`);
   } catch (error) {
     if (error instanceof ApiError) {
       throw error;
@@ -476,17 +564,21 @@ export const getAgentExecutionsV2 = async (agentId, options = {}) => {
 };
 
 /**
- * Get agent details from Bolna API
+ * Get agent details from Bolna API (India or US account)
  * @param {string} agentId - Agent ID
+ * @param {string} countryCode - Optional. 'US' or 'IN'. Default 'IN'
  * @returns {Promise<Object>} Agent details
  */
-export const getAgentDetails = async (agentId) => {
+export const getAgentDetails = async (agentId, countryCode = 'IN') => {
   try {
-    const apiKey = config.bolna?.apiKey;
-    const apiBase = config.bolna?.apiBase || 'https://api.bolna.ai';
+    const bolnaConfig = getBolnaConfig(countryCode);
+    const { apiKey, apiBase } = bolnaConfig;
 
     if (!apiKey) {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'BOLNA_API_KEY is not configured');
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        countryCode === 'US' ? 'BOLNA_US_API_KEY is not configured' : 'BOLNA_API_KEY is not configured'
+      );
     }
 
     const response = await fetch(`${apiBase}/v2/agent/${agentId}`, {
@@ -520,19 +612,23 @@ export const getAgentDetails = async (agentId) => {
  * Update agent configuration to set Plivo as input and output provider
  * This is required for using custom caller IDs (from_phone_number)
  * @param {string} agentId - Agent ID
+ * @param {string} countryCode - Optional. 'US' or 'IN'. Default 'IN' (use 'US' for US Bolna account agents)
  * @returns {Promise<Object>} Updated agent details
  */
-export const updateAgentToUsePlivo = async (agentId) => {
+export const updateAgentToUsePlivo = async (agentId, countryCode = 'IN') => {
   try {
-    const apiKey = config.bolna?.apiKey;
-    const apiBase = config.bolna?.apiBase || 'https://api.bolna.ai';
+    const bolnaConfig = getBolnaConfig(countryCode);
+    const { apiKey, apiBase } = bolnaConfig;
 
     if (!apiKey) {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'BOLNA_API_KEY is not configured');
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        countryCode === 'US' ? 'BOLNA_US_API_KEY is not configured' : 'BOLNA_API_KEY is not configured'
+      );
     }
 
     // First, get current agent details to preserve other settings
-    const currentAgent = await getAgentDetails(agentId);
+    const currentAgent = await getAgentDetails(agentId, countryCode);
 
     // Prepare tools_config with Plivo as input and output provider
     // Preserve existing tools_config structure if it exists
@@ -646,7 +742,7 @@ export const updateAgentToUsePlivo = async (agentId) => {
       // Wait a moment for the update to propagate
       await new Promise(resolve => setTimeout(resolve, 1000));
       
-      const verifyConfig = await checkAgentPlivoConfig(agentId);
+      const verifyConfig = await checkAgentPlivoConfig(agentId, countryCode);
       if (!verifyConfig.isPlivoConfigured) {
         logger.error(`❌ CRITICAL: Update API returned success, but agent ${agentId} is still NOT configured with Plivo!`);
         logger.error(`Update response tools_config: ${JSON.stringify(updatedAgent.tools_config || 'missing')}`);
@@ -682,11 +778,12 @@ export const updateAgentToUsePlivo = async (agentId) => {
 /**
  * Check if agent is configured to use Plivo
  * @param {string} agentId - Agent ID
+ * @param {string} countryCode - Optional. 'US' or 'IN'. Default 'IN'
  * @returns {Promise<Object>} Configuration check result
  */
-export const checkAgentPlivoConfig = async (agentId) => {
+export const checkAgentPlivoConfig = async (agentId, countryCode = 'IN') => {
   try {
-    const agentDetails = await getAgentDetails(agentId);
+    const agentDetails = await getAgentDetails(agentId, countryCode);
     
     // Check tools_config structure (new format)
     const toolsConfig = agentDetails.tools_config || {};
@@ -724,16 +821,20 @@ export const checkAgentPlivoConfig = async (agentId) => {
 };
 
 /**
- * Get all phone numbers associated with your Bolna account
+ * Get all phone numbers associated with a Bolna account (India or US)
+ * @param {string} countryCode - 'US' or 'IN'. Default 'IN'
  * @returns {Promise<Array>} List of phone numbers
  */
-export const getPhoneNumbers = async () => {
+export const getPhoneNumbers = async (countryCode = 'IN') => {
   try {
-    const apiKey = config.bolna?.apiKey;
-    const apiBase = config.bolna?.apiBase || 'https://api.bolna.ai';
+    const bolnaConfig = getBolnaConfig(countryCode);
+    const { apiKey, apiBase } = bolnaConfig;
 
     if (!apiKey) {
-      throw new ApiError(httpStatus.BAD_REQUEST, 'BOLNA_API_KEY is not configured');
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        countryCode === 'US' ? 'BOLNA_US_API_KEY is not configured' : 'BOLNA_API_KEY is not configured'
+      );
     }
 
     const response = await fetch(`${apiBase}/phone-numbers/all`, {
@@ -767,9 +868,10 @@ export const getPhoneNumbers = async () => {
 /**
  * Validate if a phone number is available in your Bolna account and is a Plivo number
  * @param {string} phoneNumber - Phone number to validate (E.164 format)
+ * @param {string} countryCode - Optional. 'US' or 'IN'. If not provided, detected from phone number
  * @returns {Promise<Object>} Validation result with phone number details if found
  */
-export const validateCallerId = async (phoneNumber) => {
+export const validateCallerId = async (phoneNumber, countryCode = null) => {
   try {
     const normalizedPhone = normalizePhone(phoneNumber);
     if (!normalizedPhone || !validatePhone(normalizedPhone)) {
@@ -779,7 +881,8 @@ export const validateCallerId = async (phoneNumber) => {
       };
     }
 
-    const phoneNumbers = await getPhoneNumbers();
+    const account = countryCode || detectCountryFromPhoneNumber(normalizedPhone) || 'IN';
+    const phoneNumbers = await getPhoneNumbers(account);
     const matchingNumber = phoneNumbers.find(
       (pn) => normalizePhone(pn.phone_number) === normalizedPhone
     );

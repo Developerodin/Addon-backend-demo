@@ -38,6 +38,75 @@ const openai = new OpenAI({
 });
 
 /**
+ * Levenshtein (edit) distance between two strings — for typo tolerance and "did you mean" suggestions.
+ */
+const levenshtein = (a, b) => {
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+  return matrix[b.length][a.length];
+};
+
+/**
+ * Find nearest supplier(s) by typo-tolerant word matching (for "did you mean" when no exact match).
+ * @param {string} query - User input (e.g. "wampum priviate limited")
+ * @param {Array<{brandName?: string, name?: string, _id?: string, id?: string}>} suppliers - All suppliers
+ * @param {{ maxTotalEditDistance?: number, maxPerWord?: number }} options
+ * @returns {{ best: { id: string, brandName: string }, score: number } | null}
+ */
+const findNearestSupplierByTypo = (query, suppliers, options = {}) => {
+  const maxTotalEditDistance = options.maxTotalEditDistance ?? 6;
+  const maxPerWord = options.maxPerWord ?? 2;
+  const queryWords = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  if (!queryWords.length || !suppliers?.length) return null;
+
+  let best = null;
+  let bestScore = Infinity;
+
+  for (const s of suppliers) {
+    const name = (s.brandName || s.name || '').trim();
+    if (!name) continue;
+    const nameWords = name.toLowerCase().split(/\s+/).filter(Boolean);
+    let totalScore = 0;
+    for (const qw of queryWords) {
+      let minDist = Infinity;
+      for (const nw of nameWords) {
+        const d = levenshtein(qw, nw);
+        if (d < minDist) minDist = d;
+      }
+      if (minDist > maxPerWord) {
+        totalScore = Infinity;
+        break;
+      }
+      totalScore += minDist;
+    }
+    if (totalScore < bestScore && totalScore <= maxTotalEditDistance) {
+      bestScore = totalScore;
+      best = {
+        id: (s._id || s.id)?.toString?.() || '',
+        brandName: name
+      };
+    }
+  }
+  return best ? { best, score: bestScore } : null;
+};
+
+/**
  * Generate pagination HTML helper
  * @param {number} currentPage - Current page number
  * @param {number} totalPages - Total number of pages
@@ -246,21 +315,23 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
 /**
  * Use OpenAI to intelligently detect intent and extract parameters
  * @param {string} question - User's question
+ * @param {Array<{role: string, content: string}>} [conversationHistory] - Recent chat turns for context (like GPT)
  * @returns {Promise<Object|null>} Intent object or null if no match
  */
-const detectIntentWithAI = async (question) => {
+const detectIntentWithAI = async (question, conversationHistory = []) => {
   try {
-    // Use OpenAI to intelligently understand the user's intent and extract parameters
-    const aiResponse = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
-      messages: [
-        {
-          role: 'system',
-          content: `You are an AI assistant that analyzes retail business queries and determines the user's intent. 
+    const historyMessages = (Array.isArray(conversationHistory) ? conversationHistory : [])
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+      .map((m) => ({ role: m.role, content: String(m.content).slice(0, 2000) }))
+      .slice(-20);
+    const messages = [
+      {
+        role: 'system',
+        content: `You are an AI assistant that analyzes retail business queries and determines the user's intent. 
           
           Analyze the user's question and return a JSON object with the following structure:
           {
-            "action": "one of: getProductForecast, getProductAnalysis, getStoreAnalysisByName, getTopProducts, getProductCount, getProductsList, getStoresList, getSalesReport, getSalesData, getAnalyticsDashboard, getBrandPerformance, getCapabilities, getMachineStatistics, getMachinesByStatus, getMachinesByFloor, getYarnCatalog, getYarnInventory, getLiveInventory, getRecentPOStatus, getYarnTransactions, getYarnRequisitions, getYarnPurchaseOrders, getYarnIssue, getYarnReturn, getYarnTypes, getYarnSuppliers, getYarnCountSizes, getYarnColors, getYarnBlends, getRawMaterials, getProcesses, getProductAttributes, getProductionOrders, getProductionDashboard, getOrders",
+            "action": "one of: getProductForecast, getProductAnalysis, getStoreAnalysisByName, getTopProducts, getProductCount, getProductsList, getStoresList, getSalesReport, getSalesData, getAnalyticsDashboard, getBrandPerformance, getCapabilities, getMachineStatistics, getMachinesByStatus, getMachinesByFloor, getYarnCatalog, getYarnInventory, getLiveInventory, getRecentPOStatus, getYarnTransactions, getYarnRequisitions, getYarnPurchaseOrders, getYarnPurchaseOrderById, createYarnPurchaseOrder, updateYarnPurchaseOrderStatus, deleteYarnPurchaseOrder, getYarnIssue, getYarnReturn, getYarnTypes, getYarnSuppliers, getYarnCountSizes, getYarnColors, getYarnBlends, getRawMaterials, getProcesses, getProductAttributes, getProductionOrders, getProductionDashboard, getOrders",
             "params": {
               // Common filters
               "limit": "extracted number limit or null",
@@ -324,8 +395,11 @@ const detectIntentWithAI = async (question) => {
               
               // Yarn Purchase Order filters
               "poNumber": "extracted PO number or null",
+              "purchaseOrderId": "extracted purchase order Mongo ID or null",
               "supplierName": "extracted supplier name or null",
               "currentStatus": "extracted PO status (submitted_to_supplier, in_transit, goods_received, qc_pending, po_rejected, po_accepted) or null",
+              "status_code": "extracted new status when updating order (e.g. in transit, goods received) or null",
+              "poItems": "array of { yarnName, quantity, rate, sizeCount?, shadeCode?, gstRate? } when placing new order or null",
               
               // Raw Material filters
               "groupName": "extracted group name for raw materials filtering or null",
@@ -371,7 +445,11 @@ const detectIntentWithAI = async (question) => {
           - For yarn transactions filtered by order number: action = "getYarnTransactions", extract orderno parameter
           - For yarn transactions filtered by date range: action = "getYarnTransactions", extract dateFrom and dateTo parameters
           - For yarn requisitions: action = "getYarnRequisitions" if asking about yarn requisitions/requests
-          - For yarn purchase orders: action = "getYarnPurchaseOrders" if asking about yarn purchase orders/PO
+          - For placing a new yarn purchase order: action = "createYarnPurchaseOrder" if user says "place order", "place new order", "place another yarn purchase order", "place yarn order", "create purchase order" (do NOT use getYarnPurchaseOrders for these)
+          - For showing/list of yarn purchase orders: action = "getYarnPurchaseOrders" if user says "show yarn purchase orders", "show yarn place order", "list orders", "yarn purchase orders", "get yarn purchase orders"
+          - For single purchase order details: action = "getYarnPurchaseOrderById" if asking for one order by PO number or ID (e.g. "order details PO-2024-001", "show purchase order PO-xxx")
+          - For updating order status: action = "updateYarnPurchaseOrderStatus" if user says "mark PO-xxx as in transit", "update order status", "set order to goods received"
+          - For deleting order: action = "deleteYarnPurchaseOrder" if user says "delete order PO-xxx", "cancel order", "remove purchase order"
           - For yarn issue: action = "getYarnIssue" if asking about yarn issued or yarn issue
           - For yarn return: action = "getYarnReturn" if asking about yarn returned or yarn return
           - For yarn types: action = "getYarnTypes" if asking about yarn types, yarn type details, or yarn subtypes
@@ -483,9 +561,10 @@ const detectIntentWithAI = async (question) => {
           - "show me yarn history" → getYarnTransactions
           - "tell me about yarn transactions" → getYarnTransactions
           - "what yarn activity do we have" → getYarnTransactions
+          - "place order", "place another yarn purchase order", "place yarn order" → createYarnPurchaseOrder (place new order)
+          - "show yarn purchase orders", "show yarn place order", "show me yarn purchase orders" → getYarnPurchaseOrders (list)
           - "do we have any yarn orders pending" → getYarnPurchaseOrders
           - "what's the status of yarn we ordered" → getYarnPurchaseOrders
-          - "show me yarn purchase orders" → getYarnPurchaseOrders
           - "tell me about yarn orders" → getYarnPurchaseOrders
           - "show me the yarn catalog" → getYarnCatalog
           - "what types of yarn are in the catalog" → getYarnCatalog
@@ -693,12 +772,16 @@ const detectIntentWithAI = async (question) => {
             - Previous: "machines which are active" → User: "any inactive" → getMachinesByStatus with machineStatus="Idle"
             - Previous: "active machines" → User: "show me idle" → getMachinesByStatus with machineStatus="Idle"
             - Previous: "machines which are active" → User: "no inactive machines" → getMachinesByStatus with machineStatus="Idle" (will show "No inactive machines found" if none exist)`
-        },
-        {
-          role: 'user',
-          content: `Analyze this query: "${question}"`
-        }
-      ],
+      },
+      ...historyMessages,
+      {
+        role: 'user',
+        content: `Analyze this query: "${question}"`
+      }
+    ];
+    const aiResponse = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages,
       temperature: 0.1,
       max_tokens: 300
     });
@@ -715,13 +798,13 @@ const detectIntentWithAI = async (question) => {
       if (jsonMatch) {
         const intent = JSON.parse(jsonMatch[0]);
         
-        // Validate the intent structure
-        if (intent.action && intent.params) {
+        // Validate: action is required; params may be null (e.g. createYarnPurchaseOrder opens wizard)
+        if (intent.action) {
           return {
             action: intent.action,
-            params: intent.params,
+            params: intent.params ?? null,
             description: intent.description || 'AI-detected intent',
-            confidence: intent.confidence || 0.9
+            confidence: intent.confidence ?? 0.9
           };
         }
       }
@@ -744,9 +827,11 @@ const detectIntentWithAI = async (question) => {
 /**
  * Enhanced intent detection for AI tool calling
  * @param {string} question - User's question
+ * @param {Object} [options] - { conversationHistory?: Array<{role, content}> } for GPT-style context
  * @returns {Object|null} Intent object or null if no match
  */
-export const detectIntent = async (question) => {
+export const detectIntent = async (question, options = {}) => {
+  const { conversationHistory } = options;
   // Normalize: fix common typos
   let normalizedQuestion = question.trim();
   normalizedQuestion = normalizedQuestion.replace(/quatity/gi, 'quantity');
@@ -800,22 +885,192 @@ export const detectIntent = async (question) => {
       confidence: 0.95
     };
   }
+
+  // PRE-CHECK: "buy [yarn] from [supplier]" and optional "100 units of ... at 50" for one-shot order
+  const buyFromMatch = question.trim().match(/(?:i\s+(?:wanna|want to)\s+)?(?:buy|purchase|order|get)\s+(.+?)\s+from\s+(.+)/i);
+  if (buyFromMatch) {
+    let yarnPart = (buyFromMatch[1] || '').trim();
+    const supplierPartRaw = (buyFromMatch[2] || '').trim();
+    let supplierPart = supplierPartRaw;
+    let rate;
+    let gstRate;
+    let quantity;
+    // Strip ", gst 12%" or " and gst is 12%" from supplier name first
+    const commaGst = supplierPart.match(/\s*,\s*(?:and\s+)?gst\s+(?:is\s+)?(\d+(?:\.\d+)?)\s*%?/i);
+    if (commaGst) {
+      gstRate = parseFloat(commaGst[1]);
+      supplierPart = supplierPart.replace(/\s*,\s*(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+    }
+    const gst = supplierPart.match(/\s+(?:and\s+)?gst\s+(?:is\s+)?(\d+(?:\.\d+)?)\s*%?/i);
+    if (gst) {
+      gstRate = parseFloat(gst[1]);
+      supplierPart = supplierPart.replace(/\s+(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+    }
+    // Strip ", 50 pieces at 500 each" or " and each piece at 500" or " at 500 per piece" and capture rate
+    const commaPiecesAt = supplierPart.match(/\s*,\s*(\d+)\s*pieces?\s*(?:(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?(\d+(?:\.\d+)?)\s*(?:each|per\s*piece)?)?/i);
+    if (commaPiecesAt) {
+      quantity = parseInt(commaPiecesAt[1], 10);
+      if (commaPiecesAt[2] != null) rate = parseFloat(commaPiecesAt[2]);
+      supplierPart = supplierPart.slice(0, commaPiecesAt.index).trim();
+    }
+    const eachPieceAt = supplierPart.match(/\s+(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?(\d+(?:\.\d+)?)(?:\s*per\s*piece)?(?:\s*each)?/i);
+    if (eachPieceAt) {
+      rate = parseFloat(eachPieceAt[1]);
+      supplierPart = supplierPart.slice(0, eachPieceAt.index).trim();
+    } else if (!commaPiecesAt) {
+      const rateMatch = supplierPartRaw.match(/\s+at\s+(?:₹|rs\.?|rupees?\s+)?(\d+(?:\.\d+)?)\s*$/i);
+      if (rateMatch) {
+        rate = parseFloat(rateMatch[1]);
+        supplierPart = supplierPartRaw.slice(0, rateMatch.index).trim();
+        if (gst) supplierPart = supplierPart.replace(/\s+(?:and\s+)?gst\s+is\s+\d+(?:\.\d+)?\s*%?/i, '').trim();
+      }
+    }
+    // Strip " i want 50 pieces" so supplier name is just "wumpum private limited"
+    const iWantPieces = supplierPart.match(/\s+i\s+want\s+(\d+)\s*pieces?/i);
+    if (iWantPieces) {
+      quantity = parseInt(iWantPieces[1], 10);
+      supplierPart = supplierPart.slice(0, iWantPieces.index).trim();
+    }
+    // Strip ", 50 pieces" when user said "wumpum private limited, 50 pieces at 500 each"
+    const commaPieces = supplierPart.match(/\s*,\s*(\d+)\s*pieces?/i);
+    if (commaPieces) {
+      quantity = parseInt(commaPieces[1], 10);
+      supplierPart = supplierPart.slice(0, commaPieces.index).trim();
+    }
+    const qtyMatch = yarnPart.match(/^(\d+)\s*(?:pieces?\s+of\s+)\s*(.+)$/i) || yarnPart.match(/^(\d+)\s*(?:units?\s+of\s+)\s*(.+)$/i);
+    if (qtyMatch) {
+      quantity = parseInt(qtyMatch[1], 10);
+      yarnPart = qtyMatch[2].trim();
+    }
+    if (supplierPart && yarnPart && !/^(yarn|some)$/i.test(yarnPart)) {
+      const poItem = { yarnName: yarnPart };
+      // Leading "33/2/120" before product name is size and count — extract and set on PO item
+      const sizeCountMatch = yarnPart.match(/^(\d+(?:\/\d+)+)\s*[-–]\s*/);
+      if (sizeCountMatch) poItem.sizeCount = sizeCountMatch[1];
+      if (quantity != null && quantity > 0) poItem.quantity = quantity;
+      if (rate != null && rate > 0) poItem.rate = rate;
+      if (gstRate != null && gstRate >= 0) poItem.gstRate = gstRate;
+      console.log(`[detectIntent] Detected "buy [yarn] from [supplier]" — supplier + yarn${quantity != null ? `, qty ${quantity}` : ''}${rate != null ? `, rate ${rate}` : ''}${gstRate != null ? `, gst ${gstRate}%` : ''}${poItem.sizeCount ? `, sizeCount ${poItem.sizeCount}` : ''}`);
+      return {
+        action: 'createYarnPurchaseOrder',
+        params: { supplierQuery: supplierPart, poItems: [poItem] },
+        description: 'Place order for specific yarn from named supplier',
+        confidence: 0.95
+      };
+    }
+  }
   
   // CRITICAL: Check regex patterns FIRST for yarn/machine/raw material/process/attribute queries
   // This prevents AI from misclassifying these specific queries
-  const criticalKeywords = ['yarn', 'machine', 'raw material', 'process', 'attribute', 'blend', 'supplier', 'color', 'count size', 'types', 'category', 'categories', 'box', 'boxes', 'cone', 'cones', 'storage'];
+  const criticalKeywords = ['yarn', 'machine', 'raw material', 'process', 'attribute', 'blend', 'supplier', 'color', 'count size', 'types', 'category', 'categories', 'box', 'boxes', 'cone', 'cones', 'storage', 'order'];
   const hasCriticalKeyword = criticalKeywords.some(keyword => normalizedQuestion.includes(keyword));
   console.log(`[detectIntent] Question: "${normalizedQuestion}", Has critical keyword: ${hasCriticalKeyword}`);
   
   if (hasCriticalKeyword) {
     // Check regex patterns first for critical keywords
     const intents = [
-      // YARN PATTERNS (Highest Priority - Check First)
+      // YARN PURCHASE ORDER: User selected a supplier from disambiguation or "see yarn list" for one supplier
       {
-        pattern: /yarn\s+purchase\s+orders?|yarn\s+po|purchase\s+orders?\s+(?:for\s+)?yarn|yarn\s+purchased|status\s+of\s+yarn\s+purchased|yarn\s+purchase\s+status|do\s+you\s+order\s+yarn|(?:what|show|tell)\s+me\s+(?:about\s+)?yarn\s+(?:purchase|order|po)/i,
+        pattern: /^SUPPLIER_SELECTED:(.+)$/i,
+        action: 'createYarnPurchaseOrder',
+        extractParams: (match) => ({ preSelectedSupplierId: match[1].trim(), showSupplierList: true }),
+        description: 'Open wizard with pre-selected supplier'
+      },
+      // YARN PURCHASE ORDER: "Show supplier list" when user chose to see list (must be before generic place order)
+      {
+        pattern: /show\s+(?:me\s+)?(?:the\s+)?supplier\s+list|supplier\s+list|see\s+(?:the\s+)?supplier\s+list|option\s*2|choose\s+from\s+(?:the\s+)?list|show\s+list/i,
+        action: 'createYarnPurchaseOrder',
+        extractParams: () => ({ showSupplierList: true }),
+        description: 'Show supplier list for place order wizard'
+      },
+      // YARN PURCHASE ORDER: "buy [yarn] from [supplier]" — capture both so we ask only quantity/rate, no supplier list
+      {
+        pattern: /(?:i\s+(?:wanna|want to)\s+)?(?:buy|purchase|order|get)\s+(.+?)\s+from\s+(.+)/i,
+        action: 'createYarnPurchaseOrder',
+        extractParams: (match) => {
+          const yarnPart = (match[1] || '').trim();
+          let supplierPart = (match[2] || '').trim();
+          if (!supplierPart) return {};
+          // Strip ", gst 12%", " and gst is 12%", ", 50 pieces at 500 each", " at 500 per piece", " i want 50 pieces", ", 50 pieces" so supplier name is clean
+          supplierPart = supplierPart.replace(/\s*,\s*(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+          supplierPart = supplierPart.replace(/\s+(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+          const eachPieceAtComma = supplierPart.match(/\s*,\s*\d+\s*pieces?\s*(?:(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?\d+(?:\.\d+)?\s*(?:each|per\s*piece)?)?/i);
+          if (eachPieceAtComma) supplierPart = supplierPart.slice(0, eachPieceAtComma.index).trim();
+          const eachPieceAt = supplierPart.match(/\s+(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?(\d+(?:\.\d+)?)(?:\s*per\s*piece)?(?:\s*each)?/i);
+          if (eachPieceAt) supplierPart = supplierPart.slice(0, eachPieceAt.index).trim();
+          const iWantPieces = supplierPart.match(/\s+i\s+want\s+\d+\s*pieces?/i);
+          if (iWantPieces) supplierPart = supplierPart.slice(0, iWantPieces.index).trim();
+          supplierPart = supplierPart.replace(/\s*,\s*\d+\s*pieces?/gi, '').trim();
+          if (!yarnPart || /^(yarn|some)$/i.test(yarnPart)) return { supplierQuery: supplierPart };
+          const poItem = { yarnName: yarnPart };
+          const sizeCountMatch = yarnPart.match(/^(\d+(?:\/\d+)+)\s*[-–]\s*/);
+          if (sizeCountMatch) poItem.sizeCount = sizeCountMatch[1];
+          return { supplierQuery: supplierPart, poItems: [poItem] };
+        },
+        description: 'Place order for specific yarn from named supplier'
+      },
+      // YARN PURCHASE ORDER: User mentioned supplier name only - "purchase yarn from Allen Solley", "buy from Wampum"
+      {
+        pattern: /(?:purchase|buy|order|get|want to purchase|want to buy|lets? purchase)\s+(?:yarn\s+)?(?:from|with)\s+([^,.?!]+)/i,
+        action: 'createYarnPurchaseOrder',
+        extractParams: (match) => {
+          const name = (match[1] || '').trim();
+          if (!name) return {};
+          return { supplierQuery: name };
+        },
+        description: 'Place order with named supplier'
+      },
+      // YARN PURCHASE ORDER: Place/Create must be checked BEFORE list (so "place another yarn purchase order" → create, not list)
+      {
+        pattern: /place\s+(?:another\s+)?(?:new\s+)?(?:yarn\s+)?(?:purchase\s+)?order|create\s+(?:new\s+)?(?:yarn\s+)?(?:purchase\s+)?order|place\s+order|create\s+purchase\s+order|place\s+yarn\s+order|(?:purchase|buy)\s+yarn|want to purchase yarn|lets? purchase yarn/i,
+        action: 'createYarnPurchaseOrder',
+        extractParams: () => ({}),
+        description: 'Place new yarn purchase order'
+      },
+      // Show/list yarn purchase orders (list when user asks to see/show/list; "place order" is handled above)
+      {
+        pattern: /(?:show|list|get|see|tell\s+me\s+about|what\s+are|display)\s+(?:me\s+)?(?:the\s+)?(?:yarn\s+)?(?:purchase\s+)?orders?|(?:show\s+)?yarn\s+place\s+order(?:s)?|yarn\s+purchase\s+orders?|yarn\s+po\b|purchase\s+orders?\s+(?:for\s+)?yarn|yarn\s+purchased|status\s+of\s+yarn\s+purchased|yarn\s+purchase\s+status|do\s+you\s+order\s+yarn|(?:what|show|tell)\s+me\s+(?:about\s+)?yarn\s+(?:purchase|order|po)/i,
         action: 'getYarnPurchaseOrders',
         extractParams: () => ({}),
-        description: 'Get yarn purchase orders'
+        description: 'Get yarn purchase orders (list)'
+      },
+      {
+        pattern: /delete\s+(?:yarn\s+)?(?:purchase\s+)?order\s+(?:po-?)?[\w\-]+|cancel\s+(?:yarn\s+)?(?:purchase\s+)?order\s+(?:po-?)?[\w\-]+|remove\s+(?:purchase\s+)?order\s+(?:po-?)?[\w\-]+/i,
+        action: 'deleteYarnPurchaseOrder',
+        extractParams: (match, question) => {
+          // Prefer PO-YYYY-NNN format; fallback to po-xxx or YYYY-NNN at end (avoid capturing "i" etc.)
+          const poMatch = question.match(/po-?(\d{4}-\d{2,})/i) || question.match(/po-?([a-z0-9\-]+)/i) || question.match(/(\d{4}-\d{2,})/);
+          if (!poMatch || !poMatch[1]) return { poNumber: null };
+          const value = poMatch[1].trim();
+          const poNumber = value.toUpperCase().startsWith('PO') ? value : `PO-${value}`;
+          return { poNumber };
+        },
+        description: 'Delete yarn purchase order'
+      },
+      {
+        pattern: /(?:order\s+details?|show\s+purchase\s+order|purchase\s+order\s+details?|get\s+order)\s+(?:po-?)?[\w\-]+|(?:order|po)\s+by\s+id\s+[\w\-]+/i,
+        action: 'getYarnPurchaseOrderById',
+        extractParams: (match, question) => {
+          const poMatch = question.match(/(?:po-?)?([a-z0-9\-]+)/i);
+          const idMatch = question.match(/id\s+([a-f0-9]{24})/i);
+          if (idMatch) return { purchaseOrderId: idMatch[1] };
+          if (poMatch) return { poNumber: poMatch[0].toUpperCase().startsWith('PO') ? poMatch[0] : `PO-${poMatch[1]}` };
+          return {};
+        },
+        description: 'Get single purchase order by PO number or ID'
+      },
+      {
+        pattern: /(?:mark|set|update)\s+(?:order\s+)?(?:po-?)?[\w\-]+\s+as\s+\w+|update\s+(?:order|purchase\s+order)\s+status|(?:mark|set)\s+order\s+.*\s+to\s+\w+/i,
+        action: 'updateYarnPurchaseOrderStatus',
+        extractParams: (match, question) => {
+          const poMatch = question.match(/(?:po-?)?([a-z0-9\-]+)/i);
+          const statusMatch = question.match(/(?:as|to)\s+([\w\s]+?)(?:\s|$|\.)/i) || question.match(/status\s+to\s+([\w\s]+)/i);
+          const params = {};
+          if (poMatch) params.poNumber = poMatch[0].toUpperCase().startsWith('PO') ? poMatch[0] : `PO-${poMatch[1]}`;
+          if (statusMatch) params.status_code = statusMatch[1].trim();
+          return params;
+        },
+        description: 'Update yarn purchase order status'
       },
       {
         pattern: /yarn\s+requisitions?|yarn\s+requests?|requisitions?\s+(?:for\s+)?yarn/i,
@@ -1136,7 +1391,7 @@ export const detectIntent = async (question) => {
   // ALWAYS try GPT-powered detection for natural language understanding
   // This allows GPT to handle natural language variations even for critical keywords
   console.log(`[detectIntent] Attempting GPT detection for natural language understanding: "${normalizedQuestion}"`);
-  const aiIntent = await detectIntentWithAI(question);
+  const aiIntent = await detectIntentWithAI(question, conversationHistory);
   if (aiIntent) {
     console.log(`[detectIntent] ✅ GPT detected intent: ${aiIntent.action} for "${normalizedQuestion}"`);
     return aiIntent;
@@ -4872,6 +5127,7 @@ export const getMachinesByFloor = async (params = {}) => {
  */
 export const getYarnCatalog = async (params = {}) => {
   try {
+    const safeParams = params && typeof params === 'object' ? params : {};
     const { 
       yarnType, 
       yarnName, 
@@ -4886,7 +5142,7 @@ export const getYarnCatalog = async (params = {}) => {
       status,
       limit = 20, 
       page = 1 
-    } = params;
+    } = safeParams;
     const currentPage = parseInt(page) || 1;
     const pageLimit = parseInt(limit) || 20;
     
@@ -6994,6 +7250,592 @@ export const getYarnPurchaseOrders = async (params = {}) => {
 };
 
 /**
+ * Resolve purchase order id from poNumber or return id if already valid
+ * @param {string} purchaseOrderIdOrPoNumber - Mongo Id or PO number
+ * @returns {Promise<string|null>} Mongo Id
+ */
+const resolvePurchaseOrderId = async (purchaseOrderIdOrPoNumber) => {
+  if (!purchaseOrderIdOrPoNumber || typeof purchaseOrderIdOrPoNumber !== 'string') return null;
+  const val = purchaseOrderIdOrPoNumber.trim();
+  const ObjectId = (await import('mongoose')).default.Types.ObjectId;
+  if (ObjectId.isValid(val) && String(new ObjectId(val)) === val) {
+    return val;
+  }
+  const order = await yarnPurchaseOrderService.getPurchaseOrderByPoNumber(val);
+  return order ? order._id?.toString() : null;
+};
+
+/**
+ * Get single yarn purchase order by ID or PO number (for agent)
+ * @param {Object} params - { purchaseOrderId, poNumber }
+ * @returns {Promise<string>} HTML
+ */
+export const getYarnPurchaseOrderById = async (params = {}) => {
+  try {
+    const id = params.purchaseOrderId || params.poNumber || params.orderId;
+    if (!id) {
+      return generateHTMLResponse('Purchase Order Details', 'Please specify a purchase order ID or PO number (e.g. "order details PO-2024-001" or "order by id &lt;id&gt;").');
+    }
+    let order = null;
+    const objectId = (await import('mongoose')).default.Types.ObjectId;
+    if (objectId.isValid(id) && String(new objectId(id)) === id) {
+      order = await yarnPurchaseOrderService.getPurchaseOrderById(id);
+    } else {
+      order = await yarnPurchaseOrderService.getPurchaseOrderByPoNumber(id);
+    }
+    if (!order) {
+      return generateHTMLResponse('Purchase Order Not Found', `No purchase order found for "${id}".`);
+    }
+    const supplierName = order.supplier?.brandName || (typeof order.supplier === 'string' ? order.supplier : 'N/A');
+    const status = order.currentStatus || order.status || 'N/A';
+    const items = (order.poItems || []).map((item) => {
+      const yarnName = item.yarnName || (item.yarn?.yarnName) || 'N/A';
+      const rate = item.rate ?? 0;
+      const qty = item.quantity ?? 0;
+      const lineTotal = rate * qty;
+      return `<tr><td>${yarnName}</td><td>${item.sizeCount || '-'}</td><td>${item.shadeCode || '-'}</td><td>${rate}</td><td>${qty}</td><td>₹${lineTotal.toLocaleString()}</td></tr>`;
+    }).join('');
+    const html = AI_TOOL_STYLES + `
+      <div class="ai-tool-response">
+        <h3>🛒 Purchase Order: ${order.poNumber || 'N/A'}</h3>
+        <div class="kpi-grid">
+          <div class="kpi-item"><div class="kpi-label">Supplier</div><div class="kpi-value">${supplierName}</div></div>
+          <div class="kpi-item"><div class="kpi-label">Status</div><div class="kpi-value">${status.replace(/_/g, ' ')}</div></div>
+          <div class="kpi-item"><div class="kpi-label">Total</div><div class="kpi-value">₹${(order.total ?? order.totalAmount ?? 0).toLocaleString()}</div></div>
+        </div>
+        <div class="table-container">
+          <table class="data-table">
+            <thead><tr><th>Yarn</th><th>Count</th><th>Shade</th><th>Rate</th><th>Qty</th><th>Line Total</th></tr></thead>
+            <tbody>${items}</tbody>
+          </table>
+        </div>
+        <p class="summary">PO ${order.poNumber || ''} — ${order.poItems?.length || 0} item(s).</p>
+      </div>`;
+    return html;
+  } catch (error) {
+    console.error('Error in getYarnPurchaseOrderById:', error);
+    return generateHTMLResponse('Error', `Failed to get purchase order: ${error.message}`);
+  }
+};
+
+/**
+ * Create yarn purchase order (place new order) from agent params
+ * When params are empty, returns orderWizardData (suppliers + yarn catalog) for frontend wizard.
+ * Expects: poNumber, supplierName, poItems: [{ yarnName, quantity, rate, sizeCount?, shadeCode?, gstRate? }], notes?
+ * @param {Object} params
+ * @returns {Promise<string|{html: string, orderWizardData: Object}>} HTML or wizard payload
+ */
+export const createYarnPurchaseOrder = async (params = {}) => {
+  try {
+    const safeParams = params ?? {};
+    const { poNumber, supplierName, supplier: supplierId, poItems: rawItems, notes, showSupplierList, supplierQuery, preSelectedSupplierId } = safeParams;
+    const hasOrderDetails = poNumber && (supplierName || supplierId) && Array.isArray(rawItems) && rawItems.length > 0;
+
+    if (!hasOrderDetails) {
+      // "Buy [yarn] from [supplier]" — resolve supplier, validate yarn(s); if all items have qty+rate, create order directly; else return wizard
+      const initialItems = Array.isArray(rawItems) ? rawItems : (rawItems && typeof rawItems === 'object' ? [rawItems] : []);
+      const yarnOnlyItems = initialItems.filter((it) => (it.yarnName || it.yarn_name || it.name || '').trim());
+      const allItemsHaveQtyAndRate = yarnOnlyItems.length > 0 && yarnOnlyItems.every(
+        (it) => Number(it.quantity) > 0 && Number(it.rate) > 0
+      );
+      if (supplierQuery && typeof supplierQuery === 'string' && supplierQuery.trim() && yarnOnlyItems.length > 0) {
+        let query = supplierQuery.trim();
+        // Strip order-detail phrases so "wumpum private limited, 50 pieces at 500 each, gst 12%" or "wumpum private limited i want 50 pieces..." -> "wumpum private limited"
+        query = query.replace(/\s*,\s*(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+        query = query.replace(/\s+(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+        const eachPieceAt = query.match(/\s+(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?(\d+(?:\.\d+)?)(?:\s*per\s*piece)?(?:\s*each)?/i);
+        if (eachPieceAt) query = query.slice(0, eachPieceAt.index).trim();
+        const eachPieceAtComma = query.match(/\s*,\s*\d+\s*pieces?\s*(?:(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?\d+(?:\.\d+)?\s*(?:each|per\s*piece)?)?/i);
+        if (eachPieceAtComma) query = query.slice(0, eachPieceAtComma.index).trim();
+        const iWantPieces = query.match(/\s+i\s+want\s+\d+\s*pieces?/i);
+        if (iWantPieces) query = query.slice(0, iWantPieces.index).trim();
+        query = query.replace(/\s*,\s*\d+\s*pieces?/gi, '').trim();
+        const words = query.split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        const fuzzyPattern = words.length ? words.join('.*') : query;
+        const suppliersResult = await supplierService.querySuppliers({ brandName: fuzzyPattern }, { limit: 20, page: 1 });
+        let matches = suppliersResult?.results ?? suppliersResult ?? [];
+        if (matches.length === 0) {
+          const allSuppliersResult = await supplierService.querySuppliers({}, { limit: 200, page: 1 });
+          const allSuppliers = allSuppliersResult?.results ?? allSuppliersResult ?? [];
+          const nearest = findNearestSupplierByTypo(query, allSuppliers, { maxTotalEditDistance: 6, maxPerWord: 2 });
+          if (nearest) matches = [{ _id: nearest.best.id, brandName: nearest.best.brandName }];
+        }
+        if (matches.length === 0) {
+          return generateHTMLResponse('Supplier not found', `No supplier found matching "${query}". Please check the name or choose from the supplier list.`);
+        }
+        const one = matches[0];
+        const supplierId = one._id?.toString?.() || one.id;
+        const supplierBrandName = one.brandName || one.name || 'Unknown';
+        const catalogYarns = [];
+        const resolvedOnePerItem = [];
+        for (const it of yarnOnlyItems) {
+          const yarnName = (it.yarnName || it.yarn_name || it.name || '').trim();
+          const sizeCount = (it.sizeCount || '').trim() || undefined;
+          let catalogResult = await yarnCatalogService.queryYarnCatalogs(sizeCount ? { yarnName, sizeCount } : { yarnName }, { limit: 20 });
+          let results = catalogResult?.results ?? catalogResult ?? [];
+          if (results.length === 0 && sizeCount) {
+            catalogResult = await yarnCatalogService.queryYarnCatalogs({ yarnName }, { limit: 20 });
+            results = (catalogResult?.results ?? catalogResult ?? []).filter(
+              (y) => (y.yarnName && y.yarnName.startsWith(sizeCount + '-')) || (y.countSize && String(y.countSize.name || '').trim() === String(sizeCount).trim())
+            );
+          }
+          if (results.length === 0) {
+            return generateHTMLResponse('Yarn not found', `Yarn "${yarnName}"${sizeCount ? ` (size/count ${sizeCount})` : ''} not found in catalog. Please check the name or size and count.`);
+          }
+          const pickOne = (y) => {
+            const countSizes = [];
+            if (y.countSize && (y.countSize._id || y.countSize.id)) {
+              const id = (y.countSize._id || y.countSize.id).toString?.() || y.countSize._id || y.countSize.id;
+              const name = y.countSize.name || id;
+              if (!countSizes.some((cs) => cs.id === id)) countSizes.push({ id, name });
+            }
+            const subtypeCountSizes = y.yarnSubtype?.countSize || [];
+            if (Array.isArray(subtypeCountSizes)) {
+              subtypeCountSizes.forEach((cs) => {
+                const id = (cs?._id || cs?.id)?.toString?.() || cs;
+                const name = (typeof cs === 'object' && (cs?.name || cs?.label)) || id;
+                if (id && !countSizes.some((c) => c.id === (id.toString?.() || id))) {
+                  countSizes.push({ id: id.toString?.() || id, name });
+                }
+              });
+            }
+            let shadeCode = (y.pantonShade || y.pantonName || (y.colorFamily?.name || '')).trim() || undefined;
+            if (!shadeCode && (y.yarnName || y.name)) {
+              const nameStr = (y.yarnName || y.name || '').trim();
+              const parts = nameStr.split('-').map((p) => p.trim()).filter(Boolean);
+              if (parts.length >= 2) shadeCode = parts[1] || parts[2] || undefined;
+            }
+            return {
+              id: (y._id || y.id)?.toString?.() || '',
+              yarnName: y.yarnName || y.name || 'Unknown',
+              countSizes: countSizes.length ? countSizes : undefined,
+              shadeCode
+            };
+          };
+          if (sizeCount || results.length === 1) {
+            const y = results[0];
+            const entry = pickOne(y);
+            catalogYarns.push(entry);
+            resolvedOnePerItem.push(entry);
+          } else {
+            for (const y of results) catalogYarns.push(pickOne(y));
+            resolvedOnePerItem.push(null);
+          }
+        }
+        const canDirectOrder = allItemsHaveQtyAndRate && resolvedOnePerItem.every((e) => e != null) && resolvedOnePerItem.length === yarnOnlyItems.length;
+        if (canDirectOrder) {
+          const nextPoNumber = await yarnPurchaseOrderService.getNextSuggestedPoNumber();
+          const poItems = [];
+          let subTotal = 0;
+          let gstTotal = 0;
+          for (let i = 0; i < yarnOnlyItems.length; i++) {
+            const it = yarnOnlyItems[i];
+            const y = resolvedOnePerItem[i];
+            const quantity = Number(it.quantity) || 0;
+            const rate = Number(it.rate) || 0;
+            const gstRate = Number(it.gstRate) || 0;
+            const lineTotal = rate * quantity;
+            const lineGst = (lineTotal * gstRate) / 100;
+            subTotal += lineTotal;
+            gstTotal += lineGst;
+            poItems.push({
+              yarn: y.id,
+              yarnName: y.yarnName,
+              sizeCount: (it.sizeCount || '-').trim() || '-',
+              shadeCode: (it.shadeCode || '').trim() || undefined,
+              rate,
+              quantity,
+              gstRate: gstRate || undefined,
+              estimatedDeliveryDate: it.estimatedDeliveryDate ? new Date(it.estimatedDeliveryDate) : undefined,
+            });
+          }
+          const total = subTotal + gstTotal;
+          const body = {
+            poNumber: nextPoNumber,
+            supplierName: supplierBrandName,
+            supplier: supplierId,
+            poItems,
+            notes: notes || undefined,
+            subTotal,
+            gst: gstTotal,
+            total,
+            currentStatus: 'submitted_to_supplier',
+          };
+          const created = await yarnPurchaseOrderService.createPurchaseOrder(body);
+          const msg = `Purchase order <strong>${created.poNumber}</strong> created successfully — ${poItems.length} item(s), total ₹${total.toLocaleString()}.`;
+          return generateHTMLResponse('Order Placed', msg);
+        }
+        const [suppliersResultAll, nextPoNumber] = await Promise.all([
+          supplierService.querySuppliers({}, { limit: 200, page: 1 }),
+          yarnPurchaseOrderService.getNextSuggestedPoNumber()
+        ]);
+        const suppliersAll = suppliersResultAll?.results ?? suppliersResultAll ?? [];
+        const suppliersList = suppliersAll.map((s) => ({
+          id: (s._id || s.id)?.toString?.() || s.id,
+          brandName: s.brandName || s.name || 'Unknown'
+        }));
+        const yarnNamesList = catalogYarns.map((y) => y.yarnName).join(', ');
+        const multiVariantNote = catalogYarns.length > yarnOnlyItems.length
+          ? ' <strong>Same product with different size/count — choose the variant you need below.</strong>'
+          : '';
+        const introHtml = `<p>Got it — you want <strong>${yarnNamesList}</strong> from <strong>${supplierBrandName}</strong>.</p>${multiVariantNote}<p>Enter quantity, rate (₹/unit), and other details below — no need to pick from the supplier list.</p>`;
+        const initialPoItems = yarnOnlyItems.map((it) => ({
+          quantity: it.quantity ?? 0,
+          rate: it.rate ?? 0,
+          gstRate: it.gstRate ?? 0,
+          sizeCount: it.sizeCount || undefined
+        }));
+        return {
+          html: introHtml,
+          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogYarns, nextPoNumber, preSelectedSupplierId: supplierId, initialPoItems }
+        };
+      }
+
+      // User mentioned a supplier name only: look up with fuzzy/partial match so "wampum limited 2" finds "WAMPUM SYNTEX PRIVATE LIMITED 2"
+      if (supplierQuery && typeof supplierQuery === 'string' && supplierQuery.trim()) {
+        let query = supplierQuery.trim();
+        // Strip order-detail phrases so supplier name is clean for lookup (including ", 50 pieces at 500 each, gst 12%")
+        query = query.replace(/\s*,\s*(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+        query = query.replace(/\s+(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
+        const eachPieceAt = query.match(/\s+(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?(\d+(?:\.\d+)?)(?:\s*per\s*piece)?(?:\s*each)?/i);
+        if (eachPieceAt) query = query.slice(0, eachPieceAt.index).trim();
+        const eachPieceAtComma = query.match(/\s*,\s*\d+\s*pieces?\s*(?:(?:and\s+)?(?:each\s+piece\s+at|at)\s+(?:₹|rs\.?|rupees?\s+)?\d+(?:\.\d+)?\s*(?:each|per\s*piece)?)?/i);
+        if (eachPieceAtComma) query = query.slice(0, eachPieceAtComma.index).trim();
+        const iWantPieces = query.match(/\s+i\s+want\s+\d+\s*pieces?/i);
+        if (iWantPieces) query = query.slice(0, iWantPieces.index).trim();
+        query = query.replace(/\s*,\s*\d+\s*pieces?/gi, '').trim();
+        const words = query.split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        const fuzzyPattern = words.length ? words.join('.*') : query;
+        const suppliersResult = await supplierService.querySuppliers(
+          { brandName: fuzzyPattern },
+          { limit: 20, page: 1 }
+        );
+        let matches = suppliersResult?.results ?? suppliersResult ?? [];
+        if (matches.length === 0) {
+          const allSuppliersResult = await supplierService.querySuppliers({}, { limit: 200, page: 1 });
+          const allSuppliers = allSuppliersResult?.results ?? allSuppliersResult ?? [];
+          const nearest = findNearestSupplierByTypo(query, allSuppliers, { maxTotalEditDistance: 6, maxPerWord: 2 });
+          if (nearest) {
+            const { best, score } = nearest;
+            if (score <= 2) {
+              const html = `<p>Got it — you want to order from <strong>${best.brandName}</strong>. What would you like to buy?</p><p>You can tell me the yarn name(s) and quantity, or click below to see the list of yarns from ${best.brandName}.</p>`;
+              return {
+                html,
+                orderWizardPrompt: 'choose_yarn_for_supplier',
+                preSelectedSupplier: { id: best.id, brandName: best.brandName }
+              };
+            }
+            const matchingSuppliers = [{ id: best.id, brandName: best.brandName }];
+            const html = `<p>No supplier found matching "<strong>${query}</strong>". Did you mean <strong>${best.brandName}</strong>?</p><p>Click below to order from ${best.brandName}, or try a different name.</p>`;
+            return {
+              html,
+              orderWizardPrompt: 'disambiguate_supplier',
+              matchingSuppliers
+            };
+          }
+          return generateHTMLResponse('Supplier not found', `No supplier found matching "${query}". Please check the name or choose from the supplier list.`);
+        }
+        if (matches.length === 1) {
+          const one = matches[0];
+          const id = one._id?.toString?.() || one.id;
+          const brandName = one.brandName || one.name || 'Unknown';
+          const html = `<p>Got it — you want to order from <strong>${brandName}</strong>. What would you like to buy?</p><p>You can tell me the yarn name(s) and quantity, or click below to see the list of yarns from ${brandName}.</p>`;
+          return {
+            html,
+            orderWizardPrompt: 'choose_yarn_for_supplier',
+            preSelectedSupplier: { id, brandName }
+          };
+        }
+        // Multiple suppliers matching (e.g. "Wampum")
+        const matchingSuppliers = matches.map((s) => ({
+          id: s._id?.toString?.() || s.id,
+          brandName: s.brandName || s.name || 'Unknown'
+        }));
+        const namesList = matchingSuppliers.map((s) => s.brandName).join(', ');
+        const html = `<p>There are <strong>${matches.length}</strong> suppliers matching "${query}". Which one do you mean?</p><p>${namesList}</p><p>Click the supplier you want below.</p>`;
+        return {
+          html,
+          orderWizardPrompt: 'disambiguate_supplier',
+          matchingSuppliers
+        };
+      }
+
+      // User selected a supplier from disambiguation or "see yarn list" for one supplier: return wizard with that supplier pre-selected
+      if (showSupplierList && preSelectedSupplierId) {
+        const selectedSupplier = await supplierService.getSupplierById(preSelectedSupplierId);
+        const supplierYarnNames = selectedSupplier?.yarnDetails?.length
+          ? [...new Set((selectedSupplier.yarnDetails || [])
+              .map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim())
+              .filter(Boolean))]
+          : [];
+        const catalogFilter = supplierYarnNames.length > 0
+          ? { yarnName: { $in: supplierYarnNames } }
+          : {};
+        const [suppliersResult, catalogResult, nextPoNumber] = await Promise.all([
+          supplierService.querySuppliers({}, { limit: 200, page: 1 }),
+          yarnCatalogService.queryYarnCatalogs(catalogFilter, { limit: 500, page: 1 }),
+          yarnPurchaseOrderService.getNextSuggestedPoNumber()
+        ]);
+        const suppliers = suppliersResult?.results ?? suppliersResult ?? [];
+        const yarnCatalog = catalogResult?.results ?? catalogResult ?? [];
+        const suppliersList = suppliers.map((s) => ({
+          id: s._id?.toString?.() || s.id,
+          brandName: s.brandName || s.name || 'Unknown'
+        }));
+        const catalogList = yarnCatalog.map((y) => {
+          const countSizes = [];
+          if (y.countSize && (y.countSize._id || y.countSize.id)) {
+            const id = (y.countSize._id || y.countSize.id).toString?.() || y.countSize._id || y.countSize.id;
+            const name = y.countSize.name || id;
+            if (!countSizes.some((cs) => cs.id === id)) countSizes.push({ id, name });
+          }
+          const subtypeCountSizes = y.yarnSubtype?.countSize || [];
+          if (Array.isArray(subtypeCountSizes)) {
+            subtypeCountSizes.forEach((cs) => {
+              const id = (cs?._id || cs?.id)?.toString?.() || cs;
+              const name = (typeof cs === 'object' && (cs?.name || cs?.label)) || id;
+              if (id && !countSizes.some((c) => c.id === (id.toString?.() || id))) {
+                countSizes.push({ id: id.toString?.() || id, name });
+              }
+            });
+          }
+        let shadeCode = (y.pantonShade || y.pantonName || (y.colorFamily?.name || '')).trim() || undefined;
+        if (!shadeCode && (y.yarnName || y.name)) {
+          const nameStr = (y.yarnName || y.name || '').trim();
+          const parts = nameStr.split('-').map((p) => p.trim()).filter(Boolean);
+          if (parts.length >= 2) shadeCode = parts[1] || parts[2] || undefined;
+        }
+        return {
+          id: y._id?.toString?.() || y.id,
+          yarnName: y.yarnName || y.name || 'Unknown',
+          countSizes: countSizes.length ? countSizes : undefined,
+          shadeCode
+        };
+      });
+        const introHtml = '<p>Select yarn items and enter quantity and rate for each. Supplier is already chosen.</p>';
+        return {
+          html: introHtml,
+          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogList, nextPoNumber, preSelectedSupplierId }
+        };
+      }
+
+      // If user chose "Show supplier list" (no pre-selected), return full wizard data with per-supplier yarn lists so frontend can filter
+      if (showSupplierList) {
+        const [suppliersResult, catalogResult, nextPoNumber] = await Promise.all([
+          supplierService.querySuppliers({}, { limit: 200, page: 1 }),
+          yarnCatalogService.queryYarnCatalogs({}, { limit: 500, page: 1 }),
+          yarnPurchaseOrderService.getNextSuggestedPoNumber()
+        ]);
+        const suppliers = suppliersResult?.results ?? suppliersResult ?? [];
+        const yarnCatalog = catalogResult?.results ?? catalogResult ?? [];
+        const suppliersList = suppliers.map((s) => ({
+          id: s._id?.toString?.() || s.id,
+          brandName: s.brandName || s.name || 'Unknown'
+        }));
+        const suppliersWithYarns = suppliers.map((s) => {
+          const yarnNames = (s.yarnDetails || [])
+            .map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim())
+            .filter(Boolean);
+          return {
+            id: (s._id || s.id)?.toString?.() || '',
+            brandName: s.brandName || s.name || 'Unknown',
+            yarnNames: [...new Set(yarnNames)]
+          };
+        });
+        const catalogList = yarnCatalog.map((y) => {
+        const countSizes = [];
+        if (y.countSize && (y.countSize._id || y.countSize.id)) {
+          const id = (y.countSize._id || y.countSize.id).toString?.() || y.countSize._id || y.countSize.id;
+          const name = y.countSize.name || id;
+          if (!countSizes.some((cs) => cs.id === id)) countSizes.push({ id, name });
+        }
+        const subtypeCountSizes = y.yarnSubtype?.countSize || [];
+        if (Array.isArray(subtypeCountSizes)) {
+          subtypeCountSizes.forEach((cs) => {
+            const id = (cs?._id || cs?.id)?.toString?.() || cs;
+            const name = (typeof cs === 'object' && (cs?.name || cs?.label)) || id;
+            if (id && !countSizes.some((c) => c.id === (id.toString?.() || id))) {
+              countSizes.push({ id: id.toString?.() || id, name });
+            }
+          });
+        }
+        let shadeCode = (y.pantonShade || y.pantonName || (y.colorFamily?.name || '')).trim() || undefined;
+        if (!shadeCode && (y.yarnName || y.name)) {
+          const nameStr = (y.yarnName || y.name || '').trim();
+          const parts = nameStr.split('-').map((p) => p.trim()).filter(Boolean);
+          if (parts.length >= 2) shadeCode = parts[1] || parts[2] || undefined;
+        }
+        return {
+          id: y._id?.toString?.() || y.id,
+          yarnName: y.yarnName || y.name || 'Unknown',
+          countSizes: countSizes.length ? countSizes : undefined,
+          shadeCode
+        };
+      });
+        const introHtml = '<p>Select a supplier and yarn items below to place your order. Choose one supplier, then select yarns and enter quantity and rate for each.</p>';
+        return {
+          html: introHtml,
+          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogList, nextPoNumber, suppliersWithYarns }
+        };
+      }
+
+      // No supplier mentioned: ask user to either give supplier name or show supplier list
+      const chooseSupplierHtml = '<p>To place a yarn purchase order, I need the supplier. You can either:</p><ul><li><strong>Tell me your supplier name</strong> (e.g. type "ABC Yarns" in the chat)</li><li><strong>Show the supplier list</strong> to choose from (click the button below)</li></ul>';
+      return {
+        html: chooseSupplierHtml,
+        orderWizardPrompt: 'choose_supplier'
+      };
+    }
+    let supplier = null;
+    if (supplierId) {
+      supplier = await supplierService.getSupplierById(supplierId);
+    } else {
+      const result = await supplierService.querySuppliers({ brandName: supplierName }, { limit: 1 });
+      supplier = result?.results?.[0] || result?.[0] || null;
+    }
+    if (!supplier) {
+      return generateHTMLResponse('Create Order Failed', `Supplier not found: "${supplierName || supplierId}". Please use an existing supplier name.`);
+    }
+    const supplierObjId = supplier._id?.toString?.() || supplier.id;
+    const supplierYarnNames = (supplier.yarnDetails || [])
+      .map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim())
+      .filter(Boolean);
+    const items = Array.isArray(rawItems) ? rawItems : (rawItems && typeof rawItems === 'object' ? [rawItems] : []);
+    if (items.length === 0) {
+      return generateHTMLResponse('Create Order Failed', 'At least one PO item is required (yarn name, quantity, rate).');
+    }
+    const poItems = [];
+    let subTotal = 0;
+    let gstTotal = 0;
+    for (const it of items) {
+      const yarnName = (it.yarnName || it.yarn_name || it.name || '').trim();
+      const quantity = Number(it.quantity ?? it.qty ?? 0);
+      const rate = Number(it.rate ?? 0);
+      const sizeCount = (it.sizeCount || it.size_count || it.count || '').trim() || '-';
+      const shadeCode = (it.shadeCode || it.shade_code || it.shade || '').trim() || '';
+      const gstRate = Number(it.gstRate ?? it.gst_rate ?? 0);
+      if (!yarnName || quantity <= 0 || rate <= 0) continue;
+      if (supplierYarnNames.length > 0) {
+        const supplierHasYarn = supplierYarnNames.some((s) => s.toLowerCase().trim() === yarnName.toLowerCase().trim());
+        if (!supplierHasYarn) {
+          return generateHTMLResponse('Create Order Failed', `Supplier "${supplier.brandName || supplierName}" does not list yarn "${yarnName}". Choose a yarn from their catalog.`);
+        }
+      }
+      const catalogList = await yarnCatalogService.queryYarnCatalogs({ yarnName }, { limit: 1 });
+      const yarnCatalog = catalogList?.results?.[0] || catalogList?.[0] || null;
+      if (!yarnCatalog) {
+        return generateHTMLResponse('Create Order Failed', `Yarn not found in catalog: "${yarnName}". Add the yarn to the catalog first.`);
+      }
+      const yarnId = yarnCatalog._id?.toString?.() || yarnCatalog.id;
+      const lineTotal = rate * quantity;
+      const lineGst = gstRate ? (lineTotal * gstRate) / 100 : 0;
+      subTotal += lineTotal;
+      gstTotal += lineGst;
+      poItems.push({
+        yarn: yarnId,
+        yarnName: yarnCatalog.yarnName || yarnName,
+        sizeCount,
+        shadeCode: shadeCode || undefined,
+        rate,
+        quantity,
+        gstRate: gstRate || undefined,
+        estimatedDeliveryDate: it.estimatedDeliveryDate ? new Date(it.estimatedDeliveryDate) : undefined,
+      });
+    }
+    if (poItems.length === 0) {
+      return generateHTMLResponse('Create Order Failed', 'No valid items (yarn name, quantity > 0, rate > 0).');
+    }
+    const total = subTotal + gstTotal;
+    const body = {
+      poNumber: String(poNumber).trim(),
+      supplierName: supplier.brandName || supplierName,
+      supplier: supplierObjId,
+      poItems,
+      notes: notes || undefined,
+      subTotal,
+      gst: gstTotal,
+      total,
+      currentStatus: 'submitted_to_supplier',
+    };
+    const created = await yarnPurchaseOrderService.createPurchaseOrder(body);
+    const msg = `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}.`;
+    return generateHTMLResponse('Order Placed', msg);
+  } catch (error) {
+    console.error('Error in createYarnPurchaseOrder:', error);
+    return generateHTMLResponse('Error', `Failed to create purchase order: ${error.message}`);
+  }
+};
+
+/**
+ * Update yarn purchase order status (for agent)
+ * @param {Object} params - { purchaseOrderId or poNumber, status_code }
+ * @returns {Promise<string>} HTML
+ */
+export const updateYarnPurchaseOrderStatus = async (params = {}) => {
+  try {
+    const idOrPo = params.purchaseOrderId || params.poNumber || params.orderId;
+    const statusCode = params.status_code || params.status;
+    if (!idOrPo || !statusCode) {
+      return generateHTMLResponse('Update Status', 'Please specify order (ID or PO number) and new status (e.g. "mark PO-2024-001 as in transit").');
+    }
+    const purchaseOrderId = await resolvePurchaseOrderId(idOrPo);
+    if (!purchaseOrderId) {
+      return generateHTMLResponse('Order Not Found', `No purchase order found for "${idOrPo}".`);
+    }
+    const statusMap = {
+      'submitted to supplier': 'submitted_to_supplier',
+      'in transit': 'in_transit',
+      'goods received': 'goods_received',
+      'qc pending': 'qc_pending',
+      'po accepted': 'po_accepted',
+      'po rejected': 'po_rejected',
+      'goods partially received': 'goods_partially_received',
+      'po accepted partially': 'po_accepted_partially',
+    };
+    const code = (statusMap[String(statusCode).toLowerCase().replace(/\s+/g, ' ')] || String(statusCode).replace(/\s+/g, '_')).toLowerCase();
+    const validStatuses = ['submitted_to_supplier', 'in_transit', 'goods_received', 'goods_partially_received', 'qc_pending', 'po_rejected', 'po_accepted', 'po_accepted_partially'];
+    const finalCode = validStatuses.find((s) => s.replace(/_/g, ' ') === code.replace(/_/g, ' ')) || (validStatuses.includes(code) ? code : null);
+    if (!finalCode) {
+      return generateHTMLResponse('Invalid Status', `Valid statuses: ${validStatuses.join(', ')}`);
+    }
+    const mongoose = await import('mongoose');
+    await yarnPurchaseOrderService.updatePurchaseOrderStatus(
+      purchaseOrderId,
+      finalCode,
+      { username: 'agent', user_id: new mongoose.default.Types.ObjectId().toString() },
+      null
+    );
+    return generateHTMLResponse('Status Updated', `Purchase order "${idOrPo}" status set to <strong>${finalCode.replace(/_/g, ' ')}</strong>.`);
+  } catch (error) {
+    console.error('Error in updateYarnPurchaseOrderStatus:', error);
+    return generateHTMLResponse('Error', `Failed to update status: ${error.message}`);
+  }
+};
+
+/**
+ * Delete yarn purchase order (for agent)
+ * @param {Object} params - { purchaseOrderId or poNumber }
+ * @returns {Promise<string>} HTML
+ */
+export const deleteYarnPurchaseOrder = async (params = {}) => {
+  try {
+    const idOrPo = params.purchaseOrderId || params.poNumber || params.orderId;
+    if (!idOrPo) {
+      return generateHTMLResponse('Delete Order', 'Please specify order ID or PO number to delete (e.g. "delete order PO-2024-001").');
+    }
+    const purchaseOrderId = await resolvePurchaseOrderId(idOrPo);
+    if (!purchaseOrderId) {
+      return generateHTMLResponse('Order Not Found', `No purchase order found for "${idOrPo}".`);
+    }
+    await yarnPurchaseOrderService.deletePurchaseOrderById(purchaseOrderId);
+    return generateHTMLResponse('Order Deleted', `Purchase order "${idOrPo}" has been deleted.`);
+  } catch (error) {
+    console.error('Error in deleteYarnPurchaseOrder:', error);
+    return generateHTMLResponse('Error', `Failed to delete purchase order: ${error.message}`);
+  }
+};
+
+/**
  * Get yarn types
  * @param {Object} params - Parameters with optional filters (name, status, yarnTypeName, yarnSubtype, details)
  * @returns {Promise<string>} HTML string with yarn types
@@ -8579,12 +9421,97 @@ export const getSalesData = async (params = {}) => {
   }
 };
 
+// Pending confirmation guardrails for destructive/update actions (yes/no)
+const PENDING_CONFIRM_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const pendingConfirmations = new Map();
+
+const getPendingConfirmation = (sessionId) => {
+  if (!sessionId) return null;
+  const entry = pendingConfirmations.get(sessionId);
+  if (!entry) return null;
+  if (Date.now() - entry.at > PENDING_CONFIRM_TTL_MS) {
+    pendingConfirmations.delete(sessionId);
+    return null;
+  }
+  return entry;
+};
+
+const setPendingConfirmation = (sessionId, data) => {
+  if (!sessionId) return;
+  pendingConfirmations.set(sessionId, { ...data, at: Date.now() });
+};
+
+const clearPendingConfirmation = (sessionId) => {
+  if (sessionId) pendingConfirmations.delete(sessionId);
+};
+
+const CONFIRM_VARIANTS = ['yes', 'y', 'confirm'];
+const CANCEL_VARIANTS = ['no', 'n', 'cancel'];
+
+/**
+ * Resolve pending confirmation when user types yes/no (or y/n, confirm/cancel).
+ * If there is a pending confirmation but the message is unclear, re-prompt without clearing.
+ * @param {string} sessionId - Chat session id
+ * @param {string} message - User message
+ * @returns {{ resolved: boolean, response?: string }} If resolved, response is HTML
+ */
+export const resolvePendingConfirmation = async (sessionId, message) => {
+  const pending = getPendingConfirmation(sessionId);
+  if (!pending) return { resolved: false };
+  const normalized = String(message).toLowerCase().trim();
+  const isConfirm = CONFIRM_VARIANTS.includes(normalized);
+  const isCancel = CANCEL_VARIANTS.includes(normalized);
+  if (!isConfirm && !isCancel) {
+    return {
+      resolved: true,
+      response: generateHTMLResponse(
+        'Confirm',
+        '<p>Please type <strong>yes</strong> to confirm or <strong>no</strong> to cancel.</p>'
+      )
+    };
+  }
+  clearPendingConfirmation(sessionId);
+  if (isConfirm) {
+    try {
+      const response = await executeAITool(
+        { action: pending.action, params: pending.params },
+        { skipConfirmation: true }
+      );
+      return { resolved: true, response };
+    } catch (err) {
+      return { resolved: true, response: generateHTMLResponse('Error', err.message || 'Action failed.') };
+    }
+  }
+  return {
+    resolved: true,
+    response: generateHTMLResponse('Cancelled', `${pending.label || 'Action'} was cancelled. Type a new command to continue.`)
+  };
+};
+
 /**
  * Execute AI tool based on detected intent
  * @param {Object} intent - Detected intent object
+ * @param {Object} options - { sessionId?: string, skipConfirmation?: boolean }
  * @returns {Promise<string>} HTML response
  */
-export const executeAITool = async (intent) => {
+export const executeAITool = async (intent, options = {}) => {
+  const { sessionId, skipConfirmation } = options;
+  const needsConfirmation = sessionId && !skipConfirmation &&
+    (intent.action === 'deleteYarnPurchaseOrder' || intent.action === 'updateYarnPurchaseOrderStatus');
+
+  if (needsConfirmation) {
+    const idOrPo = intent.params?.purchaseOrderId || intent.params?.poNumber || intent.params?.orderId || 'this order';
+    const label = intent.action === 'deleteYarnPurchaseOrder'
+      ? `Delete purchase order ${idOrPo}`
+      : `Update status of purchase order ${idOrPo}`;
+    setPendingConfirmation(sessionId, { action: intent.action, params: intent.params, label });
+    const actionVerb = intent.action === 'deleteYarnPurchaseOrder' ? 'delete' : 'update the status of';
+    return generateHTMLResponse(
+      'Confirm',
+      `<p><strong>Are you sure</strong> you want to ${actionVerb} <strong>${idOrPo}</strong>?</p><p>Type <strong>yes</strong> to confirm or <strong>no</strong> to cancel.</p>`
+    );
+  }
+
   try {
     switch (intent.action) {
       // Existing actions
@@ -8640,6 +9567,14 @@ export const executeAITool = async (intent) => {
         return await getYarnRequisitions(intent.params);
       case 'getYarnPurchaseOrders':
         return await getYarnPurchaseOrders(intent.params);
+      case 'getYarnPurchaseOrderById':
+        return await getYarnPurchaseOrderById(intent.params);
+      case 'createYarnPurchaseOrder':
+        return await createYarnPurchaseOrder(intent.params);
+      case 'updateYarnPurchaseOrderStatus':
+        return await updateYarnPurchaseOrderStatus(intent.params);
+      case 'deleteYarnPurchaseOrder':
+        return await deleteYarnPurchaseOrder(intent.params);
       case 'getYarnTypes':
         return await getYarnTypes(intent.params);
       case 'getYarnSuppliers':
@@ -8716,6 +9651,10 @@ export default {
   getYarnReturn,
   getYarnRequisitions,
   getYarnPurchaseOrders,
+  getYarnPurchaseOrderById,
+  createYarnPurchaseOrder,
+  updateYarnPurchaseOrderStatus,
+  deleteYarnPurchaseOrder,
   getYarnTypes,
   getYarnSuppliers,
   getYarnCountSizes,

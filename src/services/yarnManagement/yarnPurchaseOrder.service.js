@@ -1,4 +1,5 @@
 import httpStatus from 'http-status';
+import mongoose from 'mongoose';
 import { YarnPurchaseOrder, YarnBox } from '../../models/index.js';
 import ApiError from '../../utils/ApiError.js';
 import { yarnPurchaseOrderStatuses, lotStatuses } from '../../models/yarnReq/yarnPurchaseOrder.model.js';
@@ -49,14 +50,89 @@ export const getPurchaseOrderById = async (purchaseOrderId) => {
   return purchaseOrder;
 };
 
+/**
+ * Get purchase order by PO number (for agent/FAQ lookup)
+ * @param {string} poNumber - PO number
+ * @returns {Promise<Object|null>}
+ */
+export const getPurchaseOrderByPoNumber = async (poNumber) => {
+  if (!poNumber || typeof poNumber !== 'string' || !poNumber.trim()) {
+    return null;
+  }
+  const order = await YarnPurchaseOrder.findOne({ poNumber: poNumber.trim() })
+    .populate({
+      path: 'supplier',
+      select: '_id brandName contactPersonName contactNumber email address city state',
+    })
+    .populate({
+      path: 'poItems.yarn',
+      select: '_id yarnName yarnType status',
+    })
+    .lean();
+  return order;
+};
+
+/**
+ * Get only the status of a purchase order by PO number (lightweight lookup).
+ * @param {string} poNumber - PO number (e.g. PO-2025-001)
+ * @returns {Promise<{ poNumber: string, currentStatus: string }|null>}
+ */
+export const getPurchaseOrderStatusByPoNumber = async (poNumber) => {
+  if (!poNumber || typeof poNumber !== 'string' || !poNumber.trim()) {
+    return null;
+  }
+  const order = await YarnPurchaseOrder.findOne(
+    { poNumber: poNumber.trim() },
+    { poNumber: 1, currentStatus: 1, _id: 0 }
+  )
+    .lean();
+  if (!order) return null;
+  return {
+    poNumber: order.poNumber,
+    currentStatus: order.currentStatus || null,
+  };
+};
+
+/**
+ * Suggest next PO number for new orders (e.g. PO-2025-001, PO-2025-002).
+ * Finds the highest PO number for the current year and increments it.
+ * @returns {Promise<string>} e.g. "PO-2025-001"
+ */
+export const getNextSuggestedPoNumber = async () => {
+  const year = new Date().getFullYear();
+  const prefix = `PO-${year}-`;
+  const orders = await YarnPurchaseOrder.find({ poNumber: new RegExp(`^${prefix}\\d+$`) })
+    .sort({ poNumber: -1 })
+    .limit(1)
+    .select('poNumber')
+    .lean();
+  const lastOrder = orders[0];
+  if (!lastOrder || !lastOrder.poNumber) {
+    return `${prefix}001`;
+  }
+  const match = lastOrder.poNumber.match(new RegExp(`^${prefix}(\\d+)$`));
+  const nextNum = match ? parseInt(match[1], 10) + 1 : 1;
+  return `${prefix}${String(nextNum).padStart(3, '0')}`;
+};
+
 export const createPurchaseOrder = async (purchaseOrderBody) => {
   const existing = await YarnPurchaseOrder.findOne({ poNumber: purchaseOrderBody.poNumber });
   if (existing) {
-    throw new ApiError(httpStatus.BAD_REQUEST, 'PO number already exists');
+    const suggestedPoNumber = await getNextSuggestedPoNumber();
+    throw new ApiError(httpStatus.BAD_REQUEST, 'PO number already exists', true, '', { suggestedPoNumber });
   }
 
-  const statusLogs = purchaseOrderBody.statusLogs || [];
   const currentStatus = purchaseOrderBody.currentStatus || yarnPurchaseOrderStatuses[0];
+  let statusLogs = purchaseOrderBody.statusLogs || [];
+  if (statusLogs.length === 0) {
+    statusLogs = [
+      {
+        statusCode: currentStatus,
+        updatedBy: { username: 'system', user: new mongoose.Types.ObjectId() },
+        notes: 'Order created',
+      },
+    ];
+  }
 
   const payload = {
     ...purchaseOrderBody,

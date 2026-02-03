@@ -11,6 +11,15 @@ const trainFaq = {
 const askQuestion = {
   body: Joi.object().keys({
     question: Joi.string().required().min(1).max(1000).trim(),
+    sessionId: Joi.string().optional().max(128).trim(),
+    context: Joi.object().keys({ lastOrderWizardPrompt: Joi.string().optional() }).optional(),
+    conversationHistory: Joi.array()
+      .items(Joi.object().keys({
+        role: Joi.string().valid('user', 'assistant').required(),
+        content: Joi.string().max(3000).allow('')
+      }))
+      .max(50)
+      .optional()
   }),
 };
 

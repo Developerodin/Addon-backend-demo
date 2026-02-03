@@ -15,6 +15,7 @@ const createCall = {
     country: Joi.string().optional(),
     language: Joi.string().valid('en', 'hi').default('en'),
     fromPhoneNumber: Joi.string().optional(),
+    bolnaAccount: Joi.string().valid('US', 'IN').optional().description('Which Bolna account to use: US or IN (from contact call modal country selection)'),
   }),
 };
 
@@ -201,6 +202,7 @@ const createBulkCalls = {
           country: Joi.string().optional(),
           language: Joi.string().valid('en', 'hi').default('en'),
           fromPhoneNumber: Joi.string().optional(),
+          bolnaAccount: Joi.string().valid('US', 'IN').optional(),
         })
       )
       .min(1)

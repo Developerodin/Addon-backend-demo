@@ -4,12 +4,27 @@ import * as plivoService from '../../services/crm/plivoService.js';
 import logger from '../../config/logger.js';
 
 /**
- * Get current account balance
+ * Get current account balance (India account by default)
  */
 export const getBalance = catchAsync(async (req, res) => {
-  const balance = await plivoService.getAccountBalance();
+  const countryCode = req.query.country || 'IN';
+  const balance = await plivoService.getAccountBalance(countryCode);
   
-  logger.info(`Fetched Plivo account balance: ${balance.balance} ${balance.currency}`);
+  logger.info(`Fetched Plivo account balance (${countryCode}): ${balance.balance} ${balance.currency}`);
+  
+  res.status(httpStatus.OK).send({
+    success: true,
+    balance,
+  });
+});
+
+/**
+ * Get US account balance
+ */
+export const getBalanceUS = catchAsync(async (req, res) => {
+  const balance = await plivoService.getAccountBalance('US');
+  
+  logger.info(`Fetched Plivo US account balance: ${balance.balance} ${balance.currency}`);
   
   res.status(httpStatus.OK).send({
     success: true,
@@ -34,12 +49,13 @@ export const getUsage = catchAsync(async (req, res) => {
 });
 
 /**
- * Get account information
+ * Get account information (India account by default)
  */
 export const getAccountInfo = catchAsync(async (req, res) => {
-  const accountInfo = await plivoService.getAccountInfo();
+  const countryCode = req.query.country || 'IN';
+  const accountInfo = await plivoService.getAccountInfo(countryCode);
   
-  logger.info(`Fetched Plivo account info: ${accountInfo.name || accountInfo.authId}`);
+  logger.info(`Fetched Plivo account info (${countryCode}): ${accountInfo.name || accountInfo.authId}`);
   
   res.status(httpStatus.OK).send({
     success: true,
@@ -48,7 +64,21 @@ export const getAccountInfo = catchAsync(async (req, res) => {
 });
 
 /**
- * Update account details
+ * Get US account information
+ */
+export const getAccountInfoUS = catchAsync(async (req, res) => {
+  const accountInfo = await plivoService.getAccountInfo('US');
+  
+  logger.info(`Fetched Plivo US account info: ${accountInfo.name || accountInfo.authId}`);
+  
+  res.status(httpStatus.OK).send({
+    success: true,
+    account: accountInfo,
+  });
+});
+
+/**
+ * Update account details (India account by default)
  */
 export const updateAccount = catchAsync(async (req, res) => {
   const {
@@ -58,6 +88,8 @@ export const updateAccount = catchAsync(async (req, res) => {
     address,
     timezone,
   } = req.body;
+  
+  const countryCode = req.query.country || 'IN';
   
   const updates = {
     name,
@@ -81,9 +113,9 @@ export const updateAccount = catchAsync(async (req, res) => {
     });
   }
   
-  const result = await plivoService.updateAccount(updates);
+  const result = await plivoService.updateAccount(updates, countryCode);
   
-  logger.info(`Updated Plivo account details`);
+  logger.info(`Updated Plivo account details (${countryCode})`);
   
   res.status(httpStatus.ACCEPTED).send({
     success: true,
@@ -92,14 +124,32 @@ export const updateAccount = catchAsync(async (req, res) => {
 });
 
 /**
- * Get recent usage records
+ * Get recent usage records (India account by default)
  */
 export const getRecentUsage = catchAsync(async (req, res) => {
   const limit = parseInt(req.query.limit, 10) || 50;
+  const countryCode = req.query.country || 'IN';
   
-  const usage = await plivoService.getRecentUsage(limit);
+  const usage = await plivoService.getRecentUsage(limit, countryCode);
   
-  logger.info(`Fetched ${usage.length} recent Plivo usage records`);
+  logger.info(`Fetched ${usage.length} recent Plivo usage records (${countryCode})`);
+  
+  res.status(httpStatus.OK).send({
+    success: true,
+    usage,
+    count: usage.length,
+  });
+});
+
+/**
+ * Get US account recent usage records
+ */
+export const getRecentUsageUS = catchAsync(async (req, res) => {
+  const limit = parseInt(req.query.limit, 10) || 50;
+  
+  const usage = await plivoService.getRecentUsage(limit, 'US');
+  
+  logger.info(`Fetched ${usage.length} recent Plivo US usage records`);
   
   res.status(httpStatus.OK).send({
     success: true,
@@ -250,10 +300,11 @@ export const purchasePhoneNumber = catchAsync(async (req, res) => {
  */
 export const getOwnedNumbers = catchAsync(async (req, res) => {
   const limit = parseInt(req.query.limit, 10) || 50;
+  const countryCode = req.query.country || null; // null means fetch from both accounts
   
-  const numbers = await plivoService.getOwnedNumbers(limit);
+  const numbers = await plivoService.getOwnedNumbers(limit, countryCode);
   
-  logger.info(`Fetched ${numbers.length} owned Plivo phone numbers`);
+  logger.info(`Fetched ${numbers.length} owned Plivo phone numbers${countryCode ? ` (${countryCode})` : ' (all accounts)'}`);
   
   res.status(httpStatus.OK).send({
     success: true,
@@ -292,6 +343,7 @@ export const getLiveCalls = catchAsync(async (req, res) => {
   const filters = {
     call_direction: req.query.call_direction,
     number: req.query.number,
+    countryCode: req.query.country || 'IN',
   };
   
   // Remove undefined values
@@ -303,7 +355,7 @@ export const getLiveCalls = catchAsync(async (req, res) => {
   
   const result = await plivoService.getLiveCalls(filters);
   
-  logger.info(`Fetched ${result.calls.length} live Plivo calls`);
+  logger.info(`Fetched ${result.calls.length} live Plivo calls (${filters.countryCode || 'IN'})`);
   
   res.status(httpStatus.OK).send({
     success: true,
@@ -315,9 +367,10 @@ export const getLiveCalls = catchAsync(async (req, res) => {
  * Get all queued calls
  */
 export const getQueuedCalls = catchAsync(async (req, res) => {
-  const result = await plivoService.getQueuedCalls();
+  const countryCode = req.query.country || 'IN';
+  const result = await plivoService.getQueuedCalls(countryCode);
   
-  logger.info(`Fetched ${result.calls.length} queued Plivo calls`);
+  logger.info(`Fetched ${result.calls.length} queued Plivo calls (${countryCode})`);
   
   res.status(httpStatus.OK).send({
     success: true,
@@ -361,6 +414,7 @@ export const startCallRecording = catchAsync(async (req, res) => {
     callbackUrl,
     callbackMethod,
     recordChannelType,
+    countryCode,
   } = req.body;
   
   if (!callUuid) {
@@ -378,6 +432,7 @@ export const startCallRecording = catchAsync(async (req, res) => {
     callbackUrl,
     callbackMethod,
     recordChannelType,
+    countryCode: countryCode || 'IN',
   };
   
   // Remove undefined values
@@ -389,7 +444,7 @@ export const startCallRecording = catchAsync(async (req, res) => {
   
   const result = await plivoService.startCallRecording(callUuid, options);
   
-  logger.info(`Started recording for call: ${callUuid}`);
+  logger.info(`Started recording for call: ${callUuid} (${options.countryCode})`);
   
   res.status(httpStatus.ACCEPTED).send({
     success: true,
@@ -402,7 +457,7 @@ export const startCallRecording = catchAsync(async (req, res) => {
  */
 export const stopCallRecording = catchAsync(async (req, res) => {
   const { callUuid } = req.params;
-  const { recordUrl } = req.body;
+  const { recordUrl, countryCode } = req.body;
   
   if (!callUuid) {
     return res.status(httpStatus.BAD_REQUEST).send({
@@ -411,9 +466,9 @@ export const stopCallRecording = catchAsync(async (req, res) => {
     });
   }
   
-  const result = await plivoService.stopCallRecording(callUuid, recordUrl);
+  const result = await plivoService.stopCallRecording(callUuid, recordUrl, countryCode || 'IN');
   
-  logger.info(`Stopped recording for call: ${callUuid}`);
+  logger.info(`Stopped recording for call: ${callUuid} (${countryCode || 'IN'})`);
   
   res.status(httpStatus.OK).send({
     success: true,
