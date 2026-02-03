@@ -89,6 +89,21 @@ export const getPurchaseOrderStatusByPoNumber = {
   }),
 };
 
+/** GET supplier yarn tearweight via PO: query poNumber + yarnName (string or array) */
+export const getSupplierTearweightByPoAndYarnName = {
+  query: Joi.object().keys({
+    poNumber: poNumberParam.required(),
+    yarnName: Joi.alternatives()
+      .try(Joi.string().trim().min(1), Joi.array().items(Joi.string().trim().min(1)).min(1))
+      .required()
+      .messages({ 'any.required': 'At least one yarnName is required' }),
+  }),
+};
+
+export const getNextSuggestedPoNumber = {
+  params: Joi.object().keys({}),
+};
+
 export const deletePurchaseOrder = {
   params: Joi.object().keys({
     purchaseOrderId: Joi.string().custom(objectId).required(),

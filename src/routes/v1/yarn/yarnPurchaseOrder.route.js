@@ -17,6 +17,13 @@ router
   );
 
 router
+  .route('/tearweight')
+  .get(
+    validate(yarnPurchaseOrderValidation.getSupplierTearweightByPoAndYarnName),
+    yarnPurchaseOrderController.getSupplierTearweightByPoAndYarnName
+  );
+
+router
   .route('/lot-status')
   .patch(
     validate(yarnPurchaseOrderValidation.updateLotStatus),
@@ -28,6 +35,14 @@ router
   .patch(
     validate(yarnPurchaseOrderValidation.updateLotStatusAndQcApprove),
     yarnPurchaseOrderController.updateLotStatusAndQcApprove
+  );
+
+// Next suggested PO number (must be before /:purchaseOrderId)
+router
+  .route('/next-po-number')
+  .get(
+    validate(yarnPurchaseOrderValidation.getNextSuggestedPoNumber),
+    yarnPurchaseOrderController.getNextSuggestedPoNumber
   );
 
 // By PO number (must be before /:purchaseOrderId so "by-po" is not treated as ID)

@@ -59,6 +59,27 @@ export const getPurchaseOrderStatusByPoNumber = catchAsync(async (req, res) => {
   res.status(httpStatus.OK).send(result);
 });
 
+/**
+ * Get next suggested PO number (e.g. PO-2025-001, PO-2025-002).
+ */
+export const getNextSuggestedPoNumber = catchAsync(async (req, res) => {
+  const suggestedPoNumber = await yarnPurchaseOrderService.getNextSuggestedPoNumber();
+  res.status(httpStatus.OK).send({ suggestedPoNumber });
+});
+
+/**
+ * Get supplier tearweight for given yarn name(s) using a PO number.
+ * Query: poNumber, yarnName (single string or repeated: yarnName=a&yarnName=b)
+ */
+export const getSupplierTearweightByPoAndYarnName = catchAsync(async (req, res) => {
+  const { poNumber } = req.query;
+  const yarnNameParam = req.query.yarnName;
+  const yarnNames = Array.isArray(yarnNameParam) ? yarnNameParam : yarnNameParam ? [yarnNameParam] : [];
+
+  const result = await yarnPurchaseOrderService.getSupplierTearweightByPoAndYarnName(poNumber, yarnNames);
+  res.status(httpStatus.OK).send(result);
+});
+
 export const deletePurchaseOrder = catchAsync(async (req, res) => {
   const { purchaseOrderId } = req.params;
   await yarnPurchaseOrderService.deletePurchaseOrderById(purchaseOrderId);

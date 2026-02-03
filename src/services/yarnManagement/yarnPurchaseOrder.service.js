@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import { YarnPurchaseOrder, YarnBox } from '../../models/index.js';
 import ApiError from '../../utils/ApiError.js';
 import { yarnPurchaseOrderStatuses, lotStatuses } from '../../models/yarnReq/yarnPurchaseOrder.model.js';
+import * as supplierService from './supplier.service.js';
 
 export const getPurchaseOrders = async ({ startDate, endDate, statusCode }) => {
   const start = new Date(startDate);
@@ -113,6 +114,62 @@ export const getNextSuggestedPoNumber = async () => {
   const match = lastOrder.poNumber.match(new RegExp(`^${prefix}(\\d+)$`));
   const nextNum = match ? parseInt(match[1], 10) + 1 : 1;
   return `${prefix}${String(nextNum).padStart(3, '0')}`;
+};
+
+/**
+ * Get supplier tearweight for yarn(s) based on PO number.
+ *
+ * - If a single yarnName is provided, returns a single-object response:
+ *   { poNumber, supplierId, yarnName, tearweight, notFound }
+ * - If multiple yarnName values are provided, returns the list-style response:
+ *   { poNumber, supplierId, yarnTearweights: [...], notFound: [...] }
+ * @param {string} poNumber
+ * @param {string|string[]} yarnNames
+ * @returns {Promise<Object>}
+ */
+export const getSupplierTearweightByPoAndYarnName = async (poNumber, yarnNames) => {
+  const normalizedPoNumber = poNumber ? String(poNumber).trim() : '';
+  if (!normalizedPoNumber) {
+    throw new ApiError(httpStatus.BAD_REQUEST, 'poNumber is required');
+  }
+
+  const order = await YarnPurchaseOrder.findOne({ poNumber: normalizedPoNumber })
+    .select('poNumber supplier')
+    .lean();
+
+  if (!order) {
+    throw new ApiError(httpStatus.NOT_FOUND, `Purchase order not found for PO number: ${normalizedPoNumber}`);
+  }
+
+  const supplierId = order.supplier?.toString?.() || order.supplier;
+  if (!supplierId) {
+    throw new ApiError(httpStatus.BAD_REQUEST, 'Supplier not found for this purchase order');
+  }
+
+  const requestedNamesRaw = Array.isArray(yarnNames) ? yarnNames : yarnNames ? [yarnNames] : [];
+  const requestedNames = requestedNamesRaw.map((n) => String(n).trim()).filter(Boolean);
+
+  const result = await supplierService.getSupplierYarnTearweight(supplierId, requestedNames);
+
+  // If the caller asked for exactly one yarn name, return the single-object shape (as in the shared file)
+  if (requestedNames.length === 1) {
+    const yarnName = requestedNames[0];
+    const match = (result.yarnTearweights || []).find((y) => String(y.yarnName).trim() === yarnName);
+    const notFound = (result.notFound || []).includes(yarnName);
+    return {
+      poNumber: order.poNumber,
+      supplierId: result.supplierId,
+      yarnName,
+      tearweight: match ? match.tearweight : null,
+      notFound,
+    };
+  }
+
+  // Otherwise keep the list-style response
+  return {
+    poNumber: order.poNumber,
+    ...result,
+  };
 };
 
 export const createPurchaseOrder = async (purchaseOrderBody) => {
