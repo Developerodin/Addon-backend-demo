@@ -374,6 +374,76 @@ export const askQuestion = async (question, options = {}) => {
 
     const { sessionId, context, conversationHistory } = options;
 
+    // In-chat edit: when we're editing an order (context.editOrderPo) and user sends an edit instruction, apply it
+    if (context?.editOrderPo?.purchaseOrderId) {
+      try {
+        const result = await aiToolService.applyYarnPurchaseOrderEdit(context.editOrderPo.purchaseOrderId, normalizedQuestion);
+        const responseStr = result.html || '';
+        return {
+          type: 'ai_tool',
+          intent: { action: 'applyYarnPurchaseOrderEdit' },
+          response: responseStr,
+          confidence: 0.95,
+          source: 'ai_tool_service',
+          contextUsed: true,
+          ...(result.editOrderContext !== undefined && { editOrderContext: result.editOrderContext })
+        };
+      } catch (err) {
+        console.warn('Apply edit failed:', err?.message);
+      }
+    }
+
+    // Session context: when we asked "which order to edit?" and user replies with a PO number, treat as edit that order
+    const poNumberMatch = normalizedQuestion.match(/^(?:po-?)?(\d{4}-\d{2,})$/i) || (normalizedQuestion.length <= 20 && normalizedQuestion.match(/^po-?[a-z0-9\-]+$/i));
+    const poForFollowUp = poNumberMatch ? (poNumberMatch[0].toUpperCase().startsWith('PO') ? poNumberMatch[0] : `PO-${poNumberMatch[1]}`) : null;
+    if (poForFollowUp) {
+      if (context?.awaitingFollowUp === 'edit_order_po') {
+        try {
+          const aiResponse = await aiToolService.executeAITool(
+            { action: 'editYarnPurchaseOrder', params: { poNumber: poForFollowUp }, confidence: 0.95 },
+            { sessionId }
+          );
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? '');
+          return {
+            type: 'ai_tool',
+            intent: { action: 'editYarnPurchaseOrder', params: { poNumber: poForFollowUp } },
+            response: responseStr,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true,
+            awaitingFollowUp: null,
+            ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
+          };
+        } catch (err) {
+          console.warn('Edit order follow-up failed:', err?.message);
+        }
+      } else if (Array.isArray(conversationHistory) && conversationHistory.length >= 2) {
+        const lastAssistant = conversationHistory.filter(m => m.role === 'assistant').pop();
+        const lastContent = (lastAssistant?.content || '').toLowerCase();
+        const wasAskingWhichOrderToEdit = /which order to edit|specify which order|edit yarn purchase order details/i.test(lastContent);
+        if (wasAskingWhichOrderToEdit) {
+          try {
+            const aiResponse = await aiToolService.executeAITool(
+              { action: 'editYarnPurchaseOrder', params: { poNumber: poForFollowUp }, confidence: 0.95 },
+              { sessionId }
+            );
+            const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? '');
+            return {
+              type: 'ai_tool',
+              intent: { action: 'editYarnPurchaseOrder', params: { poNumber: poForFollowUp } },
+              response: responseStr,
+              confidence: 0.95,
+              source: 'ai_tool_service',
+              contextUsed: true,
+              ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
+            };
+          } catch (err) {
+            console.warn('Edit order follow-up from history failed:', err?.message);
+          }
+        }
+      }
+    }
+
     // When user is in "choose supplier" flow, treat short reply as supplier name (e.g. "wampum", "allen solley")
     if (context?.lastOrderWizardPrompt === 'choose_supplier') {
       const isShowList = /show\s+(?:me\s+)?(?:the\s+)?supplier\s+list|supplier\s+list|see\s+(?:the\s+)?supplier\s+list|option\s*2|choose\s+from\s+(?:the\s+)?list|show\s+list/i.test(normalizedQuestion);
@@ -424,21 +494,24 @@ export const askQuestion = async (question, options = {}) => {
       }
     }
     
-    // Run order-action intent (delete/update order) before FAQ so they are never overridden by FAQ match
-    const orderActionPattern = /\b(delete|cancel|remove|update|mark|set)\b.*\b(?:purchase\s+)?order\b.*(?:po-?)?[\w\-]+/i;
+    // Run order-action intent (delete/update status/edit order) before FAQ so they are never overridden by FAQ match
+    const orderActionPattern = /\b(delete|cancel|remove|update|mark|set|edit)\b.*\b(?:purchase\s+)?order\b|edit\s+order/i;
     if (orderActionPattern.test(normalizedQuestion)) {
       const orderIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
-      if (orderIntent && (orderIntent.action === 'deleteYarnPurchaseOrder' || orderIntent.action === 'updateYarnPurchaseOrder')) {
+      if (orderIntent && (orderIntent.action === 'deleteYarnPurchaseOrder' || orderIntent.action === 'updateYarnPurchaseOrderStatus' || orderIntent.action === 'editYarnPurchaseOrder')) {
         try {
           const aiResponse = await aiToolService.executeAITool(orderIntent, { sessionId });
-          const responsePayload = typeof aiResponse === 'string' ? { response: aiResponse } : { response: aiResponse?.html ?? String(aiResponse) };
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
+          const isAskingWhichOrderToEdit = orderIntent.action === 'editYarnPurchaseOrder' && /please specify which order to edit/i.test(responseStr);
           return {
             type: 'ai_tool',
             intent: orderIntent,
-            ...responsePayload,
+            response: responseStr,
             confidence: orderIntent.confidence ?? 0.95,
             source: 'ai_tool_service',
-            orderActionHandled: true
+            orderActionHandled: true,
+            ...(isAskingWhichOrderToEdit ? { awaitingFollowUp: 'edit_order_po' } : {}),
+            ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
           };
         } catch (orderErr) {
           console.warn('Order action execution failed, continuing to FAQ:', orderErr?.message);

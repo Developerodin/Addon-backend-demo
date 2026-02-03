@@ -331,7 +331,7 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           
           Analyze the user's question and return a JSON object with the following structure:
           {
-            "action": "one of: getProductForecast, getProductAnalysis, getStoreAnalysisByName, getTopProducts, getProductCount, getProductsList, getStoresList, getSalesReport, getSalesData, getAnalyticsDashboard, getBrandPerformance, getCapabilities, getMachineStatistics, getMachinesByStatus, getMachinesByFloor, getYarnCatalog, getYarnInventory, getLiveInventory, getRecentPOStatus, getYarnTransactions, getYarnRequisitions, getYarnPurchaseOrders, getYarnPurchaseOrderById, createYarnPurchaseOrder, updateYarnPurchaseOrderStatus, deleteYarnPurchaseOrder, getYarnIssue, getYarnReturn, getYarnTypes, getYarnSuppliers, getYarnCountSizes, getYarnColors, getYarnBlends, getRawMaterials, getProcesses, getProductAttributes, getProductionOrders, getProductionDashboard, getOrders",
+            "action": "one of: getProductForecast, getProductAnalysis, getStoreAnalysisByName, getTopProducts, getProductCount, getProductsList, getStoresList, getSalesReport, getSalesData, getAnalyticsDashboard, getBrandPerformance, getCapabilities, getMachineStatistics, getMachinesByStatus, getMachinesByFloor, getYarnCatalog, getYarnInventory, getLiveInventory, getRecentPOStatus, getYarnTransactions, getYarnRequisitions, getYarnPurchaseOrders, getYarnPurchaseOrderById, createYarnPurchaseOrder, editYarnPurchaseOrder, updateYarnPurchaseOrderStatus, deleteYarnPurchaseOrder, getYarnIssue, getYarnReturn, getYarnTypes, getYarnSuppliers, getYarnCountSizes, getYarnColors, getYarnBlends, getRawMaterials, getProcesses, getProductAttributes, getProductionOrders, getProductionDashboard, getOrders",
             "params": {
               // Common filters
               "limit": "extracted number limit or null",
@@ -448,7 +448,8 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - For placing a new yarn purchase order: action = "createYarnPurchaseOrder" if user says "place order", "place new order", "place another yarn purchase order", "place yarn order", "create purchase order" (do NOT use getYarnPurchaseOrders for these)
           - For showing/list of yarn purchase orders: action = "getYarnPurchaseOrders" if user says "show yarn purchase orders", "show yarn place order", "list orders", "yarn purchase orders", "get yarn purchase orders"
           - For single purchase order details: action = "getYarnPurchaseOrderById" if asking for one order by PO number or ID (e.g. "order details PO-2024-001", "show purchase order PO-xxx")
-          - For updating order status: action = "updateYarnPurchaseOrderStatus" if user says "mark PO-xxx as in transit", "update order status", "set order to goods received"
+          - For editing order details (items, quantities, supplier): action = "editYarnPurchaseOrder" if user says "edit order", "I wanna edit order PO-xxx", "edit order details" (this is NOT status change)
+          - For updating order STATUS only: action = "updateYarnPurchaseOrderStatus" only when user explicitly says "update status", "mark PO-xxx as in transit", "set order to goods received", "change status to ..."
           - For deleting order: action = "deleteYarnPurchaseOrder" if user says "delete order PO-xxx", "cancel order", "remove purchase order"
           - For yarn issue: action = "getYarnIssue" if asking about yarn issued or yarn issue
           - For yarn return: action = "getYarnReturn" if asking about yarn returned or yarn return
@@ -1059,18 +1060,35 @@ export const detectIntent = async (question, options = {}) => {
         },
         description: 'Get single purchase order by PO number or ID'
       },
+      // Edit order = order details (items, quantities), NOT status. "I wanna edit order", "edit order PO-xxx"
       {
-        pattern: /(?:mark|set|update)\s+(?:order\s+)?(?:po-?)?[\w\-]+\s+as\s+\w+|update\s+(?:order|purchase\s+order)\s+status|(?:mark|set)\s+order\s+.*\s+to\s+\w+/i,
+        pattern: /(?:i\s+)?(?:wanna|want\s+to)\s+edit\s+(?:the\s+)?order|edit\s+(?:the\s+)?(?:order\s+)?(?:details?\s+)?(?:for\s+)?(?:po-?)?[\w\-]*|edit\s+order\s+(?:po-?)?[\w\-]+/i,
+        action: 'editYarnPurchaseOrder',
+        extractParams: (match, question) => {
+          const poMatch = question.match(/po-?(\d{4}-\d{2,})/i) || question.match(/po-?([a-z0-9\-]+)/i) || question.match(/(\d{4}-\d{2,})/);
+          const idMatch = question.match(/id\s+([a-f0-9]{24})/i);
+          if (idMatch) return { purchaseOrderId: idMatch[1] };
+          if (poMatch && poMatch[1] && !/^(i|wanna|want|the|order|edit|details|for)$/i.test(poMatch[1].trim())) {
+            const value = poMatch[1].trim();
+            return { poNumber: value.toUpperCase().startsWith('PO') ? value : `PO-${value}` };
+          }
+          return {};
+        },
+        description: 'Edit yarn purchase order details (not status)'
+      },
+      // Update STATUS only — user must say "update status", "mark as in transit", "goods received", etc.
+      {
+        pattern: /(?:update|change)\s+status\s+(?:of\s+)?(?:order\s+)?(?:po-?)?[\w\-]+|mark\s+(?:order\s+)?(?:po-?)?[\w\-]+\s+as\s+[\w\s]+|set\s+(?:order\s+)?(?:po-?)?[\w\-]+\s+to\s+[\w\s]+/i,
         action: 'updateYarnPurchaseOrderStatus',
         extractParams: (match, question) => {
-          const poMatch = question.match(/(?:po-?)?([a-z0-9\-]+)/i);
+          const poMatch = question.match(/po-?(\d{4}-\d{2,})/i) || question.match(/po-?([a-z0-9\-]+)/i) || question.match(/(\d{4}-\d{2,})/);
           const statusMatch = question.match(/(?:as|to)\s+([\w\s]+?)(?:\s|$|\.)/i) || question.match(/status\s+to\s+([\w\s]+)/i);
           const params = {};
-          if (poMatch) params.poNumber = poMatch[0].toUpperCase().startsWith('PO') ? poMatch[0] : `PO-${poMatch[1]}`;
-          if (statusMatch) params.status_code = statusMatch[1].trim();
+          if (poMatch && poMatch[1]) params.poNumber = poMatch[1].toUpperCase().startsWith('PO') ? poMatch[1] : `PO-${poMatch[1]}`;
+          if (statusMatch && statusMatch[1]) params.status_code = statusMatch[1].trim();
           return params;
         },
-        description: 'Update yarn purchase order status'
+        description: 'Update yarn purchase order status (in transit, goods received, etc.)'
       },
       {
         pattern: /yarn\s+requisitions?|yarn\s+requests?|requisitions?\s+(?:for\s+)?yarn/i,
@@ -7286,32 +7304,7 @@ export const getYarnPurchaseOrderById = async (params = {}) => {
     if (!order) {
       return generateHTMLResponse('Purchase Order Not Found', `No purchase order found for "${id}".`);
     }
-    const supplierName = order.supplier?.brandName || (typeof order.supplier === 'string' ? order.supplier : 'N/A');
-    const status = order.currentStatus || order.status || 'N/A';
-    const items = (order.poItems || []).map((item) => {
-      const yarnName = item.yarnName || (item.yarn?.yarnName) || 'N/A';
-      const rate = item.rate ?? 0;
-      const qty = item.quantity ?? 0;
-      const lineTotal = rate * qty;
-      return `<tr><td>${yarnName}</td><td>${item.sizeCount || '-'}</td><td>${item.shadeCode || '-'}</td><td>${rate}</td><td>${qty}</td><td>₹${lineTotal.toLocaleString()}</td></tr>`;
-    }).join('');
-    const html = AI_TOOL_STYLES + `
-      <div class="ai-tool-response">
-        <h3>🛒 Purchase Order: ${order.poNumber || 'N/A'}</h3>
-        <div class="kpi-grid">
-          <div class="kpi-item"><div class="kpi-label">Supplier</div><div class="kpi-value">${supplierName}</div></div>
-          <div class="kpi-item"><div class="kpi-label">Status</div><div class="kpi-value">${status.replace(/_/g, ' ')}</div></div>
-          <div class="kpi-item"><div class="kpi-label">Total</div><div class="kpi-value">₹${(order.total ?? order.totalAmount ?? 0).toLocaleString()}</div></div>
-        </div>
-        <div class="table-container">
-          <table class="data-table">
-            <thead><tr><th>Yarn</th><th>Count</th><th>Shade</th><th>Rate</th><th>Qty</th><th>Line Total</th></tr></thead>
-            <tbody>${items}</tbody>
-          </table>
-        </div>
-        <p class="summary">PO ${order.poNumber || ''} — ${order.poItems?.length || 0} item(s).</p>
-      </div>`;
-    return html;
+    return buildOrderDetailsHtml(order);
   } catch (error) {
     console.error('Error in getYarnPurchaseOrderById:', error);
     return generateHTMLResponse('Error', `Failed to get purchase order: ${error.message}`);
@@ -7767,6 +7760,72 @@ export const createYarnPurchaseOrder = async (params = {}) => {
 };
 
 /**
+ * Build HTML for a single purchase order (shared by get and edit)
+ */
+const buildOrderDetailsHtml = (order) => {
+  const supplierName = order.supplier?.brandName || (typeof order.supplier === 'string' ? order.supplier : 'N/A');
+  const status = order.currentStatus || order.status || 'N/A';
+  const items = (order.poItems || []).map((item) => {
+    const yarnName = item.yarnName || (item.yarn?.yarnName) || 'N/A';
+    const rate = item.rate ?? 0;
+    const qty = item.quantity ?? 0;
+    const lineTotal = rate * qty;
+    return `<tr><td>${yarnName}</td><td>${item.sizeCount || '-'}</td><td>${item.shadeCode || '-'}</td><td>${rate}</td><td>${qty}</td><td>₹${lineTotal.toLocaleString()}</td></tr>`;
+  }).join('');
+  return AI_TOOL_STYLES + `
+    <div class="ai-tool-response">
+      <h3>🛒 Purchase Order: ${order.poNumber || 'N/A'}</h3>
+      <div class="kpi-grid">
+        <div class="kpi-item"><div class="kpi-label">Supplier</div><div class="kpi-value">${supplierName}</div></div>
+        <div class="kpi-item"><div class="kpi-label">Status</div><div class="kpi-value">${status.replace(/_/g, ' ')}</div></div>
+        <div class="kpi-item"><div class="kpi-label">Total</div><div class="kpi-value">₹${(order.total ?? order.totalAmount ?? 0).toLocaleString()}</div></div>
+      </div>
+      <div class="table-container">
+        <table class="data-table">
+          <thead><tr><th>Yarn</th><th>Count</th><th>Shade</th><th>Rate</th><th>Qty</th><th>Line Total</th></tr></thead>
+          <tbody>${items}</tbody>
+        </table>
+      </div>
+      <p class="summary">PO ${order.poNumber || ''} — ${order.poItems?.length || 0} item(s).</p>
+    </div>`;
+};
+
+/**
+ * Edit yarn purchase order — show order and enable in-chat editing. Returns editOrderContext so next messages apply edits.
+ * @param {Object} params - { purchaseOrderId or poNumber }
+ * @returns {Promise<{ html: string, editOrderContext?: { purchaseOrderId: string, poNumber: string } }>}
+ */
+export const editYarnPurchaseOrder = async (params = {}) => {
+  const idOrPo = params.purchaseOrderId || params.poNumber || params.orderId;
+  if (!idOrPo) {
+    return generateHTMLResponse('Edit Order', 'Please specify which order to edit (e.g. "edit order PO-2026-966").');
+  }
+  const purchaseOrderId = await resolvePurchaseOrderId(idOrPo);
+  if (!purchaseOrderId) {
+    return generateHTMLResponse('Order Not Found', `No purchase order found for "${idOrPo}".`);
+  }
+  const order = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+  if (!order) {
+    return generateHTMLResponse('Order Not Found', `No purchase order found for "${idOrPo}".`);
+  }
+  const baseHtml = buildOrderDetailsHtml(order);
+  const editNote = `
+    <p class="summary" style="margin-top: 0.8em;"><strong>✏️ What would you like to edit?</strong></p>
+    <p class="summary" style="margin: 0.4em 0;">You can change any of these:</p>
+    <ul class="summary" style="margin: 0.4em 0; padding-left: 1.4em;">
+      <li><strong>Quantity</strong> — e.g. "set quantity of [yarn name] to 60" or "quantity to 50" (first item)</li>
+      <li><strong>Add item</strong> — e.g. "add [yarn name] 20 at 100"</li>
+      <li><strong>Remove item</strong> — e.g. "remove [yarn name]"</li>
+      <li><strong>Status</strong> — e.g. "set status to in transit" or "mark as goods received"</li>
+    </ul>
+    <p class="summary" style="margin: 0.6em 0;">Reply with the change you want. After each edit I'll ask if you want to <strong>edit more</strong> or <strong>complete the order</strong>.</p>`;
+  return {
+    html: baseHtml + editNote,
+    editOrderContext: { purchaseOrderId: order._id.toString(), poNumber: order.poNumber }
+  };
+};
+
+/**
  * Update yarn purchase order status (for agent)
  * @param {Object} params - { purchaseOrderId or poNumber, status_code }
  * @returns {Promise<string>} HTML
@@ -7833,6 +7892,174 @@ export const deleteYarnPurchaseOrder = async (params = {}) => {
     console.error('Error in deleteYarnPurchaseOrder:', error);
     return generateHTMLResponse('Error', `Failed to delete purchase order: ${error.message}`);
   }
+};
+
+/** Prompt shown after each edit: ask if user wants to edit more or complete the order */
+const EDIT_MORE_OR_COMPLETE_PROMPT = `
+    <p class="summary" style="margin-top: 1em; padding: 0.6em; background: rgba(59, 130, 246, 0.1); border-radius: 8px;">
+      <strong>What would you like to do?</strong><br/>
+      • <strong>Edit more</strong> — reply with another change (quantity, add item, remove item, or status)<br/>
+      • <strong>Complete order</strong> — say <strong>complete</strong> or <strong>done</strong> to finish editing
+    </p>`;
+
+/** Recompute order totals from poItems */
+const recomputeOrderTotals = (poItems) => {
+  let subTotal = 0;
+  let gstTotal = 0;
+  for (const it of poItems) {
+    const lineTotal = (it.rate ?? 0) * (it.quantity ?? 0);
+    subTotal += lineTotal;
+    gstTotal += (it.gstRate ? (lineTotal * it.gstRate) / 100 : 0);
+  }
+  return { subTotal, gst: gstTotal, total: subTotal + gstTotal };
+};
+
+/**
+ * Apply in-chat edit to a purchase order (quantity, add/remove item, status). Called when context.editOrderPo is set.
+ * @param {string} purchaseOrderId - Mongo ID
+ * @param {string} userMessage - User's edit instruction
+ * @returns {Promise<{ html: string, editOrderContext?: { purchaseOrderId: string, poNumber: string } | null }>}
+ */
+export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage) => {
+  const msg = String(userMessage).trim().toLowerCase();
+  const order = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+  if (!order) {
+    return { html: generateHTMLResponse('Error', 'Order not found.'), editOrderContext: null };
+  }
+  const poNumber = order.poNumber;
+
+  if (/^(done|cancel|exit|stop|complete)\s*(edit(ing)?|order)?$/.test(msg) || /cancel\s*edit/.test(msg) || /complete\s*(the\s+)?order/.test(msg)) {
+    const isComplete = /complete|done|finish/.test(msg);
+    return {
+      html: generateHTMLResponse(
+        isComplete ? 'Order Complete' : 'Edit Cancelled',
+        isComplete
+          ? `Order <strong>${poNumber}</strong> edits are complete. Say "edit order PO-xxx" anytime to edit again.`
+          : `Stopped editing ${poNumber}. You can say "edit order PO-xxx" again to edit another order.`
+      ),
+      editOrderContext: null
+    };
+  }
+
+  const items = order.poItems || [];
+  const getYarnName = (item) => (item.yarnName || (item.yarn?.yarnName) || '').toLowerCase();
+
+  // Update status
+  const statusMatch = msg.match(/(?:set|update|change)\s+status\s+to\s+(.+?)(?:\.|$)/i) || msg.match(/(?:mark\s+as|set\s+to)\s+(in\s+transit|goods\s+received|qc\s+pending|submitted|po\s+accepted|po\s+rejected)/i);
+  if (statusMatch) {
+    const statusPhrase = (statusMatch[1] || statusMatch[2] || '').trim();
+    const statusMap = {
+      'submitted to supplier': 'submitted_to_supplier',
+      'in transit': 'in_transit',
+      'goods received': 'goods_received',
+      'qc pending': 'qc_pending',
+      'po accepted': 'po_accepted',
+      'po rejected': 'po_rejected',
+      'goods partially received': 'goods_partially_received',
+      'po accepted partially': 'po_accepted_partially',
+    };
+    const code = (statusMap[statusPhrase.toLowerCase().replace(/\s+/g, ' ')] || statusPhrase.replace(/\s+/g, '_')).toLowerCase();
+    const validStatuses = ['submitted_to_supplier', 'in_transit', 'goods_received', 'goods_partially_received', 'qc_pending', 'po_rejected', 'po_accepted', 'po_accepted_partially'];
+    const finalCode = validStatuses.find((s) => s.replace(/_/g, ' ') === code.replace(/_/g, ' ')) || (validStatuses.includes(code) ? code : null);
+    if (finalCode) {
+      const mongoose = await import('mongoose');
+      await yarnPurchaseOrderService.updatePurchaseOrderStatus(
+        purchaseOrderId,
+        finalCode,
+        { username: 'agent', user_id: new mongoose.default.Types.ObjectId().toString() },
+        null
+      );
+      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      return {
+        html: generateHTMLResponse('Status Updated', `Status set to <strong>${finalCode.replace(/_/g, ' ')}</strong>.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
+      };
+    }
+  }
+
+  // Remove item: "remove [yarn name]"
+  const removeMatch = msg.match(/remove\s+(.+?)(?:\.|$)/i);
+  if (removeMatch && items.length > 1) {
+    const search = removeMatch[1].trim().toLowerCase();
+    const idx = items.findIndex((it) => getYarnName(it).includes(search) || search.includes(getYarnName(it)));
+    if (idx !== -1) {
+      const removed = items[idx].yarnName || 'item';
+      const newItems = items.filter((_, i) => i !== idx).map((it) => (it.toObject ? it.toObject() : { ...it }));
+      const { subTotal, gst, total } = recomputeOrderTotals(newItems);
+      await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
+      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      return {
+        html: generateHTMLResponse('Item Removed', `Removed <strong>${removed}</strong>.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
+      };
+    }
+  }
+
+  // Update quantity: "set quantity of [yarn] to N" or "quantity to N" (first item)
+  const qtyMatch = msg.match(/(?:set|change|update)\s+(?:the\s+)?quantity\s+(?:of\s+)?(.+?)\s+to\s+(\d+)/i) || msg.match(/quantity\s+to\s+(\d+)/i);
+  if (qtyMatch) {
+    const newQty = parseInt(qtyMatch[2] || qtyMatch[1], 10);
+    if (newQty > 0) {
+      let idx = 0;
+      if (qtyMatch[1] && isNaN(Number(qtyMatch[1]))) {
+        const search = qtyMatch[1].trim().toLowerCase();
+        const i = items.findIndex((it) => getYarnName(it).includes(search) || search.includes(getYarnName(it)));
+        if (i !== -1) idx = i;
+      }
+      const newItems = items.map((it, i) => {
+        const plain = it.toObject ? it.toObject() : { ...it };
+        return i === idx ? { ...plain, quantity: newQty } : plain;
+      });
+      const { subTotal, gst, total } = recomputeOrderTotals(newItems);
+      await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
+      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      return {
+        html: generateHTMLResponse('Quantity Updated', `Quantity updated to <strong>${newQty}</strong>.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
+      };
+    }
+  }
+
+  // Add item: "add [yarn name] N at R" or "add [yarn] N at R"
+  const addMatch = msg.match(/add\s+(.+?)\s+(\d+)\s*(?:pieces?|pcs?|qty)?\s*(?:at|@|\s+rate)?\s*(\d+(?:\.\d+)?)?/i);
+  if (addMatch) {
+    const yarnNamePart = addMatch[1].trim();
+    const qty = parseInt(addMatch[2], 10);
+    const rate = addMatch[3] != null ? parseFloat(addMatch[3]) : (items[0]?.rate ?? 0);
+    if (qty > 0 && rate >= 0) {
+      const catalogList = await yarnCatalogService.queryYarnCatalogs({ yarnName: yarnNamePart }, { limit: 1 });
+      const yarnCatalog = catalogList?.results?.[0] || catalogList?.[0] || null;
+      if (!yarnCatalog) {
+        return {
+          html: generateHTMLResponse('Yarn Not Found', `Yarn "${yarnNamePart}" not found in catalog. Add it to the catalog first.`),
+          editOrderContext: { purchaseOrderId, poNumber }
+        };
+      }
+      const yarnId = yarnCatalog._id?.toString?.() || yarnCatalog.id;
+      const newItem = {
+        yarn: yarnId,
+        yarnName: yarnCatalog.yarnName || yarnNamePart,
+        sizeCount: (items[0]?.sizeCount ?? '-'),
+        shadeCode: items[0]?.shadeCode ?? '',
+        rate,
+        quantity: qty,
+        gstRate: items[0]?.gstRate
+      };
+      const newItems = [...items.map((it) => (it.toObject ? it.toObject() : { ...it })), newItem];
+      const { subTotal, gst, total } = recomputeOrderTotals(newItems);
+      await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
+      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      return {
+        html: generateHTMLResponse('Item Added', `Added <strong>${newItem.yarnName}</strong> × ${qty} @ ${rate}.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
+      };
+    }
+  }
+
+  return {
+    html: generateHTMLResponse('Edit Help', `Choose what to edit: <strong>Quantity</strong>, <strong>Add item</strong>, <strong>Remove item</strong>, or <strong>Status</strong>. Example: "set quantity of [yarn] to 60". Say <strong>complete</strong> or <strong>done</strong> to finish.`) + EDIT_MORE_OR_COMPLETE_PROMPT,
+    editOrderContext: { purchaseOrderId, poNumber }
+  };
 };
 
 /**
@@ -9569,6 +9796,8 @@ export const executeAITool = async (intent, options = {}) => {
         return await getYarnPurchaseOrders(intent.params);
       case 'getYarnPurchaseOrderById':
         return await getYarnPurchaseOrderById(intent.params);
+      case 'editYarnPurchaseOrder':
+        return await editYarnPurchaseOrder(intent.params);
       case 'createYarnPurchaseOrder':
         return await createYarnPurchaseOrder(intent.params);
       case 'updateYarnPurchaseOrderStatus':
@@ -9653,6 +9882,7 @@ export default {
   getYarnPurchaseOrders,
   getYarnPurchaseOrderById,
   createYarnPurchaseOrder,
+  editYarnPurchaseOrder,
   updateYarnPurchaseOrderStatus,
   deleteYarnPurchaseOrder,
   getYarnTypes,
