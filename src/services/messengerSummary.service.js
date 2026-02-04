@@ -175,11 +175,13 @@ function summarizeForMessenger(result) {
 /**
  * Ask question using same FAQ/ask flow as website, return text summary only.
  * For use by Telegram webhook, WhatsApp, etc.
+ * Pass sessionId (e.g. telegram_<chatId>) to enable multi-turn flows (edit PO, create PO) per chat.
  * @param {string} question
+ * @param {Object} options - { sessionId?: string, conversationHistory?: Array }
  * @returns {Promise<{ summary: string }>}
  */
-export async function getSummary(question) {
-  const result = await faqService.askQuestion(question);
+export async function getSummary(question, options = {}) {
+  const result = await faqService.askQuestion(question, options);
   const summary = summarizeForMessenger(result);
   return {
     summary: summary.length > TELEGRAM_MAX_LENGTH ? summary.slice(0, TELEGRAM_MAX_LENGTH - 20) + '…' : summary,
