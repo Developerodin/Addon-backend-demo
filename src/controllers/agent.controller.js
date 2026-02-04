@@ -16,7 +16,7 @@ const startUiFlow = catchAsync(async (req, res) => {
   });
 });
 
-const STEP_DELAY_MS = 2000;
+const STEP_DELAY_MS = 1000;
 
 /**
  * GET /v1/agent/ui-flow/stream?jobId=xxx
