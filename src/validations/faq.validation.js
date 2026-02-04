@@ -18,7 +18,23 @@ const askQuestion = {
       editOrderPo: Joi.object().keys({
         purchaseOrderId: Joi.string().required(),
         poNumber: Joi.string().optional(),
-      }).optional(),
+        addItemState: Joi.object().keys({
+          step: Joi.string().optional(),
+          yarnNames: Joi.array().items(Joi.string()).optional(),
+          page: Joi.number().optional(),
+          supplierId: Joi.string().optional(),
+          supplierName: Joi.string().optional(),
+          chosenYarnName: Joi.string().optional(),
+          quantity: Joi.number().optional(),
+          searchMatches: Joi.array().items(Joi.string()).optional().allow(null),
+        }).unknown(true).optional(),
+        confirmDeleteOrder: Joi.boolean().optional(),
+        removeItemState: Joi.object().keys({
+          step: Joi.string().valid('choose_items', 'confirm_remove').optional(),
+          indices: Joi.array().items(Joi.number().integer().min(0)).optional(),
+          yarnNames: Joi.array().items(Joi.string()).optional(),
+        }).optional().allow(null),
+      }).unknown(true).optional().allow(null),
       orderRefForStatus: Joi.object().keys({
         poNumber: Joi.string().optional(),
         purchaseOrderId: Joi.string().optional(),
@@ -41,7 +57,7 @@ const askQuestion = {
           gstRate: Joi.number().optional()
         })).optional(),
       }).optional(),
-    }).optional(),
+    }).unknown(true).optional(),
     conversationHistory: Joi.array()
       .items(Joi.object().keys({
         role: Joi.string().valid('user', 'assistant').required(),

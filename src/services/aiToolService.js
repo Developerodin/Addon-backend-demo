@@ -1207,6 +1207,13 @@ export const detectIntent = async (question, options = {}) => {
         },
         description: 'Edit order quantity (treated as edit order, not status update)'
       },
+      // Add item to order (when editing) — "i wanna add item", "add item", "i wanna add more yarn", "add more yarn"
+      {
+        pattern: /^(?:i\s+)?(?:wanna|want\s+to)\s+add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$|^add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$/i,
+        action: 'editYarnPurchaseOrder',
+        extractParams: () => ({}),
+        description: 'Add an item to the order (when editing, shows only that order’s supplier yarn list)'
+      },
       // Update STATUS only — user must say "update status", "mark as in transit", "goods received", etc.
       {
         pattern: /(?:update|change)\s+status\s+(?:of\s+)?(?:order\s+)?(?:po-?)?[\w\-]+|mark\s+(?:order\s+)?(?:po-?)?[\w\-]+\s+as\s+[\w\s]+|set\s+(?:order\s+)?(?:po-?)?[\w\-]+\s+to\s+[\w\s]+/i,
@@ -8023,7 +8030,7 @@ ${yarnList || 'No list'}
 
 Return ONLY a JSON object:
 - If user is clearly selecting by position/number: { "action": "list_index", "value": <number 1-based> }. Examples: "the second one" -> 2, "number 3" -> 3, "i want 3" -> 3, "3 onw" or "3 one" (typo) -> 3, "the third one" -> 3, "option 2" -> 2.
-- If user is asking for a colour/keyword to search: { "action": "search_keyword", "value": "<keyword>" } e.g. "something blue" -> "blue", "do you have black" -> "black".
+- If user is asking for a colour/keyword to search: { "action": "search_keyword", "value": "<keyword>" } e.g. "something blue" -> "blue", "do you have black" -> "black", "does this supplier have anything in 20-blue" -> "20-blue", "anything in 20-blue" -> "20-blue".
 - If user is giving a quantity (number of pieces): { "action": "quantity", "value": <number> }.
 - If user is giving a rate/price: { "action": "rate", "value": <number> }.
 - If unclear or not applicable: { "action": "none" }.`
@@ -8762,7 +8769,8 @@ ${whichSupplierWhichColourHtml}
 };
 
 /**
- * Build HTML for a single purchase order (shared by get and edit)
+ * Build HTML for a single purchase order (shared by get and edit).
+ * Supplier name shown here is the same source used in the edit flow (add item, list yarn from supplier).
  */
 const buildOrderDetailsHtml = (order) => {
   const supplierName = order.supplier?.brandName || (typeof order.supplier === 'string' ? order.supplier : 'N/A');
@@ -8793,6 +8801,14 @@ const buildOrderDetailsHtml = (order) => {
 };
 
 /**
+ * Four separate PO flows (do not merge; may share helpers but must not conflict):
+ * 1. Create PO: createYarnPurchaseOrder — placeOrderContext; new order, supplier, yarn, place.
+ * 2. Edit/Update PO: editYarnPurchaseOrder + applyYarnPurchaseOrderEdit — editOrderContext; items, qty, add, remove only (not status).
+ * 3. Update status PO: updateYarnPurchaseOrderStatus — orderRefForStatus, awaitingFollowUp; status only.
+ * 4. Delete PO: deleteYarnPurchaseOrder — no persistent context.
+ */
+
+/**
  * Edit yarn purchase order — show order and enable in-chat editing. Returns editOrderContext so next messages apply edits.
  * @param {Object} params - { purchaseOrderId or poNumber }
  * @returns {Promise<{ html: string, editOrderContext?: { purchaseOrderId: string, poNumber: string } }>}
@@ -8819,13 +8835,27 @@ export const editYarnPurchaseOrder = async (params = {}) => {
       <li><strong>Quantity</strong> — e.g. "set quantity of [yarn name] to 60" or "quantity to 50" (first item)</li>
       <li><strong>Add item</strong> — e.g. "add [yarn name] 20 at 100"</li>
       <li><strong>Remove item</strong> — e.g. "remove [yarn name]"</li>
-      <li><strong>Status</strong> — e.g. "set status to in transit" or "mark as goods received"</li>
     </ul>
-    <p class="summary" style="margin: 0.6em 0;">Reply with the change you want. After each edit I'll ask if you want to <strong>edit more</strong> or <strong>complete the order</strong>.</p>`;
+    <p class="summary" style="margin: 0.6em 0;">Reply with the change you want. After each edit I'll ask if you want to <strong>edit more</strong> or <strong>complete the order</strong>. To change status, use <strong>update status</strong> from the main menu.</p>`;
   return {
     html: baseHtml + editNote,
     editOrderContext: { purchaseOrderId: order._id.toString(), poNumber: order.poNumber }
   };
+};
+
+/**
+ * Resolve PO number to edit context (for FAQ fallback when client did not send editOrderPo).
+ * Order is fetched by PO number and has supplier populated; edit flow then uses that supplier to fetch its yarn list.
+ * @param {string} poNumber - e.g. "PO-2026-975"
+ * @returns {Promise<{ purchaseOrderId: string, poNumber: string } | null>}
+ */
+export const getEditOrderContextFromPoNumber = async (poNumber) => {
+  if (!poNumber || typeof poNumber !== 'string' || !poNumber.trim()) return null;
+  const purchaseOrderId = await resolvePurchaseOrderId(poNumber.trim());
+  if (!purchaseOrderId) return null;
+  const order = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+  if (!order || !order.poNumber) return null;
+  return { purchaseOrderId: order._id.toString(), poNumber: order.poNumber };
 };
 
 /** Status options for "choose status" flow (number + code + label) */
@@ -8978,7 +9008,7 @@ export const deleteYarnPurchaseOrder = async (params = {}) => {
 const EDIT_MORE_OR_COMPLETE_PROMPT = `
     <p class="summary" style="margin-top: 1em; padding: 0.6em; background: rgba(59, 130, 246, 0.1); border-radius: 8px;">
       <strong>What would you like to do?</strong><br/>
-      • <strong>Edit more</strong> — reply with another change (quantity, add item, remove item, or status)<br/>
+      • <strong>Edit more</strong> — reply with another change (quantity, add item, or remove item)<br/>
       • <strong>Complete order</strong> — say <strong>complete</strong> or <strong>done</strong> to finish editing
     </p>`;
 
@@ -8997,7 +9027,8 @@ const recomputeOrderTotals = (poItems) => {
 const EDIT_ADD_ITEM_PAGE_SIZE = 5;
 
 /**
- * Apply in-chat edit to a purchase order (quantity, add/remove item, status). Called when context.editOrderPo is set.
+ * Apply in-chat EDIT flow only (quantity, add/remove item). Does NOT handle status or delete — those are separate flows.
+ * Called when context.editOrderPo is set. Status/delete intents are routed to updateYarnPurchaseOrderStatus / deleteYarnPurchaseOrder by the FAQ layer.
  * @param {string} purchaseOrderId - Mongo ID
  * @param {string} userMessage - User's edit instruction
  * @param {Object} [editContext] - Previous editOrderContext (may contain addItemState for "add item" sub-flow)
@@ -9006,12 +9037,14 @@ const EDIT_ADD_ITEM_PAGE_SIZE = 5;
 export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, editContext = null) => {
   const rawMsg = String(userMessage).trim();
   const msg = rawMsg.toLowerCase();
+  // Order fetched by ID (or resolved from PO number) always has supplier populated; use that supplier to fetch its yarn list for add-item flows
   const order = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
   if (!order) {
     return { html: generateHTMLResponse('Error', 'Order not found.'), editOrderContext: null };
   }
   const poNumber = order.poNumber;
   const items = order.poItems || [];
+  const orderSupplierId = order.supplier?._id || order.supplier;
 
   if (/^(done|cancel|exit|stop|complete)\s*(edit(ing)?|order)?$/.test(msg) || /cancel\s*edit/.test(msg) || /complete\s*(the\s+)?order/.test(msg)) {
     const isComplete = /complete|done|finish/.test(msg);
@@ -9028,8 +9061,59 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
 
   const getYarnName = (item) => (item.yarnName || (item.yarn?.yarnName) || '').toLowerCase();
 
-  // "Add item" sub-flow: user chose to add item and we're collecting yarn choice, then quantity, then rate
+  // When context lost but user asked colour/keyword in add-item context (e.g. "do you have anything in blue") — load order's supplier yarn list and search, so we don't route to raw materials
   const addItemState = editContext?.addItemState;
+  const questionKeywordPattern = /^(?:do\s+you\s+have\s+(?:anything\s+in\s+|something\s+in\s+)?|do\s+they\s+(?:have\s+)?(?:anything\s+in\s+|something\s+in\s+)|does\s+this\s+supplier\s+(?:have|has)\s+(?:anything\s+in\s+|something\s+in\s+)?|anything\s+in\s+|something\s+in\s+|any\s+|show\s+me\s+(?:some\s+)?|got\s+any\s+|what\s+about\s+(?:in\s+)?|look\s+for\s+|another\s+colou?r\s+)(.+)$/i;
+  const questionKeywordMatchNoContext = !addItemState?.yarnNames && rawMsg.match(questionKeywordPattern);
+  if (questionKeywordMatchNoContext && orderSupplierId && questionKeywordMatchNoContext[1]) {
+    let questionKeyword = questionKeywordMatchNoContext[1].replace(/\s*yarn\s*$/i, '').trim();
+    if (questionKeyword && /^something\s+/i.test(questionKeyword)) questionKeyword = questionKeyword.replace(/^something\s+/i, '').trim();
+    if (questionKeyword && /\b(?:anything|something)\s+in\s+/i.test(questionKeyword)) questionKeyword = questionKeyword.replace(/^(?:anything|something)\s+in\s+/i, '').trim();
+    if (questionKeyword && questionKeyword.length >= 2) {
+      try {
+        const supplier = await supplierService.getSupplierById(orderSupplierId);
+        const supplierNameFromOrder = order.supplier?.brandName || (typeof order.supplier === 'string' ? order.supplier : null);
+        const supplierName = supplierNameFromOrder || supplier?.brandName || 'this supplier';
+        const yarnDetails = supplier?.yarnDetails || [];
+        const yarnNames = [...new Set((yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))];
+        if (yarnNames.length > 0) {
+          let searchKeyword = questionKeyword;
+          const availableTerms = extractTermsFromYarnNames(yarnNames);
+          if (availableTerms.length > 0) {
+            try {
+              const corrected = await suggestYarnKeywordCorrection(questionKeyword, availableTerms);
+              if (corrected && corrected.toLowerCase() !== questionKeyword.toLowerCase()) searchKeyword = corrected;
+            } catch (e) { /* use original */ }
+          }
+          const kwLower = searchKeyword.toLowerCase();
+          const matchesInList = yarnNames.filter((y) => y.toLowerCase().includes(kwLower));
+          if (matchesInList.length === 1) {
+            const chosenYarnName = matchesInList[0];
+            const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+            const newAddItemState = { step: 'quantity', chosenYarnName, yarnNames, page: 1, supplierId: orderSupplierId.toString?.() || orderSupplierId, supplierName, searchMatches: null };
+            return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: newAddItemState } };
+          }
+          if (matchesInList.length > 1) {
+            const listHtml = matchesInList.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+            const html = generateHTMLResponse('Add item', `<p>Here are yarns from <strong>${supplierName}</strong> with "<strong>${searchKeyword}</strong>" in the name. Reply with the <strong>number</strong> (1–${matchesInList.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+            const newAddItemState = { step: 'choose_yarn', yarnNames, page: 1, supplierId: orderSupplierId.toString?.() || orderSupplierId, supplierName, searchMatches: matchesInList };
+            return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: newAddItemState } };
+          }
+          const pageSize = EDIT_ADD_ITEM_PAGE_SIZE;
+          const slice = yarnNames.slice(0, pageSize);
+          const hasMore = yarnNames.length > pageSize;
+          const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+          const noMatchHtml = generateHTMLResponse('Add item', `<p>No yarn found with "<strong>${searchKeyword}</strong>" in the name from <strong>${supplierName}</strong>. Try a different keyword or pick from the list by number.</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number</strong>, <strong>name</strong>, or <strong>keyword</strong> to add.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          const newAddItemState = { step: 'choose_yarn', yarnNames, page: 1, supplierId: orderSupplierId.toString?.() || orderSupplierId, supplierName, searchMatches: null };
+          return { html: noMatchHtml, editOrderContext: { purchaseOrderId, poNumber, addItemState: newAddItemState } };
+        }
+      } catch (e) {
+        console.warn('Edit add-item keyword search (no addItemState) failed:', e?.message);
+      }
+    }
+  }
+
+  // "Add item" sub-flow: user chose to add item and we're collecting yarn choice, then quantity, then rate
   if (addItemState && addItemState.yarnNames && Array.isArray(addItemState.yarnNames)) {
     const yarnNames = addItemState.yarnNames;
     const supplierName = addItemState.supplierName || 'this supplier';
@@ -9055,20 +9139,112 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
         const listHtml = nextSlice.map((y, i) => `${nextStart + i + 1}. ${y}`).join('<br/>');
         const html = generateHTMLResponse(
           'Add item',
-          `<p>Here are more yarn items from <strong>${supplierName}</strong> (page ${nextPage}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No more items.'}</p>${nextHasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>done</strong> to cancel.</p>`
+          `<p>Here are more yarn items from <strong>${supplierName}</strong> (page ${nextPage}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No more items.'}</p>${nextHasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number</strong>, <strong>name</strong>, or <strong>keyword</strong> (e.g. blue) to add, or <strong>done</strong> to cancel.</p>`
         ) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
-        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, page: nextPage } } };
+        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, page: nextPage, searchMatches: null } } };
       }
-      // List index: "1", "2", ...
+      // When we previously showed search results (e.g. "yarns matching blue"), number refers to that list
+      const searchMatches = addItemState.searchMatches;
+      if (searchMatches && Array.isArray(searchMatches) && searchMatches.length > 0) {
+        const num = parseInt(rawMsg, 10);
+        if (/^\d+$/.test(rawMsg) && !Number.isNaN(num) && num >= 1 && num <= searchMatches.length) {
+          const chosenYarnName = searchMatches[num - 1];
+          const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName, searchMatches: null } } };
+        }
+      }
+      // List index: "1", "2", ... (into full list or current page list)
       const num = parseInt(rawMsg, 10);
       if (/^\d+$/.test(rawMsg) && !Number.isNaN(num) && num >= 1 && num <= yarnNames.length) {
         const chosenYarnName = yarnNames[num - 1];
-        const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
         const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
-        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName } } };
+        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName, searchMatches: null } } };
       }
-      // Yarn name or keyword match
+      // Question-style keyword search (like create PO): "do you have anything in blue", "does this supplier has anything in 20-blue", "anything in black"
+      const questionKeywordMatch = rawMsg.match(/^(?:do\s+you\s+have\s+(?:anything\s+in\s+|something\s+in\s+)?|do\s+they\s+(?:have\s+)?(?:anything\s+in\s+|something\s+in\s+)|does\s+this\s+supplier\s+(?:have|has)\s+(?:anything\s+in\s+|something\s+in\s+)?|anything\s+in\s+|something\s+in\s+|any\s+|show\s+me\s+(?:some\s+)?|got\s+any\s+|what\s+about\s+(?:in\s+)?|look\s+for\s+|another\s+colou?r\s+)(.+)$/i)
+        || rawMsg.match(/\b(?:anything|something)\s+in\s+([a-zA-Z0-9\s\-]+)\s*$/i);
+      let questionKeyword = questionKeywordMatch && questionKeywordMatch[1] ? questionKeywordMatch[1].replace(/\s*yarn\s*$/i, '').trim() : null;
+      if (questionKeyword && /^something\s+/i.test(questionKeyword)) questionKeyword = questionKeyword.replace(/^something\s+/i, '').trim();
+      if (questionKeyword && /\b(?:anything|something)\s+in\s+/i.test(questionKeyword)) questionKeyword = questionKeyword.replace(/^(?:anything|something)\s+in\s+/i, '').trim();
+      if (questionKeyword && questionKeyword.length >= 2) {
+        let searchKeyword = questionKeyword;
+        const availableTerms = extractTermsFromYarnNames(yarnNames);
+        if (availableTerms.length > 0) {
+          try {
+            const corrected = await suggestYarnKeywordCorrection(questionKeyword, availableTerms);
+            if (corrected && corrected.toLowerCase() !== questionKeyword.toLowerCase()) searchKeyword = corrected;
+          } catch (e) { /* use original */ }
+        }
+        const kwLower = searchKeyword.toLowerCase();
+        const matchesInList = yarnNames.filter((y) => y.toLowerCase().includes(kwLower));
+        if (matchesInList.length === 1) {
+          const chosenYarnName = matchesInList[0];
+          const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName, searchMatches: null } } };
+        }
+        if (matchesInList.length > 1) {
+          const listHtml = matchesInList.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+          const html = generateHTMLResponse('Add item', `<p>Here are yarns from <strong>${supplierName}</strong> with "<strong>${searchKeyword}</strong>" in the name. Reply with the <strong>number</strong> (1–${matchesInList.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, searchMatches: matchesInList } } };
+        }
+        const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
+        const noMatchHtml = generateHTMLResponse('Add item', `<p>No yarn found with "<strong>${searchKeyword}</strong>" in the name. Try a different keyword or pick from the list by number.</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+        return { html: noMatchHtml, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, searchMatches: null } } };
+      }
+      // GPT fallback (same as create PO): interpret natural language — e.g. "does this supplier has anything in 20-blue" -> search_keyword "20-blue", then filter and show list
+      try {
+        const interpreted = await interpretPlaceOrderChatMessage(rawMsg, {
+          yarnNames,
+          supplierName,
+          collectingStep: 'choose_yarn',
+          collectingYarnName: addItemState.chosenYarnName
+        });
+        if (interpreted?.action === 'list_index' && !Number.isNaN(interpreted.value) && interpreted.value >= 1 && interpreted.value <= yarnNames.length) {
+          const chosenYarnName = yarnNames[interpreted.value - 1];
+          const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName, searchMatches: null } } };
+        }
+        if (interpreted?.action === 'search_keyword' && interpreted.value) {
+          const kw = String(interpreted.value).trim().toLowerCase();
+          if (kw.length >= 1) {
+            const gptMatches = yarnNames.filter((y) => y.toLowerCase().includes(kw));
+            if (gptMatches.length === 1) {
+              const chosenYarnName = gptMatches[0];
+              const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+              return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName, searchMatches: null } } };
+            }
+            if (gptMatches.length > 1) {
+              const listHtml = gptMatches.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+              const html = generateHTMLResponse('Add item', `<p>Here are yarns from <strong>${supplierName}</strong> with "<strong>${interpreted.value}</strong>" in the name. Reply with the <strong>number</strong> (1–${gptMatches.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+              return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, searchMatches: gptMatches } } };
+            }
+            const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
+            const noMatchHtml = generateHTMLResponse('Add item', `<p>No yarn found with "<strong>${interpreted.value}</strong>" in the name. Try a different keyword or pick from the list by number.</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number</strong>, <strong>name</strong>, or a <strong>keyword</strong> (e.g. blue, black, nylon) to add.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+            return { html: noMatchHtml, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, searchMatches: null } } };
+          }
+        }
+      } catch (e) {
+        // ignore GPT errors, fall through to yarn name match / no match
+      }
+      // Multi-word keyword search: "light blue", "dark grey" (words that aren't a full yarn name)
       const nameLower = rawMsg.toLowerCase();
+      const stopwords = new Set(['anything', 'something', 'the', 'a', 'an', 'in', 'with', 'for', 'and', 'or', 'to', 'from', 'that', 'this', 'is', 'it', 'of', 'on', 'at', 'by', 'as', 'like', 'want', 'need', 'yarn', 'yarns', 'do', 'you', 'have', 'they', 'got', 'show', 'me']);
+      const rawKeywords = nameLower.split(/\s+/).filter(Boolean);
+      const keywords = rawKeywords.filter((w) => w.length > 1 && !stopwords.has(w));
+      if (keywords.length >= 1 && keywords.length <= 4) {
+        const multiMatches = yarnNames.filter((y) => keywords.every((kw) => y.toLowerCase().includes(kw)));
+        if (multiMatches.length === 1) {
+          const chosenYarnName = multiMatches[0];
+          const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName, searchMatches: null } } };
+        }
+        if (multiMatches.length > 1) {
+          const listHtml = multiMatches.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+          const html = generateHTMLResponse('Add item', `<p>Here are yarns matching "<strong>${rawMsg}</strong>". Reply with the <strong>number</strong> (1–${multiMatches.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, searchMatches: multiMatches } } };
+        }
+      }
+      // Yarn name or keyword match (exact or substring)
       const chosenByName = yarnNames.find((y) => y.toLowerCase() === nameLower || y.toLowerCase().includes(nameLower) || nameLower.includes(y.toLowerCase()));
       if (chosenByName) {
         const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenByName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
@@ -9076,8 +9252,8 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
       }
       // No match: re-show list and prompt
       const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
-      const noMatchHtml = generateHTMLResponse('Add item', `<p>No yarn found matching "<strong>${rawMsg}</strong>". Here are yarn items from <strong>${supplierName}</strong> (page ${page}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
-      return { html: noMatchHtml, editOrderContext: { purchaseOrderId, poNumber, addItemState } };
+      const noMatchHtml = generateHTMLResponse('Add item', `<p>No yarn found matching "<strong>${rawMsg}</strong>". Here are yarn items from <strong>${supplierName}</strong> (page ${page}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number</strong>, <strong>name</strong>, or a <strong>keyword</strong> (e.g. blue, black, nylon) to add.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+      return { html: noMatchHtml, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, searchMatches: null } } };
     }
 
     if (addItemState.step === 'quantity' && addItemState.chosenYarnName) {
@@ -9111,7 +9287,7 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
         const { subTotal, gst, total } = recomputeOrderTotals(newItems);
         await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
         const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
-        const html = generateHTMLResponse('Item Added', `Added <strong>${newItem.yarnName}</strong> × ${addItemState.quantity} @ ₹${rateNum}.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT;
+        const html = buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT;
         return { html, editOrderContext: { purchaseOrderId, poNumber: updated.poNumber } };
       }
     }
@@ -9131,37 +9307,13 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
     };
   }
 
-  // Update status (must explicitly say "status" so "change quantity" is not mistaken)
-  const statusMatch = msg.match(/(?:set|update|change)\s+status\s+to\s+(.+?)(?:\.|$)/i) || msg.match(/(?:mark\s+as|set\s+to)\s+(in\s+transit|goods\s+received|qc\s+pending|submitted|po\s+accepted|po\s+rejected)/i);
-  if (statusMatch) {
-    const statusPhrase = (statusMatch[1] || statusMatch[2] || '').trim();
-    const statusMap = {
-      'submitted to supplier': 'submitted_to_supplier',
-      'in transit': 'in_transit',
-      'goods received': 'goods_received',
-      'qc pending': 'qc_pending',
-      'po accepted': 'po_accepted',
-      'po rejected': 'po_rejected',
-      'goods partially received': 'goods_partially_received',
-      'po accepted partially': 'po_accepted_partially',
+  // Status changes are handled by the UPDATE STATUS flow only (not in edit flow). If user asked for status here, direct them.
+  const statusAskedInEdit = /(?:set|update|change)\s+status\s+to\s+|(?:mark\s+as|set\s+to)\s+(?:in\s+transit|goods\s+received|qc\s+pending|submitted|po\s+accepted|po\s+rejected)/i.test(rawMsg);
+  if (statusAskedInEdit) {
+    return {
+      html: generateHTMLResponse('Update status', `<p>To change the order status, say <strong>update status to [status]</strong> or <strong>mark as in transit</strong> — that’s handled in a separate step.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId, poNumber }
     };
-    const code = (statusMap[statusPhrase.toLowerCase().replace(/\s+/g, ' ')] || statusPhrase.replace(/\s+/g, '_')).toLowerCase();
-    const validStatuses = ['submitted_to_supplier', 'in_transit', 'goods_received', 'goods_partially_received', 'qc_pending', 'po_rejected', 'po_accepted', 'po_accepted_partially'];
-    const finalCode = validStatuses.find((s) => s.replace(/_/g, ' ') === code.replace(/_/g, ' ')) || (validStatuses.includes(code) ? code : null);
-    if (finalCode) {
-      const mongoose = await import('mongoose');
-      await yarnPurchaseOrderService.updatePurchaseOrderStatus(
-        purchaseOrderId,
-        finalCode,
-        { username: 'agent', user_id: new mongoose.default.Types.ObjectId().toString() },
-        null
-      );
-      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
-      return {
-        html: generateHTMLResponse('Status Updated', `Status set to <strong>${finalCode.replace(/_/g, ' ')}</strong>.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
-        editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
-      };
-    }
   }
 
   // Increase quantity by N: "increase quantity by 50", "increase it by 50", "increase by 50", "quantity increase by 50"
@@ -9190,10 +9342,11 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
       // If user also asked for supplier yarn list in same message, append it
       const alsoAskedSupplierYarn = /(?:what|which|list|give\s+me|tell\s+me)\s+(?:more\s+)?(?:yarn|items?)|(?:what\s+items?|what\s+else)\s+(?:does\s+)?(?:this\s+)?supplier|what\s+(?:more\s+)?yarn\s+(?:are\s+)?available/i.test(msg);
       if (alsoAskedSupplierYarn) {
-        const supplierId = updated.supplier?._id || updated.supplier;
-        if (supplierId) {
+        // Order has supplier; fetch that supplier's yarn list only
+        const supplierIdFromOrder = updated.supplier?._id || updated.supplier;
+        if (supplierIdFromOrder) {
           try {
-            const supplier = await supplierService.getSupplierById(supplierId);
+            const supplier = await supplierService.getSupplierById(supplierIdFromOrder);
             const supplierName = supplier?.brandName || updated.supplier?.brandName || 'this supplier';
             const yarnDetails = supplier?.yarnDetails || [];
             const yarnNames = [...new Set(yarnDetails.map((d) => d.yarnName).filter(Boolean))];
@@ -9213,9 +9366,86 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
     }
   }
 
-  // Remove item: "remove [yarn name]"
+  // Remove item sub-flow: 1) show numbered list → 2) user types number(s) → 3) confirm with names → 4) yes = remove, no = cancel
+  const removeItemState = editContext?.removeItemState;
+  if (removeItemState?.step === 'confirm_remove' && removeItemState.indices && removeItemState.yarnNames) {
+    const isYes = /^(?:yes|y|confirm)\s*$/i.test(rawMsg.trim());
+    const isNo = /^(?:no|n|cancel)\s*$/i.test(rawMsg.trim());
+    if (isYes) {
+      const indicesSet = new Set(removeItemState.indices);
+      const newItems = items.filter((_, i) => !indicesSet.has(i)).map((it) => (it.toObject ? it.toObject() : { ...it }));
+      const { subTotal, gst, total } = recomputeOrderTotals(newItems);
+      await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
+      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      const namesList = removeItemState.yarnNames.join(', ');
+      return {
+        html: buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
+      };
+    }
+    if (isNo) {
+      return {
+        html: buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber }
+      };
+    }
+    return {
+      html: generateHTMLResponse('Confirm', `<p class="summary">Remove these? <strong>yes</strong> / <strong>no</strong></p><p class="summary" style="margin: 0.4em 0; padding-left: 1em;">${removeItemState.yarnNames.map((n, i) => `${i + 1}. ${n}`).join('<br/>')}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId, poNumber, removeItemState }
+    };
+  }
+
+  if (removeItemState?.step === 'choose_items' && Array.isArray(items) && items.length > 0) {
+    const numStr = rawMsg.replace(/\s+/g, '').trim();
+    const parts = numStr.split(',').map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n) && n >= 1 && n <= items.length);
+    const uniqueIndices = [...new Set(parts)].sort((a, b) => a - b).map((oneBased) => oneBased - 1);
+    if (uniqueIndices.length > 0) {
+      const yarnNames = uniqueIndices.map((i) => items[i].yarnName || items[i].yarn?.yarnName || 'Item').filter(Boolean);
+      const listHtml = yarnNames.map((n, i) => `${i + 1}. ${n}`).join('<br/>');
+      const newRemoveState = { step: 'confirm_remove', indices: uniqueIndices, yarnNames };
+      return {
+        html: generateHTMLResponse('Confirm', `<p class="summary">Remove these? <strong>yes</strong> / <strong>no</strong></p><p class="summary" style="margin: 0.4em 0; padding-left: 1em;">${listHtml}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber, removeItemState: newRemoveState }
+      };
+    }
+    const listHtml = items.map((it, i) => `${i + 1}. ${it.yarnName || it.yarn?.yarnName || 'Item'}`).join('<br/>');
+    return {
+      html: generateHTMLResponse('Remove item', `<p class="summary">Reply with number(s), e.g. <strong>1</strong> or <strong>1, 3</strong>:</p><p class="summary" style="margin: 0.4em 0; padding-left: 1em; line-height: 1.5;">${listHtml}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId, poNumber, removeItemState }
+    };
+  }
+
+  // "Remove item" / "remove items" — show numbered list of yarns in order so user can pick by number(s)
+  const vagueRemoveItem = /^(?:remove|delete)\s+(?:an?\s+)?(?:item|line)\s*\.?$/i.test(rawMsg.trim()) || /^(?:remove|delete)\s+items?\s*\.?$/i.test(rawMsg.trim());
+  if (vagueRemoveItem) {
+    if (items.length === 0) {
+      return {
+        html: buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber }
+      };
+    }
+    if (items.length === 1) {
+      return {
+        html: generateHTMLResponse('Only one item', `This order has only one item. Removing it would leave the order empty. Do you want to delete the entire order? Reply <strong>yes, delete order</strong> or <strong>delete this order</strong> to delete it.`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber, confirmDeleteOrder: true }
+      };
+    }
+    const listHtml = items.map((it, i) => `${i + 1}. ${it.yarnName || it.yarn?.yarnName || 'Item'}`).join('<br/>');
+    return {
+      html: generateHTMLResponse('Remove item', `<p class="summary">Reply with number(s), e.g. <strong>1</strong> or <strong>1, 3</strong>:</p><p class="summary" style="margin: 0.4em 0; padding-left: 1em; line-height: 1.5;">${listHtml}</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId, poNumber, removeItemState: { step: 'choose_items' } }
+    };
+  }
+
+  // Remove item: "remove [yarn name]" — direct remove by name (single item); if only one item in order, ask about deleting entire order
   const removeMatch = msg.match(/remove\s+(.+?)(?:\.|$)/i);
-  if (removeMatch && items.length > 1) {
+  if (removeMatch) {
+    if (items.length === 1) {
+      return {
+        html: generateHTMLResponse('Only one item', `This order has only one item. Removing it would leave the order empty. Do you want to delete the entire order? Reply <strong>yes, delete order</strong> or <strong>delete this order</strong> to delete it.`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber, confirmDeleteOrder: true }
+      };
+    }
     const search = removeMatch[1].trim().toLowerCase();
     const idx = items.findIndex((it) => getYarnName(it).includes(search) || search.includes(getYarnName(it)));
     if (idx !== -1) {
@@ -9225,7 +9455,7 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
       await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
       const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
       return {
-        html: generateHTMLResponse('Item Removed', `Removed <strong>${removed}</strong>.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        html: buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
         editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
       };
     }
@@ -9268,11 +9498,12 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
     /list\s+of\s+yarn\s+items?\s+to\s+add/i.test(msg) ||
     /what\s+else\s+this\s+supplier\s+provide/i.test(msg);
   if (supplierYarnAsk) {
-    const supplierId = order.supplier?._id || order.supplier;
-    if (supplierId) {
+    // Every order has supplier (populated when fetched by PO number/ID); fetch yarn items of that supplier only
+    const supplierNameFromOrder = order.supplier?.brandName || (typeof order.supplier === 'string' ? order.supplier : null);
+    if (orderSupplierId) {
       try {
-        const supplier = await supplierService.getSupplierById(supplierId);
-        const supplierName = supplier?.brandName || order.supplier?.brandName || 'this supplier';
+        const supplier = await supplierService.getSupplierById(orderSupplierId);
+        const supplierName = supplierNameFromOrder || supplier?.brandName || 'this supplier';
         const yarnDetails = supplier?.yarnDetails || [];
         const yarnNames = yarnDetails.map((d) => d.yarnName).filter(Boolean);
         const uniqueNames = [...new Set(yarnNames)];
@@ -9303,14 +9534,19 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
     };
   }
 
-  // Vague "add item" intent: "i want to add item", "add item" — show supplier's yarn list (numbered, like place order)
-  const vagueAddItem = /^(?:i\s+)?(?:want\s+to\s+)?add\s+(?:an?\s+)?item\s*\.?$/i.test(rawMsg) || /^add\s+(?:an?\s+)?item\s*\.?$/i.test(rawMsg);
+  // Vague "add item" intent: "add item", "add more yarn", "i wanna add more yarn", etc. — show only this order's supplier yarn list (catalog of that supplier)
+  const vagueAddItem =
+    /^(?:i\s+)?(?:want\s+to\s+|wanna\s+)?add\s+(?:an?\s+)?item\s*\.?$/i.test(rawMsg) ||
+    /^add\s+(?:an?\s+)?item\s*\.?$/i.test(rawMsg) ||
+    /^(?:i\s+)?(?:want\s+to\s+|wanna\s+)?add\s+more\s+(?:yarn|items?)\s*\.?$/i.test(rawMsg) ||
+    /^add\s+more\s+(?:yarn|items?)\s*\.?$/i.test(rawMsg);
   if (vagueAddItem) {
-    const supplierId = order.supplier?._id || order.supplier;
-    if (supplierId) {
+    // Order has supplier; fetch that particular supplier's yarn list only (from order fetched by PO number/ID)
+    const supplierNameFromOrder = order.supplier?.brandName || (typeof order.supplier === 'string' ? order.supplier : null);
+    if (orderSupplierId) {
       try {
-        const supplier = await supplierService.getSupplierById(supplierId);
-        const supplierName = supplier?.brandName || order.supplier?.brandName || 'this supplier';
+        const supplier = await supplierService.getSupplierById(orderSupplierId);
+        const supplierName = supplierNameFromOrder || supplier?.brandName || 'this supplier';
         const yarnDetails = supplier?.yarnDetails || [];
         const yarnNames = [...new Set((yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))];
         if (yarnNames.length > 0) {
@@ -9321,11 +9557,11 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
           const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
           const html = generateHTMLResponse(
             'Add item',
-            `<p>Here are yarn items from <strong>${supplierName}</strong> (top ${slice.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, then I'll ask for quantity and rate.</p>`
+            `<p>Here are yarn items from <strong>${supplierName}</strong> (top ${slice.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number</strong>, <strong>name</strong>, or a <strong>keyword</strong> (e.g. blue, black, nylon — or "do you have anything in blue") to add; then I'll ask for quantity and rate.</p>`
           ) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
           return {
             html,
-            editOrderContext: { purchaseOrderId, poNumber, addItemState: { step: 'choose_yarn', yarnNames, page: 1, supplierId: supplierId.toString?.() || supplierId, supplierName } }
+            editOrderContext: { purchaseOrderId, poNumber, addItemState: { step: 'choose_yarn', yarnNames, page: 1, supplierId: orderSupplierId.toString?.() || orderSupplierId, supplierName } }
           };
         }
       } catch (e) {
@@ -9364,14 +9600,14 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
       await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
       const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
       return {
-        html: generateHTMLResponse('Item Added', `Added <strong>${newItem.yarnName}</strong> × ${qty} @ ${rate}.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        html: buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
         editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
       };
     }
   }
 
   return {
-    html: generateHTMLResponse('Edit Help', `Choose what to edit: <strong>Quantity</strong>, <strong>Add item</strong>, <strong>Remove item</strong>, or <strong>Status</strong>. Example: "set quantity of [yarn] to 60". Say <strong>complete</strong> or <strong>done</strong> to finish.`) + EDIT_MORE_OR_COMPLETE_PROMPT,
+    html: generateHTMLResponse('Edit Help', `Choose what to edit: <strong>Quantity</strong>, <strong>Add item</strong>, or <strong>Remove item</strong>. Example: "set quantity of [yarn] to 60". Say <strong>complete</strong> or <strong>done</strong> to finish. For status changes, use <strong>update status</strong> from the main menu.`) + EDIT_MORE_OR_COMPLETE_PROMPT,
     editOrderContext: { purchaseOrderId, poNumber }
   };
 };
@@ -10990,6 +11226,42 @@ const setPendingConfirmation = (sessionId, data) => {
 
 const clearPendingConfirmation = (sessionId) => {
   if (sessionId) pendingConfirmations.delete(sessionId);
+};
+
+// Agent flow session: remember which flow the user is in (edit PO, create PO, update status, etc.) so we don't fetch unrelated data (e.g. raw materials when in yarn add-item)
+const AGENT_FLOW_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const agentFlowBySession = new Map();
+
+/**
+ * Get stored agent flow for this session (so next message stays in same flow).
+ * @param {string} sessionId
+ * @returns {{ flow: string, context: Object } | null} e.g. { flow: 'edit_po', context: { editOrderPo: {...} } }
+ */
+export const getAgentFlowSession = (sessionId) => {
+  if (!sessionId) return null;
+  const entry = agentFlowBySession.get(sessionId);
+  if (!entry) return null;
+  if (Date.now() - (entry.at || 0) > AGENT_FLOW_TTL_MS) {
+    agentFlowBySession.delete(sessionId);
+    return null;
+  }
+  return entry;
+};
+
+/**
+ * Store current flow and context for this session (edit PO, create PO, update status choice).
+ * @param {string} sessionId
+ * @param {string} flow - 'edit_po' | 'create_po' | 'update_status_choice'
+ * @param {Object} context - { editOrderPo?, placeOrderContext?, awaitingFollowUp?, orderRefForStatus? }
+ */
+export const setAgentFlowSession = (sessionId, flow, context) => {
+  if (!sessionId || !flow) return;
+  agentFlowBySession.set(sessionId, { flow, context: context || {}, at: Date.now() });
+};
+
+/** Clear stored flow when user completes or cancels (e.g. done editing, order placed). */
+export const clearAgentFlowSession = (sessionId) => {
+  if (sessionId) agentFlowBySession.delete(sessionId);
 };
 
 /** Set pending "place yarn order" confirmation so that when user says "yes" we create the PO */

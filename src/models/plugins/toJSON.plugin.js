@@ -22,8 +22,6 @@ const toJSON = (schema) => {
 
   schema.options.toJSON = Object.assign(schema.options.toJSON || {}, {
     transform(doc, ret, options) {
-      console.log('🔄 toJSON Plugin - Before transform:', JSON.stringify(ret, null, 2));
-      
       Object.keys(schema.paths).forEach((path) => {
         if (schema.paths[path].options && schema.paths[path].options.private) {
           deleteAtPath(ret, path.split('.'), 0);
@@ -60,14 +58,12 @@ const toJSON = (schema) => {
       const hasFileField = schema.paths.file || schema.paths['file'];
       if (hasFileField) {
         if (ret.file && typeof ret.file === 'object') {
-          console.log('📁 toJSON Plugin - Processing file object:', JSON.stringify(ret.file, null, 2));
           if (ret.file._id) {
             ret.file.id = ret.file._id.toString();
             delete ret.file._id;
           }
           delete ret.file.__v;
           // Keep createdAt and updatedAt for file objects
-          console.log('📁 toJSON Plugin - File object after processing:', JSON.stringify(ret.file, null, 2));
         } else if (ret.file === null || ret.file === undefined) {
           // Only log warning if file field exists in schema but is null/undefined
           // This is expected for models without file fields, so we don't log it
@@ -77,18 +73,14 @@ const toJSON = (schema) => {
       // Check if schema has folder field before processing
       const hasFolderField = schema.paths.folder || schema.paths['folder'];
       if (hasFolderField && ret.folder && typeof ret.folder === 'object') {
-        console.log('📂 toJSON Plugin - Processing folder object:', JSON.stringify(ret.folder, null, 2));
         if (ret.folder._id) {
           ret.folder.id = ret.folder._id.toString();
           delete ret.folder._id;
         }
         delete ret.folder.__v;
         // Keep createdAt and updatedAt for folder objects
-        console.log('📂 toJSON Plugin - Folder object after processing:', JSON.stringify(ret.folder, null, 2));
       }
-      
-      console.log('🔄 toJSON Plugin - After transform:', JSON.stringify(ret, null, 2));
-      
+
       if (transform) {
         return transform(doc, ret, options);
       }

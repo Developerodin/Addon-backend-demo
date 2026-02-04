@@ -464,14 +464,14 @@ export const getExecutionDetails = async (executionId, countryCode = null) => {
       const msg = (indiaError.message || '').toLowerCase();
       const isNotFound = indiaError.statusCode === 404 || msg.includes('not found') || msg.includes('agent not found');
       if (!isNotFound) throw indiaError;
-      logger.info(`Execution ${executionId} not found on India Bolna account, trying US account...`);
+      logger.debug(`Execution ${executionId} not found on India Bolna account, trying US account...`);
     }
 
     // Try US account (e.g. execution was from US Bolna)
     try {
       const data = await tryAccount('US');
       if (data) {
-        logger.info(`Execution ${executionId} found on US Bolna account`);
+        logger.debug(`Execution ${executionId} found on US Bolna account`);
         return data;
       }
     } catch (usError) {

@@ -37,6 +37,33 @@ const addNaturalReply = async (returnObj, userMessage, opts = {}) => {
   return returnObj;
 };
 
+/** Persist current flow to session so next message stays in same flow and doesn't fetch unrelated data (e.g. raw materials when in edit PO add-item). */
+const persistAgentFlowIfNeeded = (sessionId, out) => {
+  if (!sessionId || !out) return;
+  if (out.awaitingFollowUp === 'update_status_choice' && out.orderRefForStatus) {
+    aiToolService.setAgentFlowSession(sessionId, 'update_status_choice', {
+      awaitingFollowUp: out.awaitingFollowUp,
+      orderRefForStatus: out.orderRefForStatus
+    });
+    return;
+  }
+  if (out.editOrderContext !== undefined) {
+    if (out.editOrderContext == null) aiToolService.clearAgentFlowSession(sessionId);
+    else aiToolService.setAgentFlowSession(sessionId, 'edit_po', { editOrderPo: out.editOrderContext });
+    return;
+  }
+  if (out.placeOrderContext != null) {
+    aiToolService.setAgentFlowSession(sessionId, 'create_po', {
+      placeOrderContext: out.placeOrderContext,
+      lastOrderWizardPrompt: out.orderWizardPrompt
+    });
+    return;
+  }
+  if (out.awaitingFollowUp === 'edit_order_po') {
+    aiToolService.setAgentFlowSession(sessionId, 'edit_po', { awaitingFollowUp: out.awaitingFollowUp });
+  }
+};
+
 /**
  * Generate embedding for text using OpenAI
  * @param {string} text - Text to generate embedding for
@@ -389,26 +416,186 @@ export const askQuestion = async (question, options = {}) => {
       throw new ApiError(400, 'Question cannot be empty');
     }
 
-    const { sessionId, context, conversationHistory } = options;
+    let { sessionId, context, conversationHistory } = options;
+    context = context && typeof context === 'object' ? { ...context } : {};
 
-    // In-chat edit: when we're editing an order (context.editOrderPo) and user sends an edit instruction, apply it
+    // Merge session-stored flow context so agent stays in the same flow (e.g. edit PO add-item) and doesn't fetch unrelated data when client didn't send context
+    if (sessionId) {
+      const stored = aiToolService.getAgentFlowSession(sessionId);
+      if (stored?.context) {
+        if (stored.context.editOrderPo != null && context.editOrderPo == null) context.editOrderPo = stored.context.editOrderPo;
+        if (stored.context.placeOrderContext != null && context.placeOrderContext == null) context.placeOrderContext = stored.context.placeOrderContext;
+        if (stored.context.awaitingFollowUp != null && context.awaitingFollowUp == null) context.awaitingFollowUp = stored.context.awaitingFollowUp;
+        if (stored.context.orderRefForStatus != null && context.orderRefForStatus == null) context.orderRefForStatus = stored.context.orderRefForStatus;
+        if (stored.context.lastOrderWizardPrompt != null && context.lastOrderWizardPrompt == null) context.lastOrderWizardPrompt = stored.context.lastOrderWizardPrompt;
+      }
+    }
+
+    // ─── Four separate PO flows (do not merge; they may share helpers but must not conflict) ───
+    // 1. Create PO: placeOrderContext — new order, choose supplier, choose yarn, place.
+    // 2. Edit/Update PO: editOrderPo / editOrderContext — change items, quantity, add/remove (NOT status).
+    // 3. Update status PO: orderRefForStatus, awaitingFollowUp 'update_status_po' | 'update_status_choice' — change status only.
+    // 4. Delete PO: deleteYarnPurchaseOrder intent — delete order (no persistent context).
+    // When in edit flow, explicit "update status" or "delete this order" is routed to flow 3 or 4 below.
+
+    // Fallback: "add item" / "add more yarn" without editOrderPo — recover edit context from last assistant message (e.g. "What would you like to edit?" + PO-2026-975) so we show order's supplier yarn list, not create-PO supplier list
+    const vagueAddItemOnly = /^(?:i\s+)?(?:wanna|want\s+to)\s+add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$|^add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$/i.test(normalizedQuestion.trim());
+    // Also fallback: "do you have anything in blue" / colour keyword when last message was add-item yarn list — so we search order's supplier yarns, not raw materials
+    const colourKeywordQuestion = /^(?:do\s+you\s+have\s+(?:anything\s+in\s+|something\s+in\s+)?|anything\s+in\s+|something\s+in\s+|do\s+you\s+have\s+)(.+)$/i.test(normalizedQuestion.trim()) && normalizedQuestion.trim().length >= 10;
+    const tryEditFallback = !context?.editOrderPo?.purchaseOrderId && (vagueAddItemOnly || colourKeywordQuestion) && Array.isArray(conversationHistory) && conversationHistory.length > 0;
+    if (tryEditFallback) {
+      const lastAssistant = [...conversationHistory].reverse().find((m) => m.role === 'assistant');
+      const lastContent = (lastAssistant?.content || '').toString();
+      // Match edit-PO screen, or add-item yarn list, or natural summary (e.g. "You can select a yarn to add to your order by number or name from the list provided")
+      const hasEditPrompt = /what would you like to edit\?/i.test(lastContent) || /edit\s+more\s+or\s+complete/i.test(lastContent) || /edited\s+purchase\s+order\s+PO-?/i.test(lastContent) || /purchase\s+order:\s*PO-?/i.test(lastContent) || /here are yarn items from/i.test(lastContent) || /here are yarns from/i.test(lastContent) || /choose a yarn from the list/i.test(lastContent) || /select a yarn to add/i.test(lastContent) || /yarn to add to your order/i.test(lastContent) || /from the list provided/i.test(lastContent) || /number or name from the list/i.test(lastContent) || /keyword.*(?:number or name|blue)/i.test(lastContent);
+      // Get PO from last assistant message or from any recent message (in case summary doesn't include PO)
+      let poInMessage = lastContent.match(/\bPO-?\s*(\d{4}-\d{2,})\b/i) || lastContent.match(/\b(\d{4}-\d{2,})\b/);
+      if (!poInMessage && Array.isArray(conversationHistory)) {
+        for (let i = conversationHistory.length - 1; i >= 0; i--) {
+          const c = (conversationHistory[i].content || '').toString();
+          const m = c.match(/\bPO-?\s*(\d{4}-\d{2,})\b/i) || c.match(/\b(\d{4}-\d{2,})\b/);
+          if (m) {
+            poInMessage = m;
+            break;
+          }
+        }
+      }
+      const poNumber = poInMessage ? (poInMessage[0].toUpperCase().startsWith('PO') ? poInMessage[0].replace(/\s+/g, '') : `PO-${poInMessage[1]}`) : null;
+      // For colour-keyword questions ("do you have anything in blue") only need PO in conversation — don't route to raw materials. For "add item" we need hasEditPrompt too.
+      const shouldRunEditFallback = poNumber && (hasEditPrompt || colourKeywordQuestion);
+      if (shouldRunEditFallback) {
+        try {
+          const editCtx = await aiToolService.getEditOrderContextFromPoNumber(poNumber);
+          if (editCtx) {
+            const result = await aiToolService.applyYarnPurchaseOrderEdit(editCtx.purchaseOrderId, normalizedQuestion, editCtx);
+            const responseStr = result.html || '';
+            const resolvedPoNum = result.editOrderContext?.poNumber ?? editCtx.poNumber;
+            let editSummary = (responseStr.includes('Here are yarn items from') || responseStr.includes('Here are yarns from')) && result.editOrderContext?.addItemState ? 'Showing yarn list to add to order. Pick a yarn by number or name.' : 'Processed your order edit.';
+            const out = {
+              type: 'ai_tool',
+              intent: { action: 'applyYarnPurchaseOrderEdit' },
+              response: responseStr,
+              confidence: 0.95,
+              source: 'ai_tool_service',
+              contextUsed: true,
+              ...(result.editOrderContext !== undefined && { editOrderContext: result.editOrderContext })
+            };
+            persistAgentFlowIfNeeded(sessionId, out);
+            return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: resolvedPoNum });
+          }
+        } catch (err) {
+          console.warn('Edit-order add-item fallback failed:', err?.message);
+        }
+      }
+    }
+
+    // In-chat EDIT flow: when we're editing an order (context.editOrderPo), handle only edit-detail actions (items, qty, add, remove). Route status/delete to their own flows.
     if (context?.editOrderPo?.purchaseOrderId) {
+      const poId = context.editOrderPo.purchaseOrderId;
+      const poNum = context.editOrderPo.poNumber;
+      const msg = normalizedQuestion.trim().toLowerCase();
+
+      // Explicit status update while in edit context → run UPDATE STATUS flow only (do not handle in edit flow)
+      const statusUpdatePhrase = /^(?:set|update|change)\s+status\s+to\s+.+|^mark\s+(?:this\s+order\s+)?as\s+(?:in\s+transit|goods\s+received|qc\s+pending|submitted|po\s+accepted|po\s+rejected|goods\s+partially\s+received|po\s+accepted\s+partially)/i.test(normalizedQuestion.trim()) ||
+        /^(?:set|update|change)\s+status\s+to\s+.+/i.test(normalizedQuestion.trim());
+      if (statusUpdatePhrase) {
+        try {
+          const statusMatch = normalizedQuestion.match(/(?:to|as)\s+([\w\s]+?)(?:\s*\.|$)/i) || normalizedQuestion.match(/status\s+to\s+([\w\s]+)/i);
+          const statusPhrase = (statusMatch && statusMatch[1]) ? statusMatch[1].trim() : '';
+          const aiResponse = await aiToolService.executeAITool(
+            { action: 'updateYarnPurchaseOrderStatus', params: { purchaseOrderId: poId, poNumber: poNum, status_code: statusPhrase || undefined }, confidence: 0.95 },
+            { sessionId }
+          );
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
+          const isChoosingStatus = aiResponse?.needsStatusChoice && aiResponse?.orderRef;
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'updateYarnPurchaseOrderStatus', params: { poNumber: poNum } },
+            response: responseStr,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true,
+            ...(isChoosingStatus ? { awaitingFollowUp: 'update_status_choice', orderRefForStatus: aiResponse.orderRef, editOrderContext: null } : { editOrderContext: { purchaseOrderId: poId, poNumber: poNum } })
+          };
+          persistAgentFlowIfNeeded(sessionId, out);
+          const summary = isChoosingStatus ? 'Choose status by number (1–8).' : 'Updated the order status.';
+          return await addNaturalReply(out, normalizedQuestion, { action: 'update order status', summary, poNumber: poNum });
+        } catch (err) {
+          console.warn('Update status from edit context failed:', err?.message);
+        }
+      }
+
+      // Explicit delete while in edit context → run DELETE flow only (then clear edit context)
+      const deletePhrase = /^(?:delete|cancel|remove)\s+(?:this\s+)?(?:order|po)\s*\.?$/i.test(normalizedQuestion.trim());
+      if (deletePhrase) {
+        try {
+          const aiResponse = await aiToolService.executeAITool(
+            { action: 'deleteYarnPurchaseOrder', params: { purchaseOrderId: poId, poNumber: poNum }, confidence: 0.95 },
+            { sessionId }
+          );
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'deleteYarnPurchaseOrder', params: { poNumber: poNum } },
+            response: responseStr,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true,
+            editOrderContext: null
+          };
+          persistAgentFlowIfNeeded(sessionId, out);
+          return await addNaturalReply(out, normalizedQuestion, { action: 'delete order', summary: 'Order deleted.', poNumber: poNum });
+        } catch (err) {
+          console.warn('Delete from edit context failed:', err?.message);
+        }
+      }
+
+      // Confirm delete after "remove item" when only one item → run DELETE flow and clear edit context
+      const confirmDelete = context.editOrderPo.confirmDeleteOrder && /^(?:yes|yeah|y|ok|sure)\s*,?\s*(?:delete\s+(?:this\s+)?(?:order|po))?\.?$/i.test(normalizedQuestion.trim());
+      if (confirmDelete) {
+        try {
+          const aiResponse = await aiToolService.executeAITool(
+            { action: 'deleteYarnPurchaseOrder', params: { purchaseOrderId: poId, poNumber: poNum }, confidence: 0.95 },
+            { sessionId }
+          );
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'deleteYarnPurchaseOrder', params: { poNumber: poNum } },
+            response: responseStr,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true,
+            editOrderContext: null
+          };
+          persistAgentFlowIfNeeded(sessionId, out);
+          return await addNaturalReply(out, normalizedQuestion, { action: 'delete order', summary: 'Order deleted.', poNumber: poNum });
+        } catch (err) {
+          console.warn('Confirm delete from edit context failed:', err?.message);
+        }
+      }
+
       try {
         const result = await aiToolService.applyYarnPurchaseOrderEdit(
-          context.editOrderPo.purchaseOrderId,
+          poId,
           normalizedQuestion,
           context.editOrderPo
         );
         const responseStr = result.html || '';
-        const poNum = context.editOrderPo.poNumber || result.editOrderContext?.poNumber;
+        const resolvedPoNum = result.editOrderContext?.poNumber ?? poNum;
         let editSummary = 'Processed your order edit.';
         if (responseStr && typeof responseStr === 'string') {
           if (responseStr.includes('Quantity Updated')) editSummary = 'Updated the quantity.';
           else if (responseStr.includes('Status Updated')) editSummary = 'Updated the order status.';
           else if (responseStr.includes('Change quantity')) editSummary = 'Helping you change the quantity.';
+          else if (responseStr.includes('Items Removed')) editSummary = 'Removed the selected items from the order.';
           else if (responseStr.includes('Item Removed')) editSummary = 'Removed the item.';
           else if (responseStr.includes('Item Added')) editSummary = 'Added the item.';
           else if (responseStr.includes('Order Complete') || responseStr.includes('Edit Cancelled')) editSummary = 'Finished with the order edit.';
+          else if (responseStr.includes('Confirm removal') && result.editOrderContext?.removeItemState?.step === 'confirm_remove') editSummary = 'Confirm removal: type yes to remove these items or no to cancel.';
+          else if (responseStr.includes('Remove item') && result.editOrderContext?.removeItemState?.step === 'choose_items') editSummary = 'Pick item(s) to remove by number (e.g. 1 or 1, 3).';
+          else if ((responseStr.includes('Add item') || responseStr.includes('Here are yarn items from')) && result.editOrderContext?.addItemState) editSummary = 'Showing yarn list to add to order. Pick a yarn by number or name.';
+          else if ((responseStr.includes('Only one item') || responseStr.includes('delete the entire order')) && result.editOrderContext?.confirmDeleteOrder) editSummary = 'Asking if you want to delete the order. Reply yes, delete order to delete.';
         }
         const out = {
           type: 'ai_tool',
@@ -419,7 +606,8 @@ export const askQuestion = async (question, options = {}) => {
           contextUsed: true,
           ...(result.editOrderContext !== undefined && { editOrderContext: result.editOrderContext })
         };
-        return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: poNum });
+        persistAgentFlowIfNeeded(sessionId, out);
+        return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: resolvedPoNum });
       } catch (err) {
         console.warn('Apply edit failed:', err?.message);
       }
@@ -510,6 +698,46 @@ export const askQuestion = async (question, options = {}) => {
         (context.placeOrderContext.supplierId && (context.placeOrderContext.yarnNames?.length ?? 0) > 0));
     if (inPlaceOrderYarnFlow) {
       try {
+        // When user says "yes"/"y"/"confirm" and we have order summary (collectedItems), place the order and return PO number (same as resolvePendingConfirmation; handles missing sessionId or lost pending)
+        const isConfirmPlace = /^(?:yes|y|confirm)\s*$/i.test(normalizedQuestion.trim());
+        const hasCollectedItems = (context.placeOrderContext?.collectedItems?.length ?? 0) > 0;
+        if (isConfirmPlace && hasCollectedItems) {
+          try {
+            const { created, total, poItems } = await aiToolService.createPurchaseOrderFromPlaceContext(context.placeOrderContext);
+            const html = `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}.`;
+            const out = {
+              type: 'ai_tool',
+              intent: { action: 'createYarnPurchaseOrder' },
+              response: html,
+              orderWizardPrompt: undefined,
+              placeOrderContext: undefined,
+              confidence: 1,
+              source: 'ai_tool_service',
+              contextUsed: true
+            };
+            persistAgentFlowIfNeeded(sessionId, out);
+            return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: `Order placed with PO number ${created.poNumber}.`, poNumber: created.poNumber });
+          } catch (placeErr) {
+            console.warn('Place order from context failed:', placeErr?.message);
+          }
+        }
+        // "no"/"n"/"cancel" at summary step — cancel and clear context
+        const isCancelPlace = /^(?:no|n|cancel)\s*$/i.test(normalizedQuestion.trim());
+        if (isCancelPlace && hasCollectedItems) {
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'createYarnPurchaseOrder' },
+            response: 'Order cancelled. You can start a new order by saying "place order".',
+            orderWizardPrompt: undefined,
+            placeOrderContext: undefined,
+            confidence: 1,
+            source: 'ai_tool_service',
+            contextUsed: true
+          };
+          persistAgentFlowIfNeeded(sessionId, out);
+          return await addNaturalReply(out, normalizedQuestion, { action: 'cancel order', summary: 'Order cancelled.' });
+        }
+
         const result = await aiToolService.handlePlaceOrderYarnChat(context.placeOrderContext, normalizedQuestion);
         if (result.needsPlaceOrderConfirmation && sessionId && result.placeOrderContext) {
           aiToolService.setPendingPlaceOrderConfirmation(sessionId, { placeOrderContext: result.placeOrderContext });
@@ -518,7 +746,7 @@ export const askQuestion = async (question, options = {}) => {
             intent: { action: 'createYarnPurchaseOrder' },
             response: result.html,
             orderWizardPrompt: undefined,
-            placeOrderContext: undefined,
+            placeOrderContext: result.placeOrderContext,
             confidence: 0.95,
             source: 'ai_tool_service',
             contextUsed: true
@@ -540,6 +768,7 @@ export const askQuestion = async (question, options = {}) => {
         const isDisambiguation = (result.summary || '').includes('Multiple yarns match') || (result.html || '').includes('Which yarn?');
         const replyAction = isNoMatch ? 'yarn search (no match)' : isDisambiguation ? 'yarn search (disambiguation)' : 'place order (chat)';
         const replySummary = isNoMatch ? 'No matching yarn. Try a different keyword or pick from the list by number.' : isDisambiguation ? 'Multiple yarns match; choose by number.' : (result.summary || 'Processing.');
+        persistAgentFlowIfNeeded(sessionId, out);
         const returned = await addNaturalReply(out, normalizedQuestion, { action: replyAction, summary: replySummary });
         // For no-match, show only the natural GPT reply; clear the rigid "No match" HTML so the UI shows just the conversational message
         if (isNoMatch && returned.conversationalMessage) {
@@ -812,7 +1041,8 @@ export const askQuestion = async (question, options = {}) => {
     }
     
     // Run order-action intent (delete/update status/edit order) before FAQ so they are never overridden by FAQ match
-    const orderActionPattern = /\b(delete|cancel|remove|update|mark|set|edit)\b.*\b(?:purchase\s+)?order\b|edit\s+order/i;
+    // Match "edit order", "edit order PO-xxx", "edit po-2026-975", "update status", "delete order", etc.
+    const orderActionPattern = /\b(delete|cancel|remove|update|mark|set|edit)\b.*\b(?:purchase\s+)?order\b|edit\s+order|edit\s+po-?[\w\-]+/i;
     if (orderActionPattern.test(normalizedQuestion)) {
       const orderIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
       if (orderIntent && (orderIntent.action === 'deleteYarnPurchaseOrder' || orderIntent.action === 'updateYarnPurchaseOrderStatus' || orderIntent.action === 'editYarnPurchaseOrder')) {
@@ -998,9 +1228,92 @@ Please provide a helpful response based on this FAQ knowledge.`
     
     const aiIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
     
+    // Don't route "do you have anything in blue" / "anythin in 20-blue" (no "raw material" in message) to getRawMaterials — that's usually yarn/order context; raw materials need explicit "raw materials in blue"
+    const looksLikeYarnColourQuestion = (/^(?:do\s+you\s+have\s+)(?:anything\s+in\s+|something\s+in\s+)[a-z0-9\s\-]+$|^(?:anything|something|anythin)\s+in\s+[a-z0-9\s\-]+$/i.test(normalizedQuestion.trim()) && !/\braw\s+material/i.test(normalizedQuestion) && normalizedQuestion.trim().length >= 8)
+      || (aiIntent?.params?.color && !/\braw\s+material/i.test(normalizedQuestion) && /\b(?:anything|something|anythin)\s+in\s+/i.test(normalizedQuestion.trim()) && normalizedQuestion.trim().length >= 8);
+    const storedFlowForYarn = sessionId ? aiToolService.getAgentFlowSession(sessionId) : null;
+    const inPoFlowWithContext = (storedFlowForYarn?.flow === 'edit_po' && storedFlowForYarn?.context?.editOrderPo?.purchaseOrderId) || (storedFlowForYarn?.flow === 'create_po' && storedFlowForYarn?.context?.placeOrderContext);
+    if (aiIntent?.action === 'getRawMaterials' && aiIntent?.params?.color && looksLikeYarnColourQuestion && !inPoFlowWithContext) {
+      const out = {
+        type: 'ai_tool',
+        intent: { action: 'applyYarnPurchaseOrderEdit' },
+        response: `If you're choosing a <strong>yarn</strong> to add to an order, say <strong>edit order PO-XXX</strong>, then <strong>add item</strong>, and ask e.g. "do you have anything in blue" — I'll show that supplier's yarns. For <strong>raw materials</strong> by colour, say "raw materials in blue".`,
+        confidence: 0.9,
+        source: 'faq_service'
+      };
+      return await addNaturalReply(out, normalizedQuestion, { action: 'clarify', summary: 'Clarifying yarn vs raw materials.' });
+    }
+
     if (aiIntent && aiIntent.action !== 'getCapabilities') {
       console.log('AI Tool Intent Detected:', aiIntent);
-      
+      // When session says we're in a PO flow (edit or create), handle colour/keyword as yarn-in-PO flow — same as create PO; don't run getRawMaterials
+      const storedFlow = storedFlowForYarn;
+      const unrelatedToYarnFlow = (storedFlow?.flow === 'edit_po' || storedFlow?.flow === 'create_po') &&
+        (aiIntent.action === 'getRawMaterials' || aiIntent.action === 'getRawMaterialColors');
+      if (unrelatedToYarnFlow) {
+        // Edit PO: run edit flow with user message so add-item keyword/colour search shows supplier yarns (like create PO)
+        if (storedFlow?.flow === 'edit_po' && storedFlow.context?.editOrderPo?.purchaseOrderId) {
+          try {
+            const poId = storedFlow.context.editOrderPo.purchaseOrderId;
+            const poNum = storedFlow.context.editOrderPo.poNumber;
+            const result = await aiToolService.applyYarnPurchaseOrderEdit(poId, normalizedQuestion, storedFlow.context.editOrderPo);
+            const responseStr = result.html || '';
+            const resolvedPoNum = result.editOrderContext?.poNumber ?? poNum;
+            let editSummary = 'Processed your order edit.';
+            if (responseStr && typeof responseStr === 'string') {
+              if (responseStr.includes('Quantity Updated')) editSummary = 'Updated the quantity.';
+              else if (responseStr.includes('Here are yarn items from') && result.editOrderContext?.addItemState) editSummary = 'Showing yarn list to add to order. Pick a yarn by number or name.';
+              else if (responseStr.includes('No yarn found') || responseStr.includes('No match')) editSummary = 'No matching yarn. Try a different keyword or pick from the list.';
+            }
+            const out = {
+              type: 'ai_tool',
+              intent: { action: 'applyYarnPurchaseOrderEdit' },
+              response: responseStr,
+              confidence: 0.95,
+              source: 'ai_tool_service',
+              contextUsed: true,
+              ...(result.editOrderContext !== undefined && { editOrderContext: result.editOrderContext })
+            };
+            persistAgentFlowIfNeeded(sessionId, out);
+            return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: resolvedPoNum });
+          } catch (err) {
+            console.warn('Edit PO flow (from session) failed:', err?.message);
+          }
+        }
+        // Create PO: run place-order chat with user message so keyword/colour search shows supplier yarns
+        if (storedFlow?.flow === 'create_po' && storedFlow.context?.placeOrderContext) {
+          try {
+            const result = await aiToolService.handlePlaceOrderYarnChat(storedFlow.context.placeOrderContext, normalizedQuestion);
+            if (result?.html != null) {
+              const out = {
+                type: 'ai_tool',
+                intent: { action: 'createYarnPurchaseOrder' },
+                response: result.html,
+                orderWizardPrompt: result.orderWizardPrompt ?? undefined,
+                ...(result.placeOrderContext != null && { placeOrderContext: result.placeOrderContext }),
+                confidence: 0.95,
+                source: 'ai_tool_service',
+                contextUsed: true
+              };
+              persistAgentFlowIfNeeded(sessionId, out);
+              const summary = (result.summary || '').includes('No match') ? 'No matching yarn. Try a different keyword or pick from the list.' : (result.summary || 'Processing.');
+              return await addNaturalReply(out, normalizedQuestion, { action: 'place order (chat)', summary });
+            }
+          } catch (err) {
+            console.warn('Create PO flow (from session) failed:', err?.message);
+          }
+        }
+        // No stored context: keep user in flow with a short hint
+        const out = {
+          type: 'ai_tool',
+          intent: { action: storedFlow?.flow === 'edit_po' ? 'applyYarnPurchaseOrderEdit' : 'createYarnPurchaseOrder' },
+          response: `You're in the <strong>${storedFlow?.flow === 'edit_po' ? 'edit order' : 'place order'}</strong> flow. Reply with a yarn choice (number, name, or keyword like "blue"), or say <strong>done</strong> to finish. For raw materials, start a new message with "raw materials in [colour]".`,
+          confidence: 0.9,
+          source: 'faq_service'
+        };
+        return await addNaturalReply(out, normalizedQuestion, { action: 'stay in flow', summary: 'Staying in current flow.' });
+      }
+
       try {
         // Execute AI tool and return HTML response (sessionId enables confirmation guardrails for update/delete)
         let aiResponse = await aiToolService.executeAITool(aiIntent, { sessionId });
@@ -1017,7 +1330,15 @@ Please provide a helpful response based on this FAQ knowledge.`
                 ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
               }
             : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
-        const out = { type: 'ai_tool', intent: aiIntent, ...responsePayload, confidence: aiIntent.confidence, source: 'ai_tool_service' };
+        // Include editOrderContext etc. so frontend can persist them (e.g. "edit PO-2026-975" → next "add item" stays in edit flow with order's supplier)
+        const contextPayload = {
+          ...(aiResponse?.editOrderContext !== undefined && { editOrderContext: aiResponse.editOrderContext }),
+          ...(aiResponse?.awaitingFollowUp != null && { awaitingFollowUp: aiResponse.awaitingFollowUp }),
+          ...(aiResponse?.orderRefForStatus && { orderRefForStatus: aiResponse.orderRefForStatus }),
+          ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
+        };
+        const out = { type: 'ai_tool', intent: aiIntent, ...responsePayload, ...contextPayload, confidence: aiIntent.confidence, source: 'ai_tool_service' };
+        persistAgentFlowIfNeeded(sessionId, out);
         const summary = aiIntent.description || 'Retrieved the requested information.';
         return await addNaturalReply(out, normalizedQuestion, { action: aiIntent.action, summary, poNumber: aiIntent.params?.poNumber });
       } catch (aiError) {
@@ -1025,7 +1346,7 @@ Please provide a helpful response based on this FAQ knowledge.`
         // Continue to fallback response
       }
     }
-    
+
     // Step 4: Final fallback - no FAQ match and no AI tool
     if (allFAQs.length === 0) {
       // Use conversation service for natural conversation handling

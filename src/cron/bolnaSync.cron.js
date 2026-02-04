@@ -14,7 +14,7 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
     schedule,
     async () => {
       try {
-        logger.info('🔄 Starting scheduled Bolna call status sync...');
+        logger.debug('🔄 Starting scheduled Bolna call status sync...');
         
         // Get all calls that need syncing:
         // 1. Active calls (in_progress, initiated) to update their status
@@ -49,21 +49,21 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
         const callsToSync = inProgressCalls.results || [];
         
         if (callsToSync.length === 0) {
-          logger.info('✅ No in-progress calls to sync');
+          logger.debug('✅ No in-progress calls to sync');
           return;
         }
 
-        logger.info(`📞 Found ${callsToSync.length} in-progress calls to sync`);
+        logger.debug(`📞 Found ${callsToSync.length} in-progress calls to sync`);
 
         // Group calls by executionId and get unique execution IDs
         const executionIds = [...new Set(callsToSync.map(call => call.executionId).filter(Boolean))];
         
         if (executionIds.length === 0) {
-          logger.info('⚠️ No execution IDs found in calls');
+          logger.debug('⚠️ No execution IDs found in calls');
           return;
         }
 
-        logger.info(`🔄 Syncing ${executionIds.length} unique executions...`);
+        logger.debug(`🔄 Syncing ${executionIds.length} unique executions...`);
         
         let syncedCount = 0;
         let updatedCount = 0;
@@ -150,7 +150,7 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
                 // Even if call already has complete data, status should match Bolna
                 if (statusChanged) {
                   updateData.status = status;
-                  logger.info(`🔄 Status change detected: ${call.status} → ${status} for call ${call._id}`);
+                  logger.debug(`🔄 Status change detected: ${call.status} → ${status} for call ${call._id}`);
                 }
 
                 // Update from phone number if available and missing
@@ -205,7 +205,7 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
                   await callService.updateCallByExecutionId(executionId, updateData);
                   updatedCount++;
                   const statusUpdate = statusChanged ? `${call.status} → ${status}` : call.status;
-                  logger.info(`✅ Updated call ${call._id}: ${statusUpdate}${hasNewData ? ' (with new data)' : ''}`);
+                  logger.debug(`✅ Updated call ${call._id}: ${statusUpdate}${hasNewData ? ' (with new data)' : ''}`);
                 }
               }
             }
@@ -217,7 +217,7 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
           }
         }
 
-        logger.info(`✅ Scheduled Bolna sync completed: ${syncedCount} executions synced, ${updatedCount} calls updated, ${errorCount} errors`);
+        logger.debug(`✅ Scheduled Bolna sync completed: ${syncedCount} executions synced, ${updatedCount} calls updated, ${errorCount} errors`);
       } catch (error) {
         logger.error('❌ Error in scheduled Bolna call sync:', error);
       }
@@ -227,7 +227,7 @@ export const startBolnaSyncJob = (schedule = '* * * * *') => {
     'UTC' // timezone
   );
 
-  logger.info(`🔄 Bolna call sync cron job started with schedule: ${schedule}`);
+  logger.debug(`🔄 Bolna call sync cron job started with schedule: ${schedule}`);
   return job;
 };
 
