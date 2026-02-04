@@ -74,6 +74,16 @@ process.on('SIGTERM', () => {
     logger.info('Bolna sync cron job stopped');
   }
   if (server) {
-    server.close();
+    server.close(() => {
+      logger.info('Server closed');
+      process.exit(0);
+    });
+    // Force exit if connections don't drain within 10s (e.g. long-lived connections)
+    setTimeout(() => {
+      logger.info('Forcing exit after graceful shutdown timeout');
+      process.exit(0);
+    }, 10000).unref();
+  } else {
+    process.exit(0);
   }
 });
