@@ -21,6 +21,23 @@ const openai = new OpenAI({
 });
 
 /**
+ * Add a natural-language agent reply so the chat feels conversational. Mutates and returns the same object.
+ * @param {Object} returnObj - The response object to add conversationalMessage to
+ * @param {string} userMessage - What the user said
+ * @param {Object} opts - { action: string, summary: string, poNumber?: string }
+ * @returns {Promise<Object>} Same returnObj with conversationalMessage if GPT replied
+ */
+const addNaturalReply = async (returnObj, userMessage, opts = {}) => {
+  try {
+    const msg = await aiToolService.generateNaturalAgentReply(userMessage, opts);
+    if (msg) returnObj.conversationalMessage = msg;
+  } catch (e) {
+    // non-blocking: keep existing response
+  }
+  return returnObj;
+};
+
+/**
  * Generate embedding for text using OpenAI
  * @param {string} text - Text to generate embedding for
  * @returns {Promise<Array<number>>} - Embedding vector
@@ -377,9 +394,23 @@ export const askQuestion = async (question, options = {}) => {
     // In-chat edit: when we're editing an order (context.editOrderPo) and user sends an edit instruction, apply it
     if (context?.editOrderPo?.purchaseOrderId) {
       try {
-        const result = await aiToolService.applyYarnPurchaseOrderEdit(context.editOrderPo.purchaseOrderId, normalizedQuestion);
+        const result = await aiToolService.applyYarnPurchaseOrderEdit(
+          context.editOrderPo.purchaseOrderId,
+          normalizedQuestion,
+          context.editOrderPo
+        );
         const responseStr = result.html || '';
-        return {
+        const poNum = context.editOrderPo.poNumber || result.editOrderContext?.poNumber;
+        let editSummary = 'Processed your order edit.';
+        if (responseStr && typeof responseStr === 'string') {
+          if (responseStr.includes('Quantity Updated')) editSummary = 'Updated the quantity.';
+          else if (responseStr.includes('Status Updated')) editSummary = 'Updated the order status.';
+          else if (responseStr.includes('Change quantity')) editSummary = 'Helping you change the quantity.';
+          else if (responseStr.includes('Item Removed')) editSummary = 'Removed the item.';
+          else if (responseStr.includes('Item Added')) editSummary = 'Added the item.';
+          else if (responseStr.includes('Order Complete') || responseStr.includes('Edit Cancelled')) editSummary = 'Finished with the order edit.';
+        }
+        const out = {
           type: 'ai_tool',
           intent: { action: 'applyYarnPurchaseOrderEdit' },
           response: responseStr,
@@ -388,6 +419,7 @@ export const askQuestion = async (question, options = {}) => {
           contextUsed: true,
           ...(result.editOrderContext !== undefined && { editOrderContext: result.editOrderContext })
         };
+        return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: poNum });
       } catch (err) {
         console.warn('Apply edit failed:', err?.message);
       }
@@ -404,7 +436,7 @@ export const askQuestion = async (question, options = {}) => {
             { sessionId }
           );
           const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? '');
-          return {
+          const out = {
             type: 'ai_tool',
             intent: { action: 'editYarnPurchaseOrder', params: { poNumber: poForFollowUp } },
             response: responseStr,
@@ -414,8 +446,31 @@ export const askQuestion = async (question, options = {}) => {
             awaitingFollowUp: null,
             ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
           };
+          return await addNaturalReply(out, normalizedQuestion, { action: 'open order for editing', summary: `Showing order ${poForFollowUp} so you can edit it.`, poNumber: poForFollowUp });
         } catch (err) {
           console.warn('Edit order follow-up failed:', err?.message);
+        }
+      } else if (context?.awaitingFollowUp === 'update_status_po') {
+        try {
+          const aiResponse = await aiToolService.executeAITool(
+            { action: 'updateYarnPurchaseOrderStatus', params: { poNumber: poForFollowUp }, confidence: 0.95 },
+            { sessionId }
+          );
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
+          const isChoosingStatus = aiResponse?.needsStatusChoice && aiResponse?.orderRef;
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'updateYarnPurchaseOrderStatus', params: { poNumber: poForFollowUp } },
+            response: responseStr,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true,
+            awaitingFollowUp: isChoosingStatus ? 'update_status_choice' : null,
+            ...(isChoosingStatus && { orderRefForStatus: aiResponse.orderRef })
+          };
+          return await addNaturalReply(out, normalizedQuestion, { action: 'update order status', summary: `Choose new status for ${poForFollowUp}.`, poNumber: poForFollowUp });
+        } catch (err) {
+          console.warn('Update status PO follow-up failed:', err?.message);
         }
       } else if (Array.isArray(conversationHistory) && conversationHistory.length >= 2) {
         const lastAssistant = conversationHistory.filter(m => m.role === 'assistant').pop();
@@ -428,7 +483,7 @@ export const askQuestion = async (question, options = {}) => {
               { sessionId }
             );
             const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? '');
-            return {
+            const out = {
               type: 'ai_tool',
               intent: { action: 'editYarnPurchaseOrder', params: { poNumber: poForFollowUp } },
               response: responseStr,
@@ -437,6 +492,7 @@ export const askQuestion = async (question, options = {}) => {
               contextUsed: true,
               ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
             };
+            return await addNaturalReply(out, normalizedQuestion, { action: 'open order for editing', summary: `Showing order ${poForFollowUp} so you can edit it.`, poNumber: poForFollowUp });
           } catch (err) {
             console.warn('Edit order follow-up from history failed:', err?.message);
           }
@@ -444,15 +500,244 @@ export const askQuestion = async (question, options = {}) => {
       }
     }
 
-    // When user is in "choose supplier" flow, treat short reply as supplier name (e.g. "wampum", "allen solley")
+    // Place-order chat flow: choose yarn from list, then quantity → rate → gst one by one, then done → summary + confirm
+    // Stay in flow when we have supplier + yarn list (even if lastOrderWizardPrompt is missing), so user's yarn reply isn't treated as new intent
+    const inPlaceOrderYarnFlow =
+      context?.placeOrderContext &&
+      (context?.lastOrderWizardPrompt === 'choose_yarn_from_supplier' ||
+        context?.placeOrderContext?.collectingStep ||
+        context?.placeOrderContext?.yarnDisambiguationList ||
+        (context.placeOrderContext.supplierId && (context.placeOrderContext.yarnNames?.length ?? 0) > 0));
+    if (inPlaceOrderYarnFlow) {
+      try {
+        const result = await aiToolService.handlePlaceOrderYarnChat(context.placeOrderContext, normalizedQuestion);
+        if (result.needsPlaceOrderConfirmation && sessionId && result.placeOrderContext) {
+          aiToolService.setPendingPlaceOrderConfirmation(sessionId, { placeOrderContext: result.placeOrderContext });
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'createYarnPurchaseOrder' },
+            response: result.html,
+            orderWizardPrompt: undefined,
+            placeOrderContext: undefined,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true
+          };
+          return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: result.summary || 'Review order. Type yes to place or no to cancel.' });
+        }
+        const out = {
+          type: 'ai_tool',
+          intent: { action: 'createYarnPurchaseOrder' },
+          response: result.html,
+          orderWizardPrompt: result.orderWizardPrompt ?? undefined,
+          ...(result.placeOrderContext != null && { placeOrderContext: result.placeOrderContext }),
+          confidence: 0.95,
+          source: 'ai_tool_service',
+          contextUsed: true
+        };
+        // When no match or disambiguation, use action/summary so the LLM doesn't say "order placed"
+        const isNoMatch = (result.summary || '').includes('No match') || (result.html || '').includes('No match');
+        const isDisambiguation = (result.summary || '').includes('Multiple yarns match') || (result.html || '').includes('Which yarn?');
+        const replyAction = isNoMatch ? 'yarn search (no match)' : isDisambiguation ? 'yarn search (disambiguation)' : 'place order (chat)';
+        const replySummary = isNoMatch ? 'No matching yarn. Try a different keyword or pick from the list by number.' : isDisambiguation ? 'Multiple yarns match; choose by number.' : (result.summary || 'Processing.');
+        const returned = await addNaturalReply(out, normalizedQuestion, { action: replyAction, summary: replySummary });
+        // For no-match, show only the natural GPT reply; clear the rigid "No match" HTML so the UI shows just the conversational message
+        if (isNoMatch && returned.conversationalMessage) {
+          returned.response = '';
+        }
+        return returned;
+      } catch (err) {
+        console.warn('Place order chat flow failed:', err?.message);
+      }
+    }
+
+    // "Which supplier has [colour] yarn?" / "Which suppliers have blue yarn?" — list suppliers that have that colour in yarn name
+    const whichSupplierHasColourMatch = normalizedQuestion.match(/which\s+suppliers?\s+has\s+(.+?)\s+yarn\b/i) || normalizedQuestion.match(/which\s+suppliers?\s+have\s+(.+?)\s+yarn\b/i);
+    if (whichSupplierHasColourMatch) {
+      const colour = whichSupplierHasColourMatch[1].trim();
+      if (colour.length >= 2 && colour.length <= 40) {
+        try {
+          const html = await aiToolService.getSuppliersByYarnColour({ colour });
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'getSuppliersByYarnColour', params: { colour } },
+            response: typeof html === 'string' ? html : (html?.html ?? String(html)),
+            confidence: 0.95,
+            source: 'ai_tool_service'
+          };
+          return await addNaturalReply(out, normalizedQuestion, { action: 'suppliers by colour', summary: `Suppliers that have ${colour} yarn.` });
+        } catch (err) {
+          console.warn('getSuppliersByYarnColour failed:', err?.message);
+        }
+      }
+    }
+
+    // GPT-first: any yarn purchase related message — let GPT extract intent and params for free-flow chat
+    const looksLikeYarnPurchase = /\byarn\b/i.test(normalizedQuestion) && /\b(buy|purchase|order|get|want|need|from|wanna)\b/i.test(normalizedQuestion);
+    if (looksLikeYarnPurchase && normalizedQuestion.length >= 10) {
+      try {
+        const interpreted = await aiToolService.interpretYarnPurchaseMessage(normalizedQuestion, {
+          supplierName: context?.placeOrderContext?.supplierName,
+          yarnNames: context?.placeOrderContext?.yarnNames
+        });
+        if (interpreted) {
+          if (interpreted.intent === 'show_lists') {
+            const aiResponse = await aiToolService.executeAITool(
+              { action: 'createYarnPurchaseOrder', params: {}, confidence: 0.95 },
+              { sessionId }
+            );
+            const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+            const responsePayload = isPromptPayload ? { response: aiResponse.html, orderWizardPrompt: aiResponse.orderWizardPrompt } : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
+            const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params: {} }, ...responsePayload, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
+            return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Choose a supplier and optionally a colour.' });
+          }
+          if ((interpreted.intent === 'create_order' || interpreted.intent === 'choose_supplier') && interpreted.supplierQuery) {
+            const params = {
+              supplierQuery: interpreted.supplierQuery,
+              supplierNumber: /^\d+$/.test(interpreted.supplierQuery) ? parseInt(interpreted.supplierQuery, 10) : undefined
+            };
+            if (interpreted.yarnHint) params.yarnHint = interpreted.yarnHint;
+            if (interpreted.poItems?.length) params.poItems = interpreted.poItems;
+            const aiResponse = await aiToolService.executeAITool(
+              { action: 'createYarnPurchaseOrder', params, confidence: 0.95 },
+              { sessionId }
+            );
+            if (aiResponse?.needsPlaceOrderConfirmation && aiResponse?.placeOrderContext && sessionId) {
+              aiToolService.setPendingPlaceOrderConfirmation(sessionId, { placeOrderContext: aiResponse.placeOrderContext });
+              const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder' }, response: aiResponse.html, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
+              return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: aiResponse.summary || 'Review order. Type yes to place or no to cancel.' });
+            }
+            const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
+            const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+            const responsePayload = isWizardPayload
+              ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+              : isPromptPayload
+                ? {
+                    response: aiResponse.html,
+                    orderWizardPrompt: aiResponse.orderWizardPrompt,
+                    ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
+                  }
+                : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+            const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params }, ...responsePayload, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
+            const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : isWizardPayload ? 'Starting purchase order.' : 'Processing your order.';
+            return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary });
+          }
+        }
+      } catch (err) {
+        console.warn('GPT yarn purchase interpret failed, falling back to regex:', err?.message);
+      }
+    }
+
+    // "I want to buy yarn" / "purchase yarn" without "from [supplier]" — show supplier list and colour list so user can choose (regex fallback)
+    const buyYarnNoSupplier = /(?:i\s+)?(?:want\s+to\s+)?(?:purchase|buy|but|order|get)\s+(?:some\s+)?yarn\b/i.test(normalizedQuestion) && !/\bfrom\s+/.test(normalizedQuestion);
+    if (buyYarnNoSupplier) {
+      try {
+        const aiResponse = await aiToolService.executeAITool(
+          { action: 'createYarnPurchaseOrder', params: {}, confidence: 0.95 },
+          { sessionId }
+        );
+        const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+        const responsePayload = isPromptPayload
+          ? {
+              response: aiResponse.html,
+              orderWizardPrompt: aiResponse.orderWizardPrompt
+            }
+          : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
+        const out = {
+          type: 'ai_tool',
+          intent: { action: 'createYarnPurchaseOrder', params: {} },
+          ...responsePayload,
+          confidence: 0.95,
+          source: 'ai_tool_service',
+          contextUsed: true
+        };
+        return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Choose a supplier and optionally a colour.' });
+      } catch (err) {
+        console.warn('Create yarn order (no supplier) failed, continuing:', err?.message);
+      }
+    }
+
+    // "I want to / wanna purchase/buy/but [blue] yarn from [supplier]" — extract supplier and optional colour hint (before "yarn" or "in colour X")
+    const purchaseYarnFromMatch = normalizedQuestion.match(/(?:i\s+)?(?:want\s+to\s+|wanna\s+)?(?:purchase|buy|but|order|get)\s+(?:some\s+)?(.+?)\s+yarn\s+from\s+(.+)/i)
+      || normalizedQuestion.match(/(?:i\s+)?(?:want\s+to\s+|wanna\s+)?(?:purchase|buy|but|order|get)\s+(?:some\s+)?yarn\s+from\s+(.+)/i);
+    let supplierFromPhrase = null;
+    let yarnHint = null;
+    if (purchaseYarnFromMatch) {
+      if (purchaseYarnFromMatch[2]) {
+        supplierFromPhrase = purchaseYarnFromMatch[2].trim();
+        const beforeYarn = (purchaseYarnFromMatch[1] || '').trim();
+        if (beforeYarn && beforeYarn.length >= 2 && !/^some$/i.test(beforeYarn)) yarnHint = beforeYarn;
+      } else {
+        supplierFromPhrase = purchaseYarnFromMatch[1].trim();
+      }
+    }
+    if (supplierFromPhrase) {
+      const colourMatch = supplierFromPhrase.match(/\s+in\s+colou?r\s+(.+)$/i);
+      if (colourMatch) {
+        yarnHint = colourMatch[1].trim();
+        supplierFromPhrase = supplierFromPhrase.replace(/\s+in\s+colou?r\s+.+$/i, '').trim();
+      }
+      const hintMatch = supplierFromPhrase.match(/\s+something\s+(?:in\s+)?(.+)$/i);
+      if (hintMatch) yarnHint = hintMatch[1].trim();
+      supplierFromPhrase = supplierFromPhrase.replace(/\s+something\s+(?:in\s+)?.+$/i, '').trim();
+    }
+    const hasInlineOrder = /\bpieces?\b/i.test(supplierFromPhrase) && (/\bgst\b/i.test(supplierFromPhrase) || /for\s+\d/i.test(supplierFromPhrase));
+    const supplierQueryMaxLen = hasInlineOrder ? 500 : 80;
+    if (supplierFromPhrase && supplierFromPhrase.length >= 2 && supplierFromPhrase.length <= supplierQueryMaxLen) {
+      try {
+        const params = { supplierQuery: supplierFromPhrase, supplierNumber: /^\d+$/.test(supplierFromPhrase) ? parseInt(supplierFromPhrase, 10) : undefined };
+        if (yarnHint && yarnHint.length >= 2) params.yarnHint = yarnHint;
+        const aiResponse = await aiToolService.executeAITool(
+          { action: 'createYarnPurchaseOrder', params, confidence: 0.95 },
+          { sessionId }
+        );
+        if (aiResponse?.needsPlaceOrderConfirmation && aiResponse?.placeOrderContext && sessionId) {
+          aiToolService.setPendingPlaceOrderConfirmation(sessionId, { placeOrderContext: aiResponse.placeOrderContext });
+          const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: supplierFromPhrase } }, response: aiResponse.html, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
+          return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: aiResponse.summary || 'Review order. Type yes to place or no to cancel.' });
+        }
+        const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
+        const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+        const responsePayload = isWizardPayload
+          ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+          : isPromptPayload
+            ? {
+                response: aiResponse.html,
+                orderWizardPrompt: aiResponse.orderWizardPrompt,
+                ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
+                ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
+                ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
+              }
+            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+        const out = {
+          type: 'ai_tool',
+          intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: supplierFromPhrase } },
+          ...responsePayload,
+          confidence: 0.95,
+          source: 'ai_tool_service',
+          contextUsed: true
+        };
+        const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : isWizardPayload ? 'Starting purchase order.' : 'Processing your order.';
+        return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary });
+      } catch (err) {
+        console.warn('Purchase yarn from supplier failed, continuing:', err?.message);
+      }
+    }
+
+    // When user is in "choose supplier" flow, treat short reply as supplier name (e.g. "wampum", "allen solley") or number (1, 2)
     if (context?.lastOrderWizardPrompt === 'choose_supplier') {
       const isShowList = /show\s+(?:me\s+)?(?:the\s+)?supplier\s+list|supplier\s+list|see\s+(?:the\s+)?supplier\s+list|option\s*2|choose\s+from\s+(?:the\s+)?list|show\s+list/i.test(normalizedQuestion);
-      if (!isShowList && normalizedQuestion.length >= 2 && normalizedQuestion.length <= 80) {
+      if (!isShowList && normalizedQuestion.length >= 1 && normalizedQuestion.length <= 80) {
         try {
           const aiResponse = await aiToolService.executeAITool(
-            { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion }, confidence: 0.95 },
+            { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion, supplierNumber: /^\d+$/.test(normalizedQuestion) ? parseInt(normalizedQuestion, 10) : undefined }, confidence: 0.95 },
             { sessionId }
           );
+          if (aiResponse?.needsPlaceOrderConfirmation && aiResponse?.placeOrderContext && sessionId) {
+            aiToolService.setPendingPlaceOrderConfirmation(sessionId, { placeOrderContext: aiResponse.placeOrderContext });
+            const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion } }, response: aiResponse.html, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
+            return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: aiResponse.summary || 'Review order. Type yes to place or no to cancel.' });
+          }
           const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
           const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
           const responsePayload = isWizardPayload
@@ -462,10 +747,11 @@ export const askQuestion = async (question, options = {}) => {
                   response: aiResponse.html,
                   orderWizardPrompt: aiResponse.orderWizardPrompt,
                   ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
-                  ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
+                  ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
+                  ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
                 }
-              : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
-          return {
+              : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+          const out = {
             type: 'ai_tool',
             intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion } },
             ...responsePayload,
@@ -473,6 +759,8 @@ export const askQuestion = async (question, options = {}) => {
             source: 'ai_tool_service',
             contextUsed: true
           };
+          const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : isWizardPayload ? 'Starting purchase order.' : 'Processing your order.';
+          return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary });
         } catch (contextErr) {
           console.warn('Context createYarnPurchaseOrder failed, falling back to normal flow:', contextErr.message);
         }
@@ -483,7 +771,7 @@ export const askQuestion = async (question, options = {}) => {
     if (sessionId) {
       const resolved = await aiToolService.resolvePendingConfirmation(sessionId, normalizedQuestion);
       if (resolved.resolved && resolved.response != null) {
-        return {
+        const out = {
           type: 'ai_tool',
           intent: { action: 'confirm_or_cancel' },
           response: resolved.response,
@@ -491,6 +779,35 @@ export const askQuestion = async (question, options = {}) => {
           source: 'ai_tool_service',
           confirmationResolved: true
         };
+        const summary = resolved.poNumber ? `Order placed with PO number ${resolved.poNumber}.` : 'Done.';
+        return await addNaturalReply(out, normalizedQuestion, { action: 'confirm action', summary });
+      }
+    }
+
+    // Status choice follow-up: we asked "which status?" (numbered list excluding current); user replies with a number → ask for confirmation
+    if (context?.awaitingFollowUp === 'update_status_choice' && context?.orderRefForStatus) {
+      const currentStatus = context.orderRefForStatus.currentStatus || null;
+      const statusOption = aiToolService.getStatusOptionByNumberExcluding(normalizedQuestion, currentStatus);
+      if (statusOption) {
+        try {
+          const aiResponse = await aiToolService.executeAITool(
+            { action: 'updateYarnPurchaseOrderStatus', params: { ...context.orderRefForStatus, status_code: statusOption.code }, confidence: 0.95 },
+            { sessionId }
+          );
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
+          const out = {
+            type: 'ai_tool',
+            intent: { action: 'updateYarnPurchaseOrderStatus', params: { ...context.orderRefForStatus, status_code: statusOption.code } },
+            response: responseStr,
+            confidence: 0.95,
+            source: 'ai_tool_service',
+            contextUsed: true,
+            awaitingFollowUp: null
+          };
+          return await addNaturalReply(out, normalizedQuestion, { action: 'update order status', summary: `Confirm update to ${statusOption.label}.`, poNumber: context.orderRefForStatus.poNumber });
+        } catch (err) {
+          console.warn('Status choice follow-up failed:', err?.message);
+        }
       }
     }
     
@@ -503,7 +820,11 @@ export const askQuestion = async (question, options = {}) => {
           const aiResponse = await aiToolService.executeAITool(orderIntent, { sessionId });
           const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
           const isAskingWhichOrderToEdit = orderIntent.action === 'editYarnPurchaseOrder' && /please specify which order to edit/i.test(responseStr);
-          return {
+          const isChoosingStatus = aiResponse?.needsStatusChoice && aiResponse?.orderRef;
+          const isAskingOrderForStatus = orderIntent.action === 'updateYarnPurchaseOrderStatus' && /please specify which order/i.test(responseStr);
+          const actionLabel = orderIntent.action === 'deleteYarnPurchaseOrder' ? 'delete order' : orderIntent.action === 'updateYarnPurchaseOrderStatus' ? 'update order status' : 'edit order';
+          const summary = isAskingWhichOrderToEdit ? 'Need the PO number to open it for editing.' : isChoosingStatus ? 'Choose status by number (1–8).' : isAskingOrderForStatus ? 'Need the PO number to update status.' : (orderIntent.action === 'editYarnPurchaseOrder' ? 'Showing order details.' : orderIntent.description || 'Done.');
+          const out = {
             type: 'ai_tool',
             intent: orderIntent,
             response: responseStr,
@@ -511,8 +832,11 @@ export const askQuestion = async (question, options = {}) => {
             source: 'ai_tool_service',
             orderActionHandled: true,
             ...(isAskingWhichOrderToEdit ? { awaitingFollowUp: 'edit_order_po' } : {}),
+            ...(isAskingOrderForStatus ? { awaitingFollowUp: 'update_status_po' } : {}),
+            ...(isChoosingStatus ? { awaitingFollowUp: 'update_status_choice', orderRefForStatus: aiResponse.orderRef } : {}),
             ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
           };
+          return await addNaturalReply(out, normalizedQuestion, { action: actionLabel, summary, poNumber: orderIntent.params?.poNumber });
         } catch (orderErr) {
           console.warn('Order action execution failed, continuing to FAQ:', orderErr?.message);
         }
@@ -660,13 +984,8 @@ Please provide a helpful response based on this FAQ knowledge.`
           const responsePayload = isWizardPayload
             ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
             : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
-          return {
-            type: 'ai_tool',
-            intent: aiIntent,
-            ...responsePayload,
-            confidence: aiIntent.confidence,
-            source: 'ai_tool_service'
-          };
+          const out = { type: 'ai_tool', intent: aiIntent, ...responsePayload, confidence: aiIntent.confidence, source: 'ai_tool_service' };
+          return await addNaturalReply(out, normalizedQuestion, { action: 'capabilities', summary: 'Here’s what I can help you with.' });
         } catch (aiError) {
           console.error('AI Tool execution failed:', aiError);
           // Continue to fallback response
@@ -698,13 +1017,9 @@ Please provide a helpful response based on this FAQ knowledge.`
                 ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
               }
             : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
-        return {
-          type: 'ai_tool',
-          intent: aiIntent,
-          ...responsePayload,
-          confidence: aiIntent.confidence,
-          source: 'ai_tool_service'
-        };
+        const out = { type: 'ai_tool', intent: aiIntent, ...responsePayload, confidence: aiIntent.confidence, source: 'ai_tool_service' };
+        const summary = aiIntent.description || 'Retrieved the requested information.';
+        return await addNaturalReply(out, normalizedQuestion, { action: aiIntent.action, summary, poNumber: aiIntent.params?.poNumber });
       } catch (aiError) {
         console.error('AI Tool execution failed:', aiError);
         // Continue to fallback response

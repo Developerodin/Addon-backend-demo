@@ -19,6 +19,28 @@ const askQuestion = {
         purchaseOrderId: Joi.string().required(),
         poNumber: Joi.string().optional(),
       }).optional(),
+      orderRefForStatus: Joi.object().keys({
+        poNumber: Joi.string().optional(),
+        purchaseOrderId: Joi.string().optional(),
+        currentStatus: Joi.string().optional().max(64),
+      }).optional(),
+      placeOrderContext: Joi.object().keys({
+        supplierId: Joi.string().optional(),
+        supplierName: Joi.string().optional(),
+        yarnNames: Joi.array().items(Joi.string()).optional(),
+        page: Joi.number().optional(),
+        yarnDisambiguationList: Joi.array().items(Joi.string()).optional(),
+        collectingYarnName: Joi.string().optional(),
+        collectingStep: Joi.string().optional(),
+        collectingQuantity: Joi.number().optional(),
+        collectingRate: Joi.number().optional(),
+        collectedItems: Joi.array().items(Joi.object().keys({
+          yarnName: Joi.string(),
+          quantity: Joi.number(),
+          rate: Joi.number(),
+          gstRate: Joi.number().optional()
+        })).optional(),
+      }).optional(),
     }).optional(),
     conversationHistory: Joi.array()
       .items(Joi.object().keys({

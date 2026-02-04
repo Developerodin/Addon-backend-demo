@@ -826,6 +826,113 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
 };
 
 /**
+ * Generate a short natural-language reply so the agent feels conversational, not template-driven.
+ * Used as the visible "content" line above data/HTML. Safe to call; returns null on failure.
+ * @param {string} userMessage - What the user said
+ * @param {Object} options - { action: string, summary: string, poNumber?: string }
+ * @returns {Promise<string|null>} 1-2 sentence agent reply or null
+ */
+/**
+ * Use GPT to suggest the best-matching color/term from available yarn terms for a possibly mistyped user keyword.
+ * @param {string} userKeyword - What the user typed (e.g. "floden", "golen")
+ * @param {string[]} availableTerms - Unique terms (colors, descriptors) extracted from yarn names
+ * @returns {Promise<string|null>} Corrected keyword or null if no suggestion / API error
+ */
+const suggestYarnKeywordCorrection = async (userKeyword, availableTerms) => {
+  if (!userKeyword || !Array.isArray(availableTerms) || availableTerms.length === 0) return null;
+  const termsList = [...new Set(availableTerms)].slice(0, 150).join(', ');
+  try {
+    const openaiResponse = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a typo-correction helper for a yarn catalog. The user typed a keyword that might be a misspelling of a color or descriptor.
+Given the user's keyword and a list of available terms from our yarn names, reply with exactly one term from the list that best matches what the user likely meant. Consider common typos (e.g. floden->golden, golen->golden, blak->black).
+Reply with ONLY that single term, nothing else. If no term is a plausible match, reply with the user's keyword unchanged.`
+        },
+        {
+          role: 'user',
+          content: `User keyword: "${userKeyword}"
+Available terms: ${termsList}
+Reply with one term that best matches the user's keyword (or the user's keyword if no match).`
+        }
+      ],
+      temperature: 0.1,
+      max_tokens: 50
+    });
+    const text = openaiResponse.choices[0]?.message?.content?.trim();
+    if (!text) return null;
+    const corrected = text.split(/[\s,]/)[0].trim();
+    return corrected || userKeyword;
+  } catch (err) {
+    console.warn('suggestYarnKeywordCorrection failed:', err?.message);
+    return null;
+  }
+};
+
+/**
+ * Extract color/descriptor-like terms from yarn names for typo matching (e.g. "20s-Black-JET BLACK-Bamboo" -> Black, JET, BLACK, Bamboo).
+ * @param {string[]} yarnNames
+ * @returns {string[]}
+ */
+const extractTermsFromYarnNames = (yarnNames) => {
+  if (!Array.isArray(yarnNames) || yarnNames.length === 0) return [];
+  const seen = new Set();
+  const terms = [];
+  for (const name of yarnNames) {
+    const tokens = String(name).split(/[\s\-/]+/).filter(Boolean);
+    for (const t of tokens) {
+      const w = t.trim();
+      if (w.length >= 2 && !/^\d+$/.test(w)) {
+        const key = w.toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          terms.push(w);
+        }
+      }
+    }
+  }
+  return terms;
+};
+
+export const generateNaturalAgentReply = async (userMessage, options = {}) => {
+  const { action, summary, poNumber } = options;
+  if (!userMessage || typeof userMessage !== 'string') return null;
+  try {
+    const actionLabel = action || 'completed an action';
+    const summaryText = summary || 'Retrieved the requested information.';
+    const poPart = poNumber ? ` (Order ${poNumber})` : '';
+    const openaiResponse = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'system',
+          content: `You are Addon, a friendly business assistant. The user just said something and we've already handled it in the system.
+Your job: reply in 1-2 short sentences as if you're confirming or briefly summarizing. Sound like a person, not a bot.
+- Be warm and natural. Don't say "I have retrieved" or "Here is the data." Say it conversationally.
+- Don't list bullets or repeat the data—the data will be shown below your message.
+- Keep it under 2 sentences. No greetings like "Hello!" unless the user greeted you.`
+        },
+        {
+          role: 'user',
+          content: `User said: "${userMessage.slice(0, 300)}"
+We did: ${actionLabel}${poPart}. ${summaryText}
+Reply in 1-2 short, natural sentences as the agent.`
+        }
+      ],
+      temperature: 0.7,
+      max_tokens: 120
+    });
+    const text = openaiResponse.choices[0]?.message?.content?.trim();
+    return text || null;
+  } catch (err) {
+    console.warn('generateNaturalAgentReply failed:', err?.message);
+    return null;
+  }
+};
+
+/**
  * Enhanced intent detection for AI tool calling
  * @param {string} question - User's question
  * @param {Object} [options] - { conversationHistory?: Array<{role, content}> } for GPT-style context
@@ -1060,7 +1167,7 @@ export const detectIntent = async (question, options = {}) => {
         },
         description: 'Get single purchase order by PO number or ID'
       },
-      // Edit order = order details (items, quantities), NOT status. "I wanna edit order", "edit order PO-xxx"
+      // Edit order = order details (items, quantities), NOT status. "I wanna edit order", "edit order PO-xxx", "update an order"
       {
         pattern: /(?:i\s+)?(?:wanna|want\s+to)\s+edit\s+(?:the\s+)?order|edit\s+(?:the\s+)?(?:order\s+)?(?:details?\s+)?(?:for\s+)?(?:po-?)?[\w\-]*|edit\s+order\s+(?:po-?)?[\w\-]+/i,
         action: 'editYarnPurchaseOrder',
@@ -1075,6 +1182,30 @@ export const detectIntent = async (question, options = {}) => {
           return {};
         },
         description: 'Edit yarn purchase order details (not status)'
+      },
+      // "Update an order" / "I wanna update a order" — same as edit (ask for PO number)
+      {
+        pattern: /(?:i\s+)?(?:wanna|want\s+to)\s+update\s+(?:an?\s+)?(?:the\s+)?order|update\s+(?:an?\s+)?(?:the\s+)?order\s*(?:\s+po-?[\w\-]+)?/i,
+        action: 'editYarnPurchaseOrder',
+        extractParams: (match, question) => {
+          const poMatch = question.match(/po-?(\d{4}-\d{2,})/i) || question.match(/po-?([a-z0-9\-]+)/i) || question.match(/(\d{4}-\d{2,})/);
+          const idMatch = question.match(/id\s+([a-f0-9]{24})/i);
+          if (idMatch) return { purchaseOrderId: idMatch[1] };
+          if (poMatch && poMatch[1]) return { poNumber: poMatch[1].toUpperCase().startsWith('PO') ? poMatch[1] : `PO-${poMatch[1]}` };
+          return {};
+        },
+        description: 'Update order (edit order details — same as edit)'
+      },
+      // Quantity change (not status) — "update the quantity", "change quantity in order" → edit order, not update status
+      {
+        pattern: /(?:update|change)\s+(?:the\s+)?quantity\s+(?:in\s+)?(?:a\s+)?(?:purchase\s+)?order|(?:lets?\s+)?(?:change|update)\s+(?:the\s+)?quantity\s*\.?$/i,
+        action: 'editYarnPurchaseOrder',
+        extractParams: (match, question) => {
+          const poMatch = question.match(/po-?(\d{4}-\d{2,})/i) || question.match(/po-?([a-z0-9\-]+)/i) || question.match(/(\d{4}-\d{2,})/);
+          if (poMatch && poMatch[1]) return { poNumber: poMatch[1].toUpperCase().startsWith('PO') ? poMatch[1] : `PO-${poMatch[1]}` };
+          return {};
+        },
+        description: 'Edit order quantity (treated as edit order, not status update)'
       },
       // Update STATUS only — user must say "update status", "mark as in transit", "goods received", etc.
       {
@@ -7290,7 +7421,8 @@ const resolvePurchaseOrderId = async (purchaseOrderIdOrPoNumber) => {
  */
 export const getYarnPurchaseOrderById = async (params = {}) => {
   try {
-    const id = params.purchaseOrderId || params.poNumber || params.orderId;
+    const p = params && typeof params === 'object' ? params : {};
+    const id = p.purchaseOrderId || p.poNumber || p.orderId;
     if (!id) {
       return generateHTMLResponse('Purchase Order Details', 'Please specify a purchase order ID or PO number (e.g. "order details PO-2024-001" or "order by id &lt;id&gt;").');
     }
@@ -7311,6 +7443,426 @@ export const getYarnPurchaseOrderById = async (params = {}) => {
   }
 };
 
+const PAGE_SIZE = 5;
+
+/** Build order summary HTML from placeOrderContext.collectedItems (for confirmation before placing) */
+const buildPlaceOrderSummaryHtml = (ctx) => {
+  const items = ctx.collectedItems || [];
+  let subTotal = 0;
+  let gstTotal = 0;
+  const rows = items.map((it) => {
+    const lineTotal = it.rate * it.quantity;
+    const lineGst = (it.gstRate || 0) ? (lineTotal * it.gstRate) / 100 : 0;
+    subTotal += lineTotal;
+    gstTotal += lineGst;
+    return `<tr><td>${it.yarnName}</td><td>₹${Number(it.rate).toLocaleString()}</td><td>${it.quantity}</td><td>${it.gstRate ?? 0}%</td><td>₹${(lineTotal + lineGst).toLocaleString()}</td></tr>`;
+  }).join('');
+  const total = subTotal + gstTotal;
+  return AI_TOOL_STYLES + `
+    <div class="ai-tool-response">
+      <h3>📋 Order Summary — ${ctx.supplierName || 'Supplier'}</h3>
+      <p class="summary" style="margin: 0.4em 0;"><strong>Supplier:</strong> ${ctx.supplierName || 'N/A'}</p>
+      <div class="table-container">
+        <table class="data-table">
+          <thead><tr><th>Yarn</th><th>Rate (₹)</th><th>Qty</th><th>GST %</th><th>Line Total</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <p class="summary" style="margin: 0.6em 0;"><strong>Subtotal:</strong> ₹${subTotal.toLocaleString()} &nbsp;|&nbsp; <strong>GST:</strong> ₹${gstTotal.toLocaleString()} &nbsp;|&nbsp; <strong>Total:</strong> ₹${total.toLocaleString()}</p>
+      <p class="summary" style="margin-top: 0.8em;"><strong>Do you want to place this order?</strong> Type <strong>yes</strong> to confirm or <strong>no</strong> to cancel.</p>
+    </div>`;
+};
+
+/** Create PO from placeOrderContext (used after user confirms "yes") */
+export const createPurchaseOrderFromPlaceContext = async (placeOrderContext) => {
+  const ctx = placeOrderContext || {};
+  const nextPoNumber = await yarnPurchaseOrderService.getNextSuggestedPoNumber();
+  const supplier = await supplierService.getSupplierById(ctx.supplierId);
+  if (!supplier) throw new Error('Supplier not found.');
+  const poItems = [];
+  let subTotal = 0;
+  let gstTotal = 0;
+  for (const it of ctx.collectedItems || []) {
+    const catalogResult = await yarnCatalogService.queryYarnCatalogs({ yarnName: it.yarnName }, { limit: 1 });
+    const yarnCatalog = catalogResult?.results?.[0] || catalogResult?.[0] || null;
+    if (!yarnCatalog) throw new Error(`Yarn "${it.yarnName}" not found in catalog.`);
+    const yarnId = yarnCatalog._id?.toString?.() || yarnCatalog.id;
+    const fullYarnName = yarnCatalog.yarnName || it.yarnName || '';
+    // sizeCount is the start of product name (e.g. "20/40" from "20/40-Black-Black-Nylon/Spandex")
+    const sizeCount = (fullYarnName.split('-')[0] || '').trim() || (it.sizeCount || 'N/A');
+    const shadeCode = it.shadeCode || (fullYarnName.split('-').length > 1 ? fullYarnName.split('-')[1]?.trim() : undefined);
+    const lineTotal = it.rate * it.quantity;
+    const lineGst = (it.gstRate || 0) ? (lineTotal * it.gstRate) / 100 : 0;
+    subTotal += lineTotal;
+    gstTotal += lineGst;
+    poItems.push({
+      yarn: yarnId,
+      yarnName: fullYarnName,
+      sizeCount,
+      shadeCode: shadeCode || undefined,
+      rate: it.rate,
+      quantity: it.quantity,
+      gstRate: it.gstRate || undefined
+    });
+  }
+  const total = subTotal + gstTotal;
+  const body = {
+    poNumber: nextPoNumber,
+    supplierName: ctx.supplierName,
+    supplier: ctx.supplierId,
+    poItems,
+    subTotal,
+    gst: gstTotal,
+    total,
+    currentStatus: 'submitted_to_supplier'
+  };
+  const created = await yarnPurchaseOrderService.createPurchaseOrder(body);
+  return { created, total, poItems };
+};
+
+/**
+ * Handle place-order chat flow: load more, pick yarn (by number/name/keyword), then quantity → rate → gst one by one, then done → summary + confirm.
+ * @param {Object} ctx - placeOrderContext: { supplierId, supplierName, yarnNames, page, yarnDisambiguationList?, collectingYarnName?, collectingStep?, collectedItems? }
+ * @param {string} userMessage
+ * @returns {Promise<{ html: string, orderWizardPrompt?: string, placeOrderContext?: Object, needsPlaceOrderConfirmation?: boolean, summary?: string }>}
+ */
+export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
+  const msg = (userMessage || '').trim().toLowerCase();
+  const ctxCopy = { ...ctx, yarnNames: ctx.yarnNames || [], collectedItems: ctx.collectedItems || [] };
+
+  if (/^(cancel|start\s+over|never\s+mind|forget\s+it)$/i.test(msg) || msg === 'no') {
+    const html = generateHTMLResponse('Order cancelled', 'Order cancelled. Say <strong>place order</strong> to start a new one.');
+    return { html, orderWizardPrompt: null, placeOrderContext: undefined, summary: 'Order cancelled.' };
+  }
+
+  // "but" = common typo for "buy" (e.g. "wanna but yarn", "i want to but yarn")
+  const isBuyIntent = /\b(wanna|want\s+to|would\s+like\s+to|i\s+want\s+to)\s+(buy|but|purchase|order|get)\s+(some\s+)?yarn\b/i.test(msg) ||
+    /\b(buy|but|purchase|order)\s+(some\s+)?yarn\b/i.test(msg) ||
+    /^hey\s*,?\s*(i\s+)?(wanna|want\s+to)\s+(buy|but|purchase)/i.test(msg);
+  if (isBuyIntent) {
+    const yarnNames = ctx.yarnNames || [];
+    const page = ctx.page || 1;
+    const start = (page - 1) * PAGE_SIZE;
+    const slice = yarnNames.slice(start, start + PAGE_SIZE);
+    const hasMore = start + PAGE_SIZE < yarnNames.length;
+    const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
+    const html = generateHTMLResponse(
+      'Already placing an order',
+      `<p>You're already placing an order with <strong>${ctx.supplierName || 'your supplier'}</strong>.</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml ? `Here are yarn items (page ${page}):<br/>${listHtml}` : 'No yarn list loaded.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more.</p>` : ''}<p class="summary" style="margin-top: 0.6em;">Pick a yarn by <strong>number</strong> or <strong>name</strong> (e.g. black, light blue), or say <strong>done</strong> when you're finished.</p><p class="summary">To start a new order instead, say <strong>cancel</strong>.</p>`
+    );
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Pick a yarn from the list or say done.' };
+  }
+
+  if (msg === 'load more') {
+    const page = (ctx.page || 1) + 1;
+    const start = (page - 1) * PAGE_SIZE;
+    const slice = (ctx.yarnNames || []).slice(start, start + PAGE_SIZE);
+    const hasMore = start + PAGE_SIZE < (ctx.yarnNames || []).length;
+    const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
+    const html = generateHTMLResponse(
+      'More yarns',
+      `<p>Here are more yarn items from <strong>${ctx.supplierName}</strong> (page ${page}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No more items.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>done</strong> to create the order.</p>`
+    );
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: { ...ctxCopy, page }, summary: 'More yarns. Pick one or say done.' };
+  }
+
+  // "I want to add more" / "add more" / "show list" etc. — show yarn list and ask to choose (don't treat as yarn search)
+  const isAddMoreIntent = /^(?:i\s+)?(?:want\s+to\s+)?add\s+more\b|^add\s+more\b|^more\s+items?\b|^(?:add\s+)?another\s+(?:one|item)\b|^show\s+(?:me\s+)?(?:the\s+)?list\b|^show\s+list\b|^yes\s*,?\s*add\s+more\b|^sure\s*,?\s*(?:add\s+)?more\b/i.test(msg);
+  if (isAddMoreIntent) {
+    const yarnList = ctx.yarnNames || [];
+    const page = ctx.page || 1;
+    const start = (page - 1) * PAGE_SIZE;
+    const slice = yarnList.slice(start, start + PAGE_SIZE);
+    const hasMore = start + PAGE_SIZE < yarnList.length;
+    const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
+    const html = generateHTMLResponse(
+      'Choose yarn',
+      `<p>Here are yarn items from <strong>${ctx.supplierName || 'your supplier'}</strong> (page ${page}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list loaded.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>done</strong> to create the order.</p>`
+    );
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Choose a yarn from the list or say done.' };
+  }
+
+  // "Change supplier to X" / "Change supplier to X and look for Y" — switch to new supplier (and optional colour), return new choose-yarn screen
+  const changeSupplierMatch = (userMessage || '').trim().match(/change\s+supplier\s+to\s+(.+)/i);
+  if (changeSupplierMatch) {
+    let changePhrase = changeSupplierMatch[1].trim();
+    let changeYarnHint = null;
+    const andLookFor = changePhrase.match(/\s+and\s+look\s+for\s+(.+)$/i);
+    if (andLookFor) {
+      changeYarnHint = andLookFor[1].trim().replace(/\s*yarn\s*$/i, '').trim();
+      changePhrase = changePhrase.replace(/\s+and\s+look\s+for\s+.+$/i, '').trim();
+    }
+    if (changePhrase.length >= 2 && changePhrase.length <= 80) {
+      try {
+        const changeResult = await createYarnPurchaseOrder({
+          supplierQuery: changePhrase,
+          yarnHint: changeYarnHint && changeYarnHint.length >= 2 ? changeYarnHint : undefined
+        });
+        if (changeResult && typeof changeResult === 'object' && changeResult.html) {
+          return {
+            html: changeResult.html,
+            orderWizardPrompt: changeResult.orderWizardPrompt ?? 'choose_yarn_from_supplier',
+            placeOrderContext: changeResult.placeOrderContext ?? null,
+            summary: changeResult.placeOrderContext ? 'Switched supplier; choose yarn.' : 'Processing.'
+          };
+        }
+      } catch (e) {
+        console.warn('Change supplier failed:', e?.message);
+      }
+    }
+  }
+
+  if (ctx.yarnDisambiguationList && ctx.yarnDisambiguationList.length > 0) {
+    const raw = String(userMessage).trim();
+    let n = parseInt(raw, 10);
+    if (Number.isNaN(n) || n < 1 || n > ctx.yarnDisambiguationList.length) {
+      // Quick regex: "i want 3", "3 onw", "number 3", "option 2" -> first number in range
+      const firstNum = raw.match(/\b([1-9]\d*)\b/);
+      if (firstNum) {
+        const num = parseInt(firstNum[1], 10);
+        if (num >= 1 && num <= ctx.yarnDisambiguationList.length) n = num;
+      }
+      if (Number.isNaN(n) || n < 1 || n > ctx.yarnDisambiguationList.length) {
+        // GPT: interpret "the third one", "3 onw" (typo), "i want the 3rd" as list index
+        try {
+          const interpreted = await interpretPlaceOrderChatMessage(raw, {
+            yarnNames: ctx.yarnDisambiguationList,
+            supplierName: ctx.supplierName,
+            collectingStep: 'disambiguation',
+            collectedItems: ctx.collectedItems
+          });
+          if (interpreted?.action === 'list_index' && typeof interpreted.value === 'number') {
+            const idx = Math.floor(interpreted.value);
+            if (idx >= 1 && idx <= ctx.yarnDisambiguationList.length) n = idx;
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+    if (!Number.isNaN(n) && n >= 1 && n <= ctx.yarnDisambiguationList.length) {
+      const chosenYarn = ctx.yarnDisambiguationList[n - 1];
+      ctxCopy.collectingYarnName = chosenYarn;
+      ctxCopy.collectingStep = 'quantity';
+      ctxCopy.yarnDisambiguationList = undefined;
+      const html = generateHTMLResponse('Quantity', `How much yarn do you need for <strong>${chosenYarn}</strong>?`);
+      return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Adding yarn. Enter quantity.' };
+    }
+    ctxCopy.yarnDisambiguationList = undefined;
+  }
+
+  if (ctx.collectingStep === 'quantity') {
+    let qty = parseFloat(String(userMessage).trim().replace(/,/g, ''));
+    if (Number.isNaN(qty) || qty <= 0) {
+      const interpreted = await interpretPlaceOrderChatMessage(String(userMessage).trim(), { collectingStep: 'quantity', collectingYarnName: ctx.collectingYarnName, supplierName: ctx.supplierName });
+      if (interpreted?.action === 'quantity' && typeof interpreted.value === 'number' && interpreted.value > 0) qty = interpreted.value;
+    }
+    if (Number.isNaN(qty) || qty <= 0) {
+      return { html: generateHTMLResponse('Quantity', `Please enter a valid quantity (number) for <strong>${ctx.collectingYarnName}</strong>.`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy };
+    }
+    ctxCopy.collectingQuantity = qty;
+    ctxCopy.collectingStep = 'rate';
+    const html = generateHTMLResponse('Rate', `What <strong>rate</strong> do you want for <strong>${ctx.collectingYarnName}</strong>? (₹ per unit)`);
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter rate.' };
+  }
+
+  if (ctx.collectingStep === 'rate') {
+    let rate = parseFloat(String(userMessage).trim().replace(/,/g, '').replace(/[₹rs.]/gi, ''));
+    if (Number.isNaN(rate) || rate <= 0) {
+      const interpreted = await interpretPlaceOrderChatMessage(String(userMessage).trim(), { collectingStep: 'rate', collectingYarnName: ctx.collectingYarnName, supplierName: ctx.supplierName });
+      if (interpreted?.action === 'rate' && typeof interpreted.value === 'number' && interpreted.value > 0) rate = interpreted.value;
+    }
+    if (Number.isNaN(rate) || rate <= 0) {
+      return { html: generateHTMLResponse('Rate', `Please enter a valid rate (₹ per unit) for <strong>${ctx.collectingYarnName}</strong>.`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy };
+    }
+    ctxCopy.collectingRate = rate;
+    ctxCopy.collectingStep = 'gst';
+    const html = generateHTMLResponse('GST', `How much <strong>GST</strong> is there for <strong>${ctx.collectingYarnName}</strong>? (Enter percentage, e.g. 12 or 0)`);
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter GST %.' };
+  }
+
+  if (ctx.collectingStep === 'gst') {
+    const gstInput = String(userMessage).trim().replace(/%/g, '');
+    const gstRate = Number.isNaN(parseFloat(gstInput)) ? 0 : Math.max(0, parseFloat(gstInput));
+    const yarnNameAdded = ctx.collectingYarnName;
+    ctxCopy.collectedItems.push({
+      yarnName: ctx.collectingYarnName,
+      quantity: ctx.collectingQuantity,
+      rate: ctx.collectingRate,
+      gstRate
+    });
+    ctxCopy.collectingYarnName = undefined;
+    ctxCopy.collectingStep = undefined;
+    ctxCopy.collectingQuantity = undefined;
+    ctxCopy.collectingRate = undefined;
+    const html = generateHTMLResponse('Item added', `Added <strong>${yarnNameAdded}</strong>. Add another yarn? Reply with the <strong>number or name</strong> from the list, or <strong>done</strong> to create the order.`);
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Item added. Add more or say done.' };
+  }
+
+  if (msg === 'done' && (ctx.collectedItems || []).length > 0) {
+    const html = buildPlaceOrderSummaryHtml(ctxCopy);
+    return {
+      html,
+      orderWizardPrompt: null,
+      placeOrderContext: ctxCopy,
+      needsPlaceOrderConfirmation: true,
+      summary: 'Review your order. Type yes to place or no to cancel.'
+    };
+  }
+
+  if (msg === 'done') {
+    return { html: generateHTMLResponse('Order', 'No items added yet. Reply with the number or name of a yarn to add, or start over with "place order".'), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy };
+  }
+
+  const yarnNames = ctx.yarnNames || [];
+  const rawInput = String(userMessage).trim();
+
+  // Question-style request: "do you have anything in blue", "do they anything in black", "look for blue", "another colour black" — extract color/keyword
+  const questionKeywordMatch = rawInput.match(/^(?:do\s+you\s+have\s+(?:anything\s+in\s+|something\s+in\s+)?|do\s+they\s+(?:have\s+)?(?:anything\s+in\s+|something\s+in\s+)|do\s+we\s+have\s+(?:anything\s+in\s+|something\s+in\s+)?|(?:is\s+there\s+)(?:anything\s+in\s+|something\s+in\s+)|(?:have\s+they\s+)(?:anything\s+in\s+|something\s+in\s+)|anything\s+in\s+|something\s+in\s+|any\s+|show\s+me\s+(?:some\s+)?|got\s+any\s+|what\s+about\s+in\s+|what\s+about\s+|look\s+for\s+|another\s+colou?r\s+)(.+)$/i)
+    || rawInput.match(/\b(?:anything|something)\s+in\s+([a-zA-Z]+)\s*$/i);  // "... anything in black" at end (e.g. "do they anything in black")
+  let questionKeyword = questionKeywordMatch && questionKeywordMatch[1] ? questionKeywordMatch[1].replace(/\s*yarn\s*$/i, '').trim() : null;
+  if (questionKeyword && /^something\s+/i.test(questionKeyword)) questionKeyword = questionKeyword.replace(/^something\s+/i, '').trim();
+  if (questionKeyword && /\b(?:anything|something)\s+in\s+/i.test(questionKeyword)) questionKeyword = questionKeyword.replace(/^(?:anything|something)\s+in\s+/i, '').trim();
+  if (questionKeyword && questionKeyword.length >= 2) {
+    let searchKeyword = questionKeyword;
+    const availableTerms = extractTermsFromYarnNames(yarnNames);
+    if (availableTerms.length > 0) {
+      const corrected = await suggestYarnKeywordCorrection(questionKeyword, availableTerms);
+      if (corrected && corrected.toLowerCase() !== questionKeyword.toLowerCase()) searchKeyword = corrected;
+    }
+    const kwLower = searchKeyword.toLowerCase();
+    const matchesInList = yarnNames.filter((y) => y.toLowerCase().includes(kwLower));
+    if (matchesInList.length === 1) {
+      const chosenYarn = matchesInList[0];
+      ctxCopy.collectingYarnName = chosenYarn;
+      ctxCopy.collectingStep = 'quantity';
+      const html = generateHTMLResponse('Quantity', `How much yarn do you need for <strong>${chosenYarn}</strong>?`);
+      return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity.' };
+    }
+    if (matchesInList.length > 1) {
+      ctxCopy.yarnDisambiguationList = matchesInList;
+      const listHtml = matchesInList.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+      const html = generateHTMLResponse('Yarns matching your search', `Here are yarns with "<strong>${searchKeyword}</strong>" in the name. Reply with the <strong>number</strong> (1–${matchesInList.length}):<p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`);
+      return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Multiple yarns match; choose by number.' };
+    }
+    if (matchesInList.length === 0) {
+      return { html: generateHTMLResponse('No match', `No yarn found with "<strong>${searchKeyword}</strong>" in the name. Try a different keyword or pick from the list by number.`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'No match. Try again.' };
+    }
+  }
+
+  // Only treat as list index when message is exactly a number (e.g. "70") — not "70/2-Black..." which is a yarn name
+  const num = parseInt(rawInput, 10);
+  const isListIndex = /^\d+$/.test(rawInput) && !Number.isNaN(num) && num >= 1 && num <= yarnNames.length;
+  let chosenYarn = null;
+  if (isListIndex) {
+    chosenYarn = yarnNames[num - 1];
+  } else {
+    const nameLower = rawInput.toLowerCase();
+    chosenYarn = yarnNames.find((y) => y.toLowerCase() === nameLower || y.toLowerCase().includes(nameLower) || nameLower.includes(y.toLowerCase()));
+
+    // Extract yarn name from phrases like "do you have this 70/2-Black (New)-Paloma Grey-Nylon/Nylon"; also treat raw "70/2-Black..." as yarn name
+    const yarnNamePrefix = /^(?:\s*do\s+you\s+have\s+(?:this\s+)?|have\s+this\s+|get\s+this\s+|can\s+(?:i|you|we)\s+get\s+(?:this\s+)?|is\s+this\s+available\s+|(?:can\s+you\s+)?(?:find|search)\s+(?:me\s+)?(?:for\s+)?|i\s+(?:need|want)\s+)\s*/i;
+    let yarnPart = rawInput.replace(yarnNamePrefix, '').trim();
+    if (yarnPart.length < 2) yarnPart = null;
+    const looksLikeYarnName = yarnPart && (/\d+[s\/]\d*|\d+\/\d+/.test(yarnPart) || (yarnPart.split('-').length >= 2 && yarnPart.length >= 8));
+
+    if (!chosenYarn && yarnPart && looksLikeYarnName) {
+      chosenYarn = yarnNames.find((y) => y.toLowerCase().includes(yarnPart.toLowerCase()) || yarnPart.toLowerCase().includes(y.toLowerCase()));
+    }
+
+    if (!chosenYarn && nameLower.length >= 2) {
+      const stopwords = new Set(['anything', 'something', 'the', 'a', 'an', 'in', 'with', 'for', 'and', 'or', 'to', 'from', 'that', 'this', 'is', 'it', 'of', 'on', 'at', 'by', 'as', 'like', 'want', 'need', 'yarn', 'yarns']);
+      const rawKeywords = nameLower.split(/\s+/).filter(Boolean);
+      const keywords = rawKeywords.filter((w) => w.length > 1 && !stopwords.has(w));
+      const searchTerms = keywords.length > 0 ? keywords : rawKeywords;
+      const matches = searchTerms.length > 0
+        ? yarnNames.filter((y) => searchTerms.every((kw) => y.toLowerCase().includes(kw)))
+        : [];
+      if (matches.length === 1) {
+        chosenYarn = matches[0];
+      } else if (matches.length > 1) {
+        ctxCopy.yarnDisambiguationList = matches;
+        const listHtml = matches.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+        const html = generateHTMLResponse('Which yarn?', `Which yarn do you mean? Reply with the <strong>number</strong> (1–${matches.length}):<p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`);
+        return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Multiple yarns match; choose by number.' };
+      } else if (matches.length === 0 && (keywords.length > 0 || yarnPart)) {
+        // No match in supplier list — do not search catalog; only use GPT fallback or show No match
+        if (!chosenYarn) {
+          // GPT fallback: interpret free-form reply (e.g. "the blue one", "second one") with context
+          try {
+            const interpreted = await interpretPlaceOrderChatMessage(rawInput, {
+              yarnNames,
+              supplierName: ctx.supplierName,
+              collectedItems: ctx.collectedItems,
+              collectingStep: ctx.collectingStep,
+              collectingYarnName: ctx.collectingYarnName
+            });
+            if (interpreted?.action === 'list_index' && !Number.isNaN(interpreted.value) && interpreted.value >= 1 && interpreted.value <= yarnNames.length) {
+              chosenYarn = yarnNames[interpreted.value - 1];
+            } else if (interpreted?.action === 'search_keyword' && interpreted.value) {
+              const kw = String(interpreted.value).toLowerCase();
+              const gptMatches = yarnNames.filter((y) => y.toLowerCase().includes(kw));
+              if (gptMatches.length === 1) chosenYarn = gptMatches[0];
+              else if (gptMatches.length > 1) {
+                ctxCopy.yarnDisambiguationList = gptMatches;
+                const listHtml = gptMatches.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+                return { html: generateHTMLResponse('Yarns matching your search', `Here are yarns with "<strong>${interpreted.value}</strong>" in the name. Reply with the <strong>number</strong> (1–${gptMatches.length}):<p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Multiple yarns match; choose by number.' };
+              }
+            }
+          } catch (e) {
+            // ignore GPT errors, show no match below
+          }
+        }
+        if (!chosenYarn) {
+          return { html: generateHTMLResponse('No match', `No yarn found matching "<strong>${rawInput}</strong>". Try a different keyword or pick from the list by number.`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'No match. Try again.' };
+        }
+      }
+    }
+  }
+  if (chosenYarn) {
+    ctxCopy.collectingYarnName = chosenYarn;
+    ctxCopy.collectingStep = 'quantity';
+    const html = generateHTMLResponse('Quantity', `How much yarn do you need for <strong>${chosenYarn}</strong>?`);
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity.' };
+  }
+
+  // Final GPT fallback: interpret as list index or search keyword (e.g. "the second one", "something in navy")
+  try {
+    const interpreted = await interpretPlaceOrderChatMessage(rawInput, {
+      yarnNames,
+      supplierName: ctx.supplierName,
+      collectedItems: ctx.collectedItems,
+      collectingStep: ctx.collectingStep,
+      collectingYarnName: ctx.collectingYarnName
+    });
+    if (interpreted?.action === 'list_index' && !Number.isNaN(interpreted.value) && interpreted.value >= 1 && interpreted.value <= yarnNames.length) {
+      const chosen = yarnNames[interpreted.value - 1];
+      ctxCopy.collectingYarnName = chosen;
+      ctxCopy.collectingStep = 'quantity';
+      const html = generateHTMLResponse('Quantity', `How much yarn do you need for <strong>${chosen}</strong>?`);
+      return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity.' };
+    }
+    if (interpreted?.action === 'search_keyword' && interpreted.value) {
+      const kw = String(interpreted.value).toLowerCase();
+      const gptMatches = yarnNames.filter((y) => y.toLowerCase().includes(kw));
+      if (gptMatches.length === 1) {
+        ctxCopy.collectingYarnName = gptMatches[0];
+        ctxCopy.collectingStep = 'quantity';
+        return { html: generateHTMLResponse('Quantity', `How much yarn do you need for <strong>${gptMatches[0]}</strong>?`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity.' };
+      }
+      if (gptMatches.length > 1) {
+        ctxCopy.yarnDisambiguationList = gptMatches;
+        const listHtml = gptMatches.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+        return { html: generateHTMLResponse('Yarns matching your search', `Here are yarns with "<strong>${interpreted.value}</strong>". Reply with the <strong>number</strong> (1–${gptMatches.length}):<p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Multiple yarns match; choose by number.' };
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  return { html: generateHTMLResponse('Choose yarn', `Reply with a <strong>number</strong> (1–${yarnNames.length}), <strong>yarn name</strong> or keywords (e.g. black nylon, light blue), or <strong>load more</strong> / <strong>done</strong>.`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Pick a yarn or say done.' };
+};
+
 /**
  * Create yarn purchase order (place new order) from agent params
  * When params are empty, returns orderWizardData (suppliers + yarn catalog) for frontend wizard.
@@ -7318,10 +7870,261 @@ export const getYarnPurchaseOrderById = async (params = {}) => {
  * @param {Object} params
  * @returns {Promise<string|{html: string, orderWizardData: Object}>} HTML or wizard payload
  */
+
+/**
+ * Use GPT to parse a free-text "buy yarn" message into structured supplier + line items.
+ * Handles variations like "from allen solley 20s-Light Green-... and 20s-Beige-... 65 and 85 pieces for 60 and 75 per piece with 12% gst".
+ * @param {string} userMessage - Full user message (e.g. everything after "buy yarn from " or the whole sentence)
+ * @returns {Promise<{ supplierQuery: string, poItems: Array<{yarnName, quantity, rate, gstRate}> } | null>}
+ */
+const parseYarnOrderWithGPT = async (userMessage) => {
+  const text = String(userMessage || '').trim();
+  if (text.length < 20) return null;
+  try {
+    const response = await openai.chat.completions.create({
+      model: config.openai?.model || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a parser for yarn purchase orders. Extract the supplier name and line items from the user's message.
+
+Rules:
+- supplierQuery: only the supplier/brand name (e.g. "allen solley", "Allen Solly", "wampum private limited"). No yarn names, numbers, or "pieces"/"gst"/"for" in it.
+- poItems: array of objects. Each object has: yarnName (full yarn product name as given, e.g. "20s-Light Green-LT. GREEN-Bamboo/Bamboo"), quantity (number of pieces), rate (price per piece, number), gstRate (GST % as number, e.g. 12 for 12%; use same for all items if only one GST mentioned).
+- If the user says "65 and 85 pieces for 60 and 75 per piece with 12% gst" for two yarns, then first yarn has quantity 65 rate 60 gstRate 12, second has quantity 85 rate 75 gstRate 12.
+- Preserve exact yarn names including slashes, hyphens, and case (e.g. "20s-Light Green-LT. GREEN-Bamboo/Bamboo").
+- Reply with ONLY a JSON object, no markdown or extra text: { "supplierQuery": "...", "poItems": [ { "yarnName": "...", "quantity": N, "rate": N, "gstRate": N }, ... ] }`
+        },
+        {
+          role: 'user',
+          content: `Parse this yarn order message into supplier and line items:\n\n${text}`
+        }
+      ],
+      temperature: 0.1,
+      max_tokens: 800
+    });
+    const content = response.choices[0]?.message?.content?.trim();
+    if (!content) return null;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const supplierQuery = (parsed.supplierQuery || '').trim();
+    const poItems = Array.isArray(parsed.poItems) ? parsed.poItems : [];
+    if (!supplierQuery || poItems.length === 0) return null;
+    const normalized = poItems.map((it) => ({
+      yarnName: (it.yarnName || it.yarn_name || it.name || '').trim(),
+      quantity: Number(it.quantity) || 0,
+      rate: Number(it.rate) || 0,
+      gstRate: Number(it.gstRate) ?? Number(parsed.defaultGst) ?? 0
+    })).filter((it) => it.yarnName && (it.quantity > 0 || it.rate > 0));
+    if (normalized.length === 0) return null;
+    return { supplierQuery, poItems: normalized };
+  } catch (err) {
+    console.warn('parseYarnOrderWithGPT failed:', err?.message);
+    return null;
+  }
+};
+
+/**
+ * Use GPT to interpret any yarn-purchase-related message with context. Returns structured params for createYarnPurchaseOrder or "show_lists".
+ * Makes the chat free-flow: handles "get me yarn from allen solley in blue", "i need 20s black from wampum 50 pieces at 60", etc.
+ * @param {string} userMessage - Full user message
+ * @param {Object} context - Optional: { inPlaceOrderFlow, supplierName, yarnNames[], collectedItems[] }
+ * @returns {Promise<{ intent: string, supplierQuery?: string, yarnHint?: string, poItems?: Array, rawMessage?: string } | null>}
+ */
+export const interpretYarnPurchaseMessage = async (userMessage, context = {}) => {
+  const text = String(userMessage || '').trim();
+  if (text.length < 3) return null;
+  try {
+    const ctxStr = context.yarnNames?.length
+      ? `Current supplier: ${context.supplierName || 'none'}. Available yarn names (sample): ${(context.yarnNames || []).slice(0, 15).join(', ')}.`
+      : '';
+    const response = await openai.chat.completions.create({
+      model: config.openai?.model || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a yarn purchase intent parser. Extract structured data from the user's message for a yarn ordering system.
+
+Return ONLY a JSON object, no markdown or explanation.
+
+Possible intents:
+- "create_order": user wants to place an order. Extract supplierQuery (supplier/brand name only, e.g. "allen solley", "wampum"), and if they specified yarns with quantities/rates/gst then poItems array. Each poItem: { yarnName, quantity, rate, gstRate }. Preserve exact yarn names (e.g. "20s-Light Green-LT. GREEN-Bamboo/Bamboo"). If they only said a colour (e.g. "blue yarn from X") set yarnHint to that colour and leave poItems empty.
+- "show_lists": user wants to buy yarn but didn't name supplier or colour (e.g. "i want to buy yarn", "get some yarn"). Return intent "show_lists", no supplierQuery.
+- "choose_supplier": same as create_order but only supplier name given (e.g. "from allen solley").
+
+Rules:
+- supplierQuery: ONLY the supplier or brand name, no yarn names, no numbers, no "pieces"/"gst"/"for". Normalize spelling (e.g. "allen solley" not "Allen Solley").
+- yarnHint: colour or keyword when user says "in blue", "something black", "blue yarn" etc.
+- poItems: only when user gave specific yarn names with quantities and/or rates. Preserve full yarn names. Map "65 and 85 pieces for 60 and 75 per piece with 12% gst" to two items with quantity 65 rate 60 gstRate 12 and quantity 85 rate 75 gstRate 12.
+- If message is not about buying/ordering yarn, return { "intent": "none" }.
+
+Format: { "intent": "...", "supplierQuery": "" or string, "yarnHint": "" or string, "poItems": [] or array of { yarnName, quantity, rate, gstRate } }`
+        },
+        {
+          role: 'user',
+          content: `${ctxStr ? `Context: ${ctxStr}\n\n` : ''}User message: ${text}`
+        }
+      ],
+      temperature: 0.1,
+      max_tokens: 600
+    });
+    const content = response.choices[0]?.message?.content?.trim();
+    if (!content) return null;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (parsed.intent === 'none' || !parsed.intent) return null;
+    const result = {
+      intent: parsed.intent || 'create_order',
+      supplierQuery: (parsed.supplierQuery || '').trim() || undefined,
+      yarnHint: (parsed.yarnHint || '').trim() || undefined,
+      poItems: Array.isArray(parsed.poItems) ? parsed.poItems.map((it) => ({
+        yarnName: (it.yarnName || it.yarn_name || it.name || '').trim(),
+        quantity: Number(it.quantity) || 0,
+        rate: Number(it.rate) || 0,
+        gstRate: Number(it.gstRate) ?? 0
+      })).filter((it) => it.yarnName) : undefined
+    };
+    if (result.intent === 'show_lists') return result;
+    if (result.intent === 'create_order' && !result.supplierQuery && !result.poItems?.length) return null;
+    return result;
+  } catch (err) {
+    console.warn('interpretYarnPurchaseMessage failed:', err?.message);
+    return null;
+  }
+};
+
+/**
+ * Use GPT to interpret a user reply inside the place-order chat (choose yarn / quantity / rate step) with context.
+ * E.g. "the blue one", "second one", "add 50 more", "same as before but 100 pieces" -> search keyword or list index or quantity.
+ * @param {string} userMessage - User's reply
+ * @param {Object} context - { yarnNames[], supplierName, collectedItems[], collectingStep?, collectingYarnName? }
+ * @returns {Promise<{ action: 'search_keyword'|'list_index'|'quantity'|'rate'|'none', value: string|number } | null>}
+ */
+const interpretPlaceOrderChatMessage = async (userMessage, context = {}) => {
+  const text = String(userMessage || '').trim();
+  if (text.length < 2) return null;
+  try {
+    const yarnList = (context.yarnNames || []).slice(0, 20).join('\n');
+    const lastItem = context.collectedItems?.length ? context.collectedItems[context.collectedItems.length - 1] : null;
+    const response = await openai.chat.completions.create({
+      model: config.openai?.model || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are interpreting a user message during a yarn order flow. The user is choosing yarns, entering quantity, or rate.
+
+Current context: Supplier: ${context.supplierName || 'unknown'}. User is ${context.collectingStep === 'quantity' ? 'entering quantity for: ' + (context.collectingYarnName || '') : context.collectingStep === 'rate' ? 'entering rate for: ' + (context.collectingYarnName || '') : context.collectingStep === 'disambiguation' ? 'picking one option by number from the list below (reply with list_index 1-based)' : 'choosing a yarn from the list'}.
+${lastItem ? `Last added item: ${lastItem.yarnName} qty ${lastItem.quantity} rate ${lastItem.rate}.` : ''}
+
+Yarn list (numbered 1 to N):
+${yarnList || 'No list'}
+
+Return ONLY a JSON object:
+- If user is clearly selecting by position/number: { "action": "list_index", "value": <number 1-based> }. Examples: "the second one" -> 2, "number 3" -> 3, "i want 3" -> 3, "3 onw" or "3 one" (typo) -> 3, "the third one" -> 3, "option 2" -> 2.
+- If user is asking for a colour/keyword to search: { "action": "search_keyword", "value": "<keyword>" } e.g. "something blue" -> "blue", "do you have black" -> "black".
+- If user is giving a quantity (number of pieces): { "action": "quantity", "value": <number> }.
+- If user is giving a rate/price: { "action": "rate", "value": <number> }.
+- If unclear or not applicable: { "action": "none" }.`
+        },
+        { role: 'user', content: text }
+      ],
+      temperature: 0.1,
+      max_tokens: 80
+    });
+    const content = response.choices[0]?.message?.content?.trim();
+    if (!content) return null;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!parsed.action || parsed.action === 'none') return null;
+    const value = parsed.value;
+    if (parsed.action === 'list_index') return { action: 'list_index', value: typeof value === 'number' ? value : parseInt(String(value), 10) };
+    if (parsed.action === 'search_keyword') return { action: 'search_keyword', value: String(value || '').trim() };
+    if (parsed.action === 'quantity') return { action: 'quantity', value: typeof value === 'number' ? value : parseFloat(String(value)) };
+    if (parsed.action === 'rate') return { action: 'rate', value: typeof value === 'number' ? value : parseFloat(String(value)) };
+    return null;
+  } catch (err) {
+    console.warn('interpretPlaceOrderChatMessage failed:', err?.message);
+    return null;
+  }
+};
+
+/**
+ * Parse "supplier yarn1 and yarn2 and yarn3 ... qty1 and qty2 and qty3 pieces for rate1 and rate2 and rate3 with 12% gst" (or "with 12% and 18% gst" for per-item GST).
+ * Supports 2 or more items with different pieces, rates, and optional per-item GST.
+ * @returns {{ supplierQuery: string, poItems: Array<{yarnName, quantity, rate, gstRate}> } | null}
+ */
+const parseSupplierAndOrderFromPhrase = (fullQuery) => {
+  const s = String(fullQuery).trim();
+  if (s.length < 30 || !/\bpieces?\b/i.test(s) || (!/\bgst\b/i.test(s) && !/for\s+\d/i.test(s))) return null;
+  // Supplier name ends before yarn pattern: "20s-", "30/2-", "40s ", etc. (no trailing space required after -/.)
+  const supplierEnd = s.match(/\s+(\d{1,4}s?[-\.\/]|\d{1,4}\/\d{1,4})[-\.\s\/]/i);
+  if (!supplierEnd) return null;
+  const supplierQuery = s.slice(0, supplierEnd.index).trim();
+  if (supplierQuery.length < 2) return null;
+  let orderPart = s.slice(supplierEnd.index).trim();
+  // Strip "with 12% gst" or "with 12% and 18% and 5% gst" (one or more GST values) from end
+  const withGstMatch = orderPart.match(/\s+with\s+([\d.\s%+and]+)\s*gst\s*$/i);
+  let gstRates = [];
+  if (withGstMatch) {
+    const gstStr = withGstMatch[1];
+    gstRates = gstStr.split(/\s+and\s+/).map((x) => parseFloat(x.replace(/%/g, '').trim())).filter((n) => !Number.isNaN(n) && n >= 0);
+    orderPart = orderPart.replace(/\s+with\s+[\d.\s%+and]+\s*gst\s*$/i, '').trim();
+  }
+  const defaultGst = gstRates.length > 0 ? gstRates[0] : 0;
+  // Strip "for 60 and 75" or "for 60 and 75 per piece" or "for 60 and 75 each" (one or more rates) from end
+  const forRatesMatch = orderPart.match(/\s+for\s+([\d.\s+and]+)(?:\s+per\s+piece|\s+each)?\s*$/i);
+  let rates = [];
+  if (forRatesMatch) {
+    rates = forRatesMatch[1].split(/\s+and\s+/).map((x) => parseFloat(x.trim())).filter((n) => !Number.isNaN(n));
+    orderPart = orderPart.replace(/\s+for\s+[\d.\s+and]+(?:\s+per\s+piece|\s+each)?\s*$/i, '').trim();
+  }
+  // Strip "65 and 85 and 100 pieces" (one or more quantities) from end
+  const piecesMatch = orderPart.match(/\s+([\d\s+and]+)\s+pieces?\s*$/i);
+  let quantities = [];
+  if (piecesMatch) {
+    quantities = piecesMatch[1].split(/\s+and\s+/).map((x) => parseInt(x.trim(), 10)).filter((n) => !Number.isNaN(n) && n > 0);
+    orderPart = orderPart.replace(/\s+[\d\s+and]+\s+pieces?\s*$/i, '').trim();
+  }
+  // Remainder = "20s-Light Green-... and 20s-Beige-... and 20s-..." — split by " and " (before a yarn pattern)
+  const yarnNames = orderPart.split(/\s+and\s+(?=\d{1,4}s?[-\.\/]|\d{1,4}\/\d)/i).map((x) => x.trim()).filter(Boolean);
+  if (yarnNames.length === 0) return null;
+  const n = Math.max(yarnNames.length, quantities.length, rates.length, 1);
+  const poItems = [];
+  for (let i = 0; i < n; i++) {
+    poItems.push({
+      yarnName: yarnNames[Math.min(i, yarnNames.length - 1)],
+      quantity: quantities[i] ?? quantities[quantities.length - 1] ?? 0,
+      rate: rates[i] ?? rates[rates.length - 1] ?? 0,
+      gstRate: gstRates[i] ?? gstRates[gstRates.length - 1] ?? defaultGst
+    });
+  }
+  return { supplierQuery, poItems };
+};
+
 export const createYarnPurchaseOrder = async (params = {}) => {
   try {
-    const safeParams = params ?? {};
-    const { poNumber, supplierName, supplier: supplierId, poItems: rawItems, notes, showSupplierList, supplierQuery, preSelectedSupplierId } = safeParams;
+    let safeParams = params ?? {};
+    let { poNumber, supplierName, supplier: supplierId, poItems: rawItems, notes, showSupplierList, supplierQuery, preSelectedSupplierId, supplierNumber, yarnHint } = safeParams;
+    // If supplierQuery contains full order in one line, let GPT parse first (then regex fallback) into supplier + poItems
+    if (supplierQuery && typeof supplierQuery === 'string' && supplierQuery.trim().length > 50) {
+      const raw = supplierQuery.trim();
+      const looksLikeOrder = /\bpieces?\b/i.test(raw) || /\bgst\b/i.test(raw) || /for\s+\d/i.test(raw);
+      let parsed = null;
+      if (looksLikeOrder) {
+        parsed = await parseYarnOrderWithGPT(raw);
+      }
+      if (!parsed || parsed.poItems.length === 0) {
+        parsed = parseSupplierAndOrderFromPhrase(raw);
+      }
+      if (parsed && parsed.poItems.length > 0) {
+        supplierQuery = parsed.supplierQuery;
+        rawItems = parsed.poItems;
+        safeParams = { ...safeParams, supplierQuery, poItems: rawItems };
+      }
+    }
     const hasOrderDetails = poNumber && (supplierName || supplierId) && Array.isArray(rawItems) && rawItems.length > 0;
 
     if (!hasOrderDetails) {
@@ -7333,6 +8136,35 @@ export const createYarnPurchaseOrder = async (params = {}) => {
       );
       if (supplierQuery && typeof supplierQuery === 'string' && supplierQuery.trim() && yarnOnlyItems.length > 0) {
         let query = supplierQuery.trim();
+        const num = supplierNumber != null ? Number(supplierNumber) : (/^\d+$/.test(query) ? parseInt(query, 10) : null);
+        if (num != null && !Number.isNaN(num) && num >= 1) {
+          const allRes = await supplierService.querySuppliers({}, { limit: 50, page: 1 });
+          const allList = allRes?.results ?? allRes ?? [];
+          const one = allList[num - 1];
+          if (one) {
+            const id = one._id?.toString?.() || one.id;
+            const brandName = one.brandName || one.name || 'Unknown';
+            const supplier = await supplierService.getSupplierById(id);
+            let yarnNames = supplier?.yarnDetails?.length
+              ? [...new Set((supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+              : [];
+            // Only show yarns this supplier actually has — do not enrich from catalog
+            const pageSize = 5;
+            const page = 1;
+            const slice = yarnNames.slice(0, pageSize);
+            const hasMore = yarnNames.length > pageSize;
+            const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+            const html = generateHTMLResponse(
+              'Choose yarn',
+              `<p>You chose <strong>${brandName}</strong>. Here are yarn items (top ${slice.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+            );
+            return {
+              html,
+              orderWizardPrompt: 'choose_yarn_from_supplier',
+              placeOrderContext: { supplierId: id, supplierName: brandName, yarnNames, page }
+            };
+          }
+        }
         // Strip order-detail phrases so "wumpum private limited, 50 pieces at 500 each, gst 12%" or "wumpum private limited i want 50 pieces..." -> "wumpum private limited"
         query = query.replace(/\s*,\s*(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
         query = query.replace(/\s+(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
@@ -7361,6 +8193,8 @@ export const createYarnPurchaseOrder = async (params = {}) => {
         const supplierBrandName = one.brandName || one.name || 'Unknown';
         const catalogYarns = [];
         const resolvedOnePerItem = [];
+        let fallbackToColourHint = false;
+        let colourHintForFallback = '';
         for (const it of yarnOnlyItems) {
           const yarnName = (it.yarnName || it.yarn_name || it.name || '').trim();
           const sizeCount = (it.sizeCount || '').trim() || undefined;
@@ -7373,7 +8207,10 @@ export const createYarnPurchaseOrder = async (params = {}) => {
             );
           }
           if (results.length === 0) {
-            return generateHTMLResponse('Yarn not found', `Yarn "${yarnName}"${sizeCount ? ` (size/count ${sizeCount})` : ''} not found in catalog. Please check the name or size and count.`);
+            // Yarn not in catalog: treat as colour hint — show supplier's top 5 + 3 options (change supplier, another colour, choose from table)
+            fallbackToColourHint = true;
+            colourHintForFallback = yarnName.replace(/\s+yarn\s*$/i, '').trim() || yarnName;
+            break;
           }
           const pickOne = (y) => {
             const countSizes = [];
@@ -7415,48 +8252,66 @@ export const createYarnPurchaseOrder = async (params = {}) => {
             resolvedOnePerItem.push(null);
           }
         }
+        // When yarn was not found in catalog, show supplier's top 5 + 3 options (change supplier, another colour, choose from table)
+        if (fallbackToColourHint && colourHintForFallback) {
+          const supplier = await supplierService.getSupplierById(supplierId);
+          let yarnNames = supplier?.yarnDetails?.length
+            ? [...new Set((supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+            : [];
+          const h = colourHintForFallback.toLowerCase();
+          const matching = yarnNames.filter((y) => y.toLowerCase().includes(h));
+          let displayYarnNames = yarnNames;
+          let noColourMatchMessage = '';
+          if (matching.length > 0) {
+            displayYarnNames = matching;
+          } else {
+            noColourMatchMessage = `This supplier has nothing in <strong>${colourHintForFallback}</strong>. You can: <strong>change supplier</strong>, <strong>look for another colour</strong>, or <strong>choose from the table below</strong>.`;
+          }
+          const pageSize = 5;
+          const slice = displayYarnNames.slice(0, pageSize);
+          const hasMore = displayYarnNames.length > pageSize;
+          const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+          const intro = noColourMatchMessage
+            ? `<p>${noColourMatchMessage}</p><p>Here are yarn items from <strong>${supplierBrandName}</strong> (top ${slice.length}):</p>`
+            : `Here are yarn items from <strong>${supplierBrandName}</strong> with "<strong>${colourHintForFallback}</strong>" in the name:`;
+          const html = generateHTMLResponse(
+            'Choose yarn',
+            `<p>${intro}</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+          );
+          return {
+            html,
+            orderWizardPrompt: 'choose_yarn_from_supplier',
+            placeOrderContext: { supplierId, supplierName: supplierBrandName, yarnNames: displayYarnNames, page: 1 }
+          };
+        }
         const canDirectOrder = allItemsHaveQtyAndRate && resolvedOnePerItem.every((e) => e != null) && resolvedOnePerItem.length === yarnOnlyItems.length;
         if (canDirectOrder) {
-          const nextPoNumber = await yarnPurchaseOrderService.getNextSuggestedPoNumber();
-          const poItems = [];
-          let subTotal = 0;
-          let gstTotal = 0;
+          // Build collectedItems for order summary and confirmation (do not place yet — ask permission)
+          const collectedItems = [];
           for (let i = 0; i < yarnOnlyItems.length; i++) {
             const it = yarnOnlyItems[i];
             const y = resolvedOnePerItem[i];
-            const quantity = Number(it.quantity) || 0;
-            const rate = Number(it.rate) || 0;
-            const gstRate = Number(it.gstRate) || 0;
-            const lineTotal = rate * quantity;
-            const lineGst = (lineTotal * gstRate) / 100;
-            subTotal += lineTotal;
-            gstTotal += lineGst;
-            poItems.push({
-              yarn: y.id,
+            collectedItems.push({
               yarnName: y.yarnName,
-              sizeCount: (it.sizeCount || '-').trim() || '-',
-              shadeCode: (it.shadeCode || '').trim() || undefined,
-              rate,
-              quantity,
-              gstRate: gstRate || undefined,
-              estimatedDeliveryDate: it.estimatedDeliveryDate ? new Date(it.estimatedDeliveryDate) : undefined,
+              quantity: Number(it.quantity) || 0,
+              rate: Number(it.rate) || 0,
+              gstRate: Number(it.gstRate) || 0,
+              sizeCount: (it.sizeCount || '').trim() || undefined,
+              shadeCode: (it.shadeCode || '').trim() || undefined
             });
           }
-          const total = subTotal + gstTotal;
-          const body = {
-            poNumber: nextPoNumber,
+          const placeOrderContext = {
+            supplierId,
             supplierName: supplierBrandName,
-            supplier: supplierId,
-            poItems,
-            notes: notes || undefined,
-            subTotal,
-            gst: gstTotal,
-            total,
-            currentStatus: 'submitted_to_supplier',
+            collectedItems
           };
-          const created = await yarnPurchaseOrderService.createPurchaseOrder(body);
-          const msg = `Purchase order <strong>${created.poNumber}</strong> created successfully — ${poItems.length} item(s), total ₹${total.toLocaleString()}.`;
-          return generateHTMLResponse('Order Placed', msg);
+          const html = buildPlaceOrderSummaryHtml(placeOrderContext);
+          return {
+            html,
+            needsPlaceOrderConfirmation: true,
+            placeOrderContext,
+            summary: 'Review your order. Type yes to place or no to cancel.'
+          };
         }
         const [suppliersResultAll, nextPoNumber] = await Promise.all([
           supplierService.querySuppliers({}, { limit: 200, page: 1 }),
@@ -7487,6 +8342,51 @@ export const createYarnPurchaseOrder = async (params = {}) => {
       // User mentioned a supplier name only: look up with fuzzy/partial match so "wampum limited 2" finds "WAMPUM SYNTEX PRIVATE LIMITED 2"
       if (supplierQuery && typeof supplierQuery === 'string' && supplierQuery.trim()) {
         let query = supplierQuery.trim();
+        const num = supplierNumber != null ? Number(supplierNumber) : (/^\d+$/.test(query) ? parseInt(query, 10) : null);
+        if (num != null && !Number.isNaN(num) && num >= 1) {
+          const allRes = await supplierService.querySuppliers({}, { limit: 50, page: 1 });
+          const allList = allRes?.results ?? allRes ?? [];
+          const one = allList[num - 1];
+          if (one) {
+            const id = one._id?.toString?.() || one.id;
+            const brandName = one.brandName || one.name || 'Unknown';
+            const supplier = await supplierService.getSupplierById(id);
+            let yarnNames = supplier?.yarnDetails?.length
+              ? [...new Set((supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+              : [];
+            let displayYarnNames = yarnNames;
+            let filterLabel = '';
+            let noColourMatchMessage = '';
+            if (yarnHint && String(yarnHint).trim()) {
+              const h = String(yarnHint).trim().toLowerCase();
+              const matching = yarnNames.filter((y) => y.toLowerCase().includes(h));
+              if (matching.length > 0) {
+                displayYarnNames = matching;
+                filterLabel = ` with "<strong>${yarnHint}</strong>" in the name`;
+              } else {
+                noColourMatchMessage = `This supplier has nothing in <strong>${yarnHint}</strong>. You can: <strong>change supplier</strong>, <strong>look for another colour</strong>, or <strong>choose from the table below</strong>.`;
+              }
+            }
+            const pageSize = 5;
+            const slice = displayYarnNames.slice(0, pageSize);
+            const hasMore = displayYarnNames.length > pageSize;
+            const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+            const intro = noColourMatchMessage
+              ? `<p>${noColourMatchMessage}</p><p>Here are yarn items from <strong>${brandName}</strong> (top ${slice.length}):</p>`
+              : filterLabel
+                ? `Here are yarn items from <strong>${brandName}</strong>${filterLabel}:`
+                : `You chose <strong>${brandName}</strong>. Here are yarn items (top ${slice.length}):`;
+            const html = generateHTMLResponse(
+              'Choose yarn',
+              `<p>${intro}</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+            );
+            return {
+              html,
+              orderWizardPrompt: 'choose_yarn_from_supplier',
+              placeOrderContext: { supplierId: id, supplierName: brandName, yarnNames: displayYarnNames, page: 1 }
+            };
+          }
+        }
         // Strip order-detail phrases so supplier name is clean for lookup (including ", 50 pieces at 500 each, gst 12%")
         query = query.replace(/\s*,\s*(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
         query = query.replace(/\s+(?:and\s+)?gst\s+(?:is\s+)?\d+(?:\.\d+)?\s*%?/gi, '').trim();
@@ -7511,11 +8411,40 @@ export const createYarnPurchaseOrder = async (params = {}) => {
           if (nearest) {
             const { best, score } = nearest;
             if (score <= 2) {
-              const html = `<p>Got it — you want to order from <strong>${best.brandName}</strong>. What would you like to buy?</p><p>You can tell me the yarn name(s) and quantity, or click below to see the list of yarns from ${best.brandName}.</p>`;
+              const supplier = await supplierService.getSupplierById(best.id);
+              let yarnNames = supplier?.yarnDetails?.length
+                ? [...new Set((supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+                : [];
+              let displayYarnNames = yarnNames;
+              let filterLabel = '';
+              let noColourMatchMessage = '';
+              if (yarnHint && String(yarnHint).trim()) {
+                const h = String(yarnHint).trim().toLowerCase();
+                const matching = yarnNames.filter((y) => y.toLowerCase().includes(h));
+                if (matching.length > 0) {
+                  displayYarnNames = matching;
+                  filterLabel = ` with "<strong>${yarnHint}</strong>" in the name`;
+                } else {
+                  noColourMatchMessage = `This supplier has nothing in <strong>${yarnHint}</strong>. You can: <strong>change supplier</strong>, <strong>look for another colour</strong>, or <strong>choose from the table below</strong>.`;
+                }
+              }
+              const pageSize = 5;
+              const slice = displayYarnNames.slice(0, pageSize);
+              const hasMore = displayYarnNames.length > pageSize;
+              const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+              const intro = noColourMatchMessage
+                ? `<p>${noColourMatchMessage}</p><p>Here are yarn items from <strong>${best.brandName}</strong> (top ${slice.length}):</p>`
+                : filterLabel
+                  ? `Here are yarn items from <strong>${best.brandName}</strong>${filterLabel}:`
+                  : `You chose <strong>${best.brandName}</strong>. Here are yarn items (top ${slice.length}):`;
+              const html = generateHTMLResponse(
+                'Choose yarn',
+                `<p>${intro}</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+              );
               return {
                 html,
-                orderWizardPrompt: 'choose_yarn_for_supplier',
-                preSelectedSupplier: { id: best.id, brandName: best.brandName }
+                orderWizardPrompt: 'choose_yarn_from_supplier',
+                placeOrderContext: { supplierId: best.id, supplierName: best.brandName, yarnNames: displayYarnNames, page: 1 }
               };
             }
             const matchingSuppliers = [{ id: best.id, brandName: best.brandName }];
@@ -7532,11 +8461,40 @@ export const createYarnPurchaseOrder = async (params = {}) => {
           const one = matches[0];
           const id = one._id?.toString?.() || one.id;
           const brandName = one.brandName || one.name || 'Unknown';
-          const html = `<p>Got it — you want to order from <strong>${brandName}</strong>. What would you like to buy?</p><p>You can tell me the yarn name(s) and quantity, or click below to see the list of yarns from ${brandName}.</p>`;
+          const supplier = await supplierService.getSupplierById(id);
+          let yarnNames = supplier?.yarnDetails?.length
+            ? [...new Set((supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+            : [];
+          let displayYarnNames = yarnNames;
+          let filterLabel = '';
+          let noColourMatchMessage = '';
+          if (yarnHint && String(yarnHint).trim()) {
+            const h = String(yarnHint).trim().toLowerCase();
+            const matching = yarnNames.filter((y) => y.toLowerCase().includes(h));
+            if (matching.length > 0) {
+              displayYarnNames = matching;
+              filterLabel = ` with "<strong>${yarnHint}</strong>" in the name`;
+            } else {
+              noColourMatchMessage = `This supplier has nothing in <strong>${yarnHint}</strong>. You can: <strong>change supplier</strong>, <strong>look for another colour</strong>, or <strong>choose from the table below</strong>.`;
+            }
+          }
+          const pageSize = 5;
+          const slice = displayYarnNames.slice(0, pageSize);
+          const hasMore = displayYarnNames.length > pageSize;
+          const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+          const intro = noColourMatchMessage
+            ? `<p>${noColourMatchMessage}</p><p>Here are yarn items from <strong>${brandName}</strong> (top ${slice.length}):</p>`
+            : filterLabel
+              ? `Here are yarn items from <strong>${brandName}</strong>${filterLabel}:`
+              : `You chose <strong>${brandName}</strong>. Here are yarn items (top ${slice.length}):`;
+          const html = generateHTMLResponse(
+            'Choose yarn',
+            `<p>${intro}</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+          );
           return {
             html,
-            orderWizardPrompt: 'choose_yarn_for_supplier',
-            preSelectedSupplier: { id, brandName }
+            orderWizardPrompt: 'choose_yarn_from_supplier',
+            placeOrderContext: { supplierId: id, supplierName: brandName, yarnNames: displayYarnNames, page: 1 }
           };
         }
         // Multiple suppliers matching (e.g. "Wampum")
@@ -7672,8 +8630,52 @@ export const createYarnPurchaseOrder = async (params = {}) => {
         };
       }
 
-      // No supplier mentioned: ask user to either give supplier name or show supplier list
-      const chooseSupplierHtml = '<p>To place a yarn purchase order, I need the supplier. You can either:</p><ul><li><strong>Tell me your supplier name</strong> (e.g. type "ABC Yarns" in the chat)</li><li><strong>Show the supplier list</strong> to choose from (click the button below)</li></ul>';
+      // No supplier mentioned: fetch suppliers and colours, show both lists and which supplier has which colour
+      const [suppliersForListRes, colorsRes] = await Promise.all([
+        supplierService.querySuppliers({}, { limit: 50 }),
+        colorService.queryColors({}, { limit: 30, page: 1 })
+      ]);
+      const list = (suppliersForListRes?.results ?? suppliersForListRes ?? []);
+      const colorList = (colorsRes?.results ?? colorsRes ?? []);
+      const numberedList = list
+        .map((s, i) => {
+          const name = s.brandName || s.supplierName || s.name || 'N/A';
+          return `${i + 1}. ${name}`;
+        })
+        .join('<br/>');
+      const colourNames = [...new Set(colorList.map((c) => (c.name || c.pantoneName || '').trim()).filter(Boolean))].slice(0, 25);
+      const colourListHtml = colourNames.length > 0
+        ? colourNames.join(', ')
+        : '—';
+      // Build "which supplier has which colour" from each supplier's yarnDetails (embedded on paginated result)
+      const supplierColoursList = [];
+      for (let i = 0; i < list.length; i++) {
+        const s = list[i];
+        const supplierName = s.brandName || s.supplierName || s.name || 'N/A';
+        const yarnDetails = s.yarnDetails || [];
+        const yarnNamesForSupplier = yarnDetails.map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean);
+        const hasColours = [];
+        for (const col of colourNames) {
+          const colLower = col.toLowerCase();
+          if (yarnNamesForSupplier.some((yn) => yn.toLowerCase().includes(colLower))) hasColours.push(col);
+        }
+        if (hasColours.length > 0) {
+          supplierColoursList.push(`${i + 1}. <strong>${supplierName}</strong> — ${hasColours.slice(0, 15).join(', ')}${hasColours.length > 15 ? ` (+${hasColours.length - 15} more)` : ''}`);
+        }
+      }
+      const whichSupplierWhichColourHtml = supplierColoursList.length > 0
+        ? `<p><strong>Which supplier has which colour</strong> (in yarn name):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.5;">${supplierColoursList.join('<br/>')}</p>`
+        : '';
+      let chooseSupplierHtml = '';
+      if (list.length > 0) {
+        chooseSupplierHtml = `<p>To place a yarn purchase order, choose a <strong>supplier</strong> and optionally a <strong>colour</strong>.</p>
+<p><strong>Suppliers</strong> — reply with the number or name:</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${numberedList}</p>
+${whichSupplierWhichColourHtml}
+<p><strong>Colours you can search for</strong> (e.g. in yarn name):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em;">${colourListHtml}</p>
+<p class="summary" style="margin-top: 0.6em;">Or type your supplier name, or e.g. <strong>buy yarn from [supplier] in [colour]</strong>.</p>`;
+      } else {
+        chooseSupplierHtml = '<p>To place a yarn purchase order, I need the supplier. No suppliers found in the system — add suppliers in Yarn Management first.</p>';
+      }
       return {
         html: chooseSupplierHtml,
         orderWizardPrompt: 'choose_supplier'
@@ -7796,9 +8798,10 @@ const buildOrderDetailsHtml = (order) => {
  * @returns {Promise<{ html: string, editOrderContext?: { purchaseOrderId: string, poNumber: string } }>}
  */
 export const editYarnPurchaseOrder = async (params = {}) => {
-  const idOrPo = params.purchaseOrderId || params.poNumber || params.orderId;
+  const p = params && typeof params === 'object' ? params : {};
+  const idOrPo = p.purchaseOrderId || p.poNumber || p.orderId;
   if (!idOrPo) {
-    return generateHTMLResponse('Edit Order', 'Please specify which order to edit (e.g. "edit order PO-2026-966").');
+    return generateHTMLResponse('Edit Order', 'Please specify which order to edit (e.g. "edit order PO-2026-966" or "update order PO-2026-968").');
   }
   const purchaseOrderId = await resolvePurchaseOrderId(idOrPo);
   if (!purchaseOrderId) {
@@ -7825,6 +8828,76 @@ export const editYarnPurchaseOrder = async (params = {}) => {
   };
 };
 
+/** Status options for "choose status" flow (number + code + label) */
+const STATUS_OPTIONS = [
+  { code: 'submitted_to_supplier', label: 'Submitted to supplier' },
+  { code: 'in_transit', label: 'In transit' },
+  { code: 'goods_received', label: 'Goods received' },
+  { code: 'goods_partially_received', label: 'Goods partially received' },
+  { code: 'qc_pending', label: 'QC pending' },
+  { code: 'po_rejected', label: 'PO rejected' },
+  { code: 'po_accepted', label: 'PO accepted' },
+  { code: 'po_accepted_partially', label: 'PO accepted partially' },
+];
+
+/** Get status option by 1-based number (1–8) for follow-up flow */
+export const getStatusOptionByNumber = (num) => {
+  const n = parseInt(String(num).trim(), 10);
+  if (Number.isNaN(n) || n < 1 || n > STATUS_OPTIONS.length) return null;
+  return STATUS_OPTIONS[n - 1] || null;
+};
+
+/** Get status option by 1-based number from list that excludes current order status (so user can't "change" to same status) */
+export const getStatusOptionByNumberExcluding = (num, excludeStatusCode) => {
+  const n = parseInt(String(num).trim(), 10);
+  const available = excludeStatusCode
+    ? STATUS_OPTIONS.filter((s) => s.code !== String(excludeStatusCode).trim())
+    : STATUS_OPTIONS;
+  if (Number.isNaN(n) || n < 1 || n > available.length) return null;
+  return available[n - 1] || null;
+};
+
+/** Reject LLM placeholder/schema text (e.g. "extracted ... or null") so we don't show confirmation with fake status */
+const isValidStatusForConfirmation = (value) => {
+  if (value == null || typeof value !== 'string') return false;
+  const s = value.trim();
+  if (s.length > 60) return false;
+  const placeholderPatterns = [/extracted/i, /\bor null\b/i, /\be\.g\.\s/i, /when updating/i];
+  if (placeholderPatterns.some((re) => re.test(s))) return false;
+  const code = s.replace(/\s+/g, '_').toLowerCase();
+  return STATUS_OPTIONS.some((opt) => opt.code === code || opt.label.toLowerCase() === s.toLowerCase());
+};
+
+/**
+ * Build response asking user to choose status by number. Excludes current order status so user can't "change" to same.
+ * @param {string} idOrPo - PO number or order ID
+ * @param {string} [currentStatusCode] - order's current status code (e.g. submitted_to_supplier); this option is omitted from the list
+ * @returns {Object} { html, needsStatusChoice: true, orderRef }
+ */
+const buildChooseStatusResponse = (idOrPo, currentStatusCode) => {
+  const orderRef = /^[a-f0-9]{24}$/i.test(String(idOrPo).trim()) ? { purchaseOrderId: idOrPo } : { poNumber: idOrPo };
+  const currentCode = currentStatusCode ? String(currentStatusCode).trim() : null;
+  const available = currentCode ? STATUS_OPTIONS.filter((s) => s.code !== currentCode) : STATUS_OPTIONS;
+  const currentLabel = currentCode ? (STATUS_OPTIONS.find((s) => s.code === currentCode)?.label || currentCode.replace(/_/g, ' ')) : null;
+  if (available.length === 0) {
+    const html = generateHTMLResponse('Update Status', `Order <strong>${idOrPo}</strong> is already the only status. Nothing to change.`);
+    return { html, needsStatusChoice: false, orderRef };
+  }
+  const listItems = available.map((s, i) => `${i + 1}. ${s.label} (<code>${s.code}</code>)`).join('<br/>');
+  const currentLine = currentLabel
+    ? `<p class="summary" style="margin: 0.4em 0;"><strong>Current status:</strong> ${currentLabel}. Choose a <strong>different</strong> status:</p>`
+    : '<p class="summary" style="margin: 0.4em 0;">Reply with the <strong>number</strong> of the new status:</p>';
+  const html = generateHTMLResponse(
+    'Choose status',
+    `<p>To which status do you want to update order <strong>${idOrPo}</strong>?</p>
+    ${currentLine}
+    <p class="summary" style="margin: 0.4em 0; padding-left: 1em;">${listItems}</p>
+    <p class="summary" style="margin-top: 0.8em;">After you choose, I'll ask you to confirm before updating.</p>`
+  );
+  const orderRefWithCurrent = { ...orderRef, ...(currentCode && { currentStatus: currentCode }) };
+  return { html, needsStatusChoice: true, orderRef: orderRefWithCurrent };
+};
+
 /**
  * Update yarn purchase order status (for agent)
  * @param {Object} params - { purchaseOrderId or poNumber, status_code }
@@ -7832,14 +8905,20 @@ export const editYarnPurchaseOrder = async (params = {}) => {
  */
 export const updateYarnPurchaseOrderStatus = async (params = {}) => {
   try {
-    const idOrPo = params.purchaseOrderId || params.poNumber || params.orderId;
-    const statusCode = params.status_code || params.status;
-    if (!idOrPo || !statusCode) {
-      return generateHTMLResponse('Update Status', 'Please specify order (ID or PO number) and new status (e.g. "mark PO-2024-001 as in transit").');
+    const p = params && typeof params === 'object' ? params : {};
+    const idOrPo = p.purchaseOrderId || p.poNumber || p.orderId;
+    const statusCode = p.status_code || p.status;
+    if (!idOrPo) {
+      return generateHTMLResponse('Update Status', 'Please specify which order (e.g. PO-2026-965). I\'ll then ask you to choose the new status from a list.');
     }
     const purchaseOrderId = await resolvePurchaseOrderId(idOrPo);
     if (!purchaseOrderId) {
       return generateHTMLResponse('Order Not Found', `No purchase order found for "${idOrPo}".`);
+    }
+    if (!statusCode || !isValidStatusForConfirmation(statusCode)) {
+      const order = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      const currentStatus = order?.currentStatus || null;
+      return buildChooseStatusResponse(idOrPo, currentStatus);
     }
     const statusMap = {
       'submitted to supplier': 'submitted_to_supplier',
@@ -7852,7 +8931,7 @@ export const updateYarnPurchaseOrderStatus = async (params = {}) => {
       'po accepted partially': 'po_accepted_partially',
     };
     const code = (statusMap[String(statusCode).toLowerCase().replace(/\s+/g, ' ')] || String(statusCode).replace(/\s+/g, '_')).toLowerCase();
-    const validStatuses = ['submitted_to_supplier', 'in_transit', 'goods_received', 'goods_partially_received', 'qc_pending', 'po_rejected', 'po_accepted', 'po_accepted_partially'];
+    const validStatuses = STATUS_OPTIONS.map((s) => s.code);
     const finalCode = validStatuses.find((s) => s.replace(/_/g, ' ') === code.replace(/_/g, ' ')) || (validStatuses.includes(code) ? code : null);
     if (!finalCode) {
       return generateHTMLResponse('Invalid Status', `Valid statuses: ${validStatuses.join(', ')}`);
@@ -7878,7 +8957,8 @@ export const updateYarnPurchaseOrderStatus = async (params = {}) => {
  */
 export const deleteYarnPurchaseOrder = async (params = {}) => {
   try {
-    const idOrPo = params.purchaseOrderId || params.poNumber || params.orderId;
+    const p = params && typeof params === 'object' ? params : {};
+    const idOrPo = p.purchaseOrderId || p.poNumber || p.orderId;
     if (!idOrPo) {
       return generateHTMLResponse('Delete Order', 'Please specify order ID or PO number to delete (e.g. "delete order PO-2024-001").');
     }
@@ -7914,19 +8994,24 @@ const recomputeOrderTotals = (poItems) => {
   return { subTotal, gst: gstTotal, total: subTotal + gstTotal };
 };
 
+const EDIT_ADD_ITEM_PAGE_SIZE = 5;
+
 /**
  * Apply in-chat edit to a purchase order (quantity, add/remove item, status). Called when context.editOrderPo is set.
  * @param {string} purchaseOrderId - Mongo ID
  * @param {string} userMessage - User's edit instruction
- * @returns {Promise<{ html: string, editOrderContext?: { purchaseOrderId: string, poNumber: string } | null }>}
+ * @param {Object} [editContext] - Previous editOrderContext (may contain addItemState for "add item" sub-flow)
+ * @returns {Promise<{ html: string, editOrderContext?: { purchaseOrderId: string, poNumber: string, addItemState?: Object } | null }>}
  */
-export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage) => {
-  const msg = String(userMessage).trim().toLowerCase();
+export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, editContext = null) => {
+  const rawMsg = String(userMessage).trim();
+  const msg = rawMsg.toLowerCase();
   const order = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
   if (!order) {
     return { html: generateHTMLResponse('Error', 'Order not found.'), editOrderContext: null };
   }
   const poNumber = order.poNumber;
+  const items = order.poItems || [];
 
   if (/^(done|cancel|exit|stop|complete)\s*(edit(ing)?|order)?$/.test(msg) || /cancel\s*edit/.test(msg) || /complete\s*(the\s+)?order/.test(msg)) {
     const isComplete = /complete|done|finish/.test(msg);
@@ -7941,10 +9026,112 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage) =
     };
   }
 
-  const items = order.poItems || [];
   const getYarnName = (item) => (item.yarnName || (item.yarn?.yarnName) || '').toLowerCase();
 
-  // Update status
+  // "Add item" sub-flow: user chose to add item and we're collecting yarn choice, then quantity, then rate
+  const addItemState = editContext?.addItemState;
+  if (addItemState && addItemState.yarnNames && Array.isArray(addItemState.yarnNames)) {
+    const yarnNames = addItemState.yarnNames;
+    const supplierName = addItemState.supplierName || 'this supplier';
+    const page = Math.max(1, addItemState.page || 1);
+    const pageSize = EDIT_ADD_ITEM_PAGE_SIZE;
+    const start = (page - 1) * pageSize;
+    const slice = yarnNames.slice(start, start + pageSize);
+    const hasMore = start + pageSize < yarnNames.length;
+
+    // "done" / "cancel" in add-item flow -> exit to edit menu
+    if (/^(done|cancel|back|never mind)\s*$/i.test(rawMsg)) {
+      const html = generateHTMLResponse('Add item cancelled', `<p>Back to editing order <strong>${poNumber}</strong>. What would you like to do?</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+      return { html, editOrderContext: { purchaseOrderId, poNumber } };
+    }
+
+    if (addItemState.step === 'choose_yarn') {
+      // "load more" -> show next page
+      if (/^\s*load\s+more\s*$/i.test(rawMsg)) {
+        const nextPage = page + 1;
+        const nextStart = (nextPage - 1) * pageSize;
+        const nextSlice = yarnNames.slice(nextStart, nextStart + pageSize);
+        const nextHasMore = nextStart + pageSize < yarnNames.length;
+        const listHtml = nextSlice.map((y, i) => `${nextStart + i + 1}. ${y}`).join('<br/>');
+        const html = generateHTMLResponse(
+          'Add item',
+          `<p>Here are more yarn items from <strong>${supplierName}</strong> (page ${nextPage}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No more items.'}</p>${nextHasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>done</strong> to cancel.</p>`
+        ) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, page: nextPage } } };
+      }
+      // List index: "1", "2", ...
+      const num = parseInt(rawMsg, 10);
+      if (/^\d+$/.test(rawMsg) && !Number.isNaN(num) && num >= 1 && num <= yarnNames.length) {
+        const chosenYarnName = yarnNames[num - 1];
+        const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
+        const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenYarnName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName } } };
+      }
+      // Yarn name or keyword match
+      const nameLower = rawMsg.toLowerCase();
+      const chosenByName = yarnNames.find((y) => y.toLowerCase() === nameLower || y.toLowerCase().includes(nameLower) || nameLower.includes(y.toLowerCase()));
+      if (chosenByName) {
+        const html = generateHTMLResponse('Add item', `<p>You chose <strong>${chosenByName}</strong>. How many units do you want to add?</p><p class="summary">Reply with a number (e.g. 20 or 50).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'quantity', chosenYarnName: chosenByName } } };
+      }
+      // No match: re-show list and prompt
+      const listHtml = slice.map((y, i) => `${start + i + 1}. ${y}`).join('<br/>');
+      const noMatchHtml = generateHTMLResponse('Add item', `<p>No yarn found matching "<strong>${rawMsg}</strong>". Here are yarn items from <strong>${supplierName}</strong> (page ${page}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+      return { html: noMatchHtml, editOrderContext: { purchaseOrderId, poNumber, addItemState } };
+    }
+
+    if (addItemState.step === 'quantity' && addItemState.chosenYarnName) {
+      const qtyNum = parseInt(rawMsg, 10);
+      if (!Number.isNaN(qtyNum) && qtyNum > 0) {
+        const html = generateHTMLResponse('Add item', `<p>Adding <strong>${addItemState.chosenYarnName}</strong> × ${qtyNum}. What <strong>rate</strong> (₹ per unit) do you want?</p><p class="summary">Reply with a number (e.g. 100 or 85).</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+        return { html, editOrderContext: { purchaseOrderId, poNumber, addItemState: { ...addItemState, step: 'rate', quantity: qtyNum } } };
+      }
+    }
+
+    if (addItemState.step === 'rate' && addItemState.chosenYarnName && addItemState.quantity != null) {
+      const rateNum = parseFloat(rawMsg.replace(/[^\d.]/g, ''));
+      if (!Number.isNaN(rateNum) && rateNum >= 0) {
+        const catalogList = await yarnCatalogService.queryYarnCatalogs({ yarnName: addItemState.chosenYarnName }, { limit: 1 });
+        const yarnCatalog = catalogList?.results?.[0] || catalogList?.[0] || null;
+        if (!yarnCatalog) {
+          const html = generateHTMLResponse('Yarn Not Found', `Yarn "${addItemState.chosenYarnName}" not found in catalog. Add it to the catalog first.`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return { html, editOrderContext: { purchaseOrderId, poNumber } };
+        }
+        const yarnId = yarnCatalog._id?.toString?.() || yarnCatalog.id;
+        const newItem = {
+          yarn: yarnId,
+          yarnName: yarnCatalog.yarnName || addItemState.chosenYarnName,
+          sizeCount: (items[0]?.sizeCount ?? '-'),
+          shadeCode: items[0]?.shadeCode ?? '',
+          rate: rateNum,
+          quantity: addItemState.quantity,
+          gstRate: items[0]?.gstRate
+        };
+        const newItems = [...items.map((it) => (it.toObject ? it.toObject() : { ...it })), newItem];
+        const { subTotal, gst, total } = recomputeOrderTotals(newItems);
+        await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
+        const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+        const html = generateHTMLResponse('Item Added', `Added <strong>${newItem.yarnName}</strong> × ${addItemState.quantity} @ ₹${rateNum}.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT;
+        return { html, editOrderContext: { purchaseOrderId, poNumber: updated.poNumber } };
+      }
+    }
+  }
+
+  // Vague quantity intent: "change quantity", "lets change quantity", "update quantity" (no number) — ask for specific instruction
+  const vagueQty = /^(?:lets?\s+)?(?:change|update)\s+(?:the\s+)?quantity\s*\.?$|(?:i\s+)?(?:want\s+to\s+)?(?:change|update)\s+(?:the\s+)?quantity\s*\.?$/i.test(msg) ||
+    /^(?:change|update)\s+(?:the\s+)?quantity\s+(?:in\s+)?(?:a\s+)?(?:purchase\s+)?order\s*\.?$/i.test(msg);
+  if (vagueQty && items.length > 0) {
+    const itemList = items.map((it, i) => `${i + 1}. ${(it.yarnName || it.yarn?.yarnName || 'Item')} — current qty: ${it.quantity ?? 0}`).join('<br/>');
+    return {
+      html: generateHTMLResponse(
+        'Change quantity',
+        `<p>To change quantity, tell me the new value.</p><p><strong>Current items:</strong></p><p>${itemList}</p><p><strong>Examples:</strong></p><ul><li>For the first item: <strong>quantity to 50</strong></li><li>For a specific yarn: <strong>set quantity of [yarn name] to 60</strong></li></p><p>Reply with the quantity you want (e.g. "quantity to 199" or "set quantity of 110/70-Brown to 100").</p>`
+      ) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId, poNumber }
+    };
+  }
+
+  // Update status (must explicitly say "status" so "change quantity" is not mistaken)
   const statusMatch = msg.match(/(?:set|update|change)\s+status\s+to\s+(.+?)(?:\.|$)/i) || msg.match(/(?:mark\s+as|set\s+to)\s+(in\s+transit|goods\s+received|qc\s+pending|submitted|po\s+accepted|po\s+rejected)/i);
   if (statusMatch) {
     const statusPhrase = (statusMatch[1] || statusMatch[2] || '').trim();
@@ -7977,6 +9164,55 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage) =
     }
   }
 
+  // Increase quantity by N: "increase quantity by 50", "increase it by 50", "increase by 50", "quantity increase by 50"
+  const increaseMatch = msg.match(/(?:increase|add)\s+(?:the\s+|quantity\s+|it\s+)?by\s+(\d+)/i) || msg.match(/(?:quantity\s+)?increase\s+by\s+(\d+)/i);
+  if (increaseMatch && items.length > 0) {
+    const addQty = parseInt(increaseMatch[1], 10);
+    if (addQty > 0) {
+      let idx = 0;
+      const forYarnMatch = msg.match(/(?:for|of)\s+(.+?)(?:\s+by\s+|\s+increase|$)/i);
+      if (forYarnMatch && forYarnMatch[1]) {
+        const search = forYarnMatch[1].trim().toLowerCase();
+        const i = items.findIndex((it) => getYarnName(it).includes(search) || search.includes(getYarnName(it)));
+        if (i !== -1) idx = i;
+      }
+      const currentQty = items[idx].quantity ?? 0;
+      const newQty = currentQty + addQty;
+      const newItems = items.map((it, i) => {
+        const plain = it.toObject ? it.toObject() : { ...it };
+        return i === idx ? { ...plain, quantity: newQty } : plain;
+      });
+      const { subTotal, gst, total } = recomputeOrderTotals(newItems);
+      await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
+      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      const itemLabel = items[idx].yarnName || items[idx].yarn?.yarnName || 'item';
+      let html = generateHTMLResponse('Quantity Updated', `Increased <strong>${itemLabel}</strong> by <strong>${addQty}</strong> (was ${currentQty}, now ${newQty}).`) + buildOrderDetailsHtml(updated);
+      // If user also asked for supplier yarn list in same message, append it
+      const alsoAskedSupplierYarn = /(?:what|which|list|give\s+me|tell\s+me)\s+(?:more\s+)?(?:yarn|items?)|(?:what\s+items?|what\s+else)\s+(?:does\s+)?(?:this\s+)?supplier|what\s+(?:more\s+)?yarn\s+(?:are\s+)?available/i.test(msg);
+      if (alsoAskedSupplierYarn) {
+        const supplierId = updated.supplier?._id || updated.supplier;
+        if (supplierId) {
+          try {
+            const supplier = await supplierService.getSupplierById(supplierId);
+            const supplierName = supplier?.brandName || updated.supplier?.brandName || 'this supplier';
+            const yarnDetails = supplier?.yarnDetails || [];
+            const yarnNames = [...new Set(yarnDetails.map((d) => d.yarnName).filter(Boolean))];
+            if (yarnNames.length > 0) {
+              const listHtml = yarnNames.map((name) => `<li><strong>${name}</strong></li>`).join('');
+              html += generateHTMLResponse(`Yarn from ${supplierName}`, `<p>Yarn items <strong>${supplierName}</strong> provides:</p><ul>${listHtml}</ul><p>To add: say <strong>add [yarn name] [qty] at [rate]</strong> — e.g. "add 33/2/120-Dark Grey 20 at 100".</p>`);
+            } else {
+              html += generateHTMLResponse(`Yarn from ${supplierName}`, `<p>No yarn list on file for this supplier. You can add by name: "add [yarn name] 20 at 100".</p>`);
+            }
+          } catch (e) {
+            console.warn('Supplier yarn list append failed:', e?.message);
+          }
+        }
+      }
+      html += EDIT_MORE_OR_COMPLETE_PROMPT;
+      return { html, editOrderContext: { purchaseOrderId, poNumber: updated.poNumber } };
+    }
+  }
+
   // Remove item: "remove [yarn name]"
   const removeMatch = msg.match(/remove\s+(.+?)(?:\.|$)/i);
   if (removeMatch && items.length > 1) {
@@ -7995,12 +9231,15 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage) =
     }
   }
 
-  // Update quantity: "set quantity of [yarn] to N" or "quantity to N" (first item)
-  const qtyMatch = msg.match(/(?:set|change|update)\s+(?:the\s+)?quantity\s+(?:of\s+)?(.+?)\s+to\s+(\d+)/i) || msg.match(/quantity\s+to\s+(\d+)/i);
+  // Update quantity: "set quantity of [yarn] to N", "change quantity to N" (first item), or "quantity to N"
+  const qtyMatch = msg.match(/(?:set|change|update)\s+(?:the\s+)?quantity\s+(?:of\s+)(.+?)\s+to\s+(\d+)/i) ||
+    msg.match(/(?:set|change|update)\s+(?:the\s+)?quantity\s+to\s+(\d+)/i) ||
+    msg.match(/quantity\s+to\s+(\d+)/i);
   if (qtyMatch) {
     const newQty = parseInt(qtyMatch[2] || qtyMatch[1], 10);
     if (newQty > 0) {
       let idx = 0;
+      // If we have a yarn name (first pattern), find that item; otherwise first item
       if (qtyMatch[1] && isNaN(Number(qtyMatch[1]))) {
         const search = qtyMatch[1].trim().toLowerCase();
         const i = items.findIndex((it) => getYarnName(it).includes(search) || search.includes(getYarnName(it)));
@@ -8017,6 +9256,81 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage) =
         html: generateHTMLResponse('Quantity Updated', `Quantity updated to <strong>${newQty}</strong>.`) + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
         editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
       };
+    }
+  }
+
+  // "What yarn from this supplier" / "list yarn to add" / "what items does this supplier have" — show supplier's yarn list so user can add by name
+  const supplierYarnAsk = /(?:what|which|list|give\s+me|tell\s+me|show\s+me)\s+(?:more\s+)?(?:yarn|items?)\s+(?:from\s+this\s+supplier|(?:to\s+add|available|(?:that\s+)?this\s+supplier\s+(?:provide|have|supply)s?))?/i.test(msg) ||
+    /(?:what|which)\s+(?:items?|yarn)\s+(?:does\s+)?(?:this\s+)?supplier\s+(?:have|provide|supply)/i.test(msg) ||
+    /(?:what\s+else|list\s+of\s+yarn)\s+(?:does\s+)?(?:this\s+)?supplier\s+(?:provide|have)/i.test(msg) ||
+    /(?:yes\s+)?tell\s+me\s+what\s+(?:more\s+)?yarn\s+(?:are\s+)?available/i.test(msg) ||
+    /give\s+me\s+(?:the\s+)?list\s+of\s+yarn\s+items?/i.test(msg) ||
+    /list\s+of\s+yarn\s+items?\s+to\s+add/i.test(msg) ||
+    /what\s+else\s+this\s+supplier\s+provide/i.test(msg);
+  if (supplierYarnAsk) {
+    const supplierId = order.supplier?._id || order.supplier;
+    if (supplierId) {
+      try {
+        const supplier = await supplierService.getSupplierById(supplierId);
+        const supplierName = supplier?.brandName || order.supplier?.brandName || 'this supplier';
+        const yarnDetails = supplier?.yarnDetails || [];
+        const yarnNames = yarnDetails.map((d) => d.yarnName).filter(Boolean);
+        const uniqueNames = [...new Set(yarnNames)];
+        if (uniqueNames.length > 0) {
+          const listHtml = uniqueNames.map((name, i) => `<li><strong>${name}</strong></li>`).join('');
+          return {
+            html: generateHTMLResponse(
+              `Yarn from ${supplierName}`,
+              `<p>Here are the yarn items <strong>${supplierName}</strong> provides:</p><ul>${listHtml}</ul><p>To add any of these to your order, say: <strong>add [yarn name] [quantity] at [rate]</strong> — e.g. "add 33/2/120-Dark Grey 20 at 100".</p>`
+            ) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+            editOrderContext: { purchaseOrderId, poNumber }
+          };
+        }
+        return {
+          html: generateHTMLResponse(
+            `Yarn from ${supplierName}`,
+            `<p>No yarn list is on file for <strong>${supplierName}</strong>. You can still add yarn by name if it exists in the catalog — e.g. "add [yarn name] 20 at 100".</p>`
+          ) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+          editOrderContext: { purchaseOrderId, poNumber }
+        };
+      } catch (e) {
+        console.warn('Failed to load supplier yarn list:', e?.message);
+      }
+    }
+    return {
+      html: generateHTMLResponse('Supplier info', `<p>I couldn't load the yarn list for this order's supplier. You can add yarn by name — e.g. "add [yarn name] 20 at 100".</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId, poNumber }
+    };
+  }
+
+  // Vague "add item" intent: "i want to add item", "add item" — show supplier's yarn list (numbered, like place order)
+  const vagueAddItem = /^(?:i\s+)?(?:want\s+to\s+)?add\s+(?:an?\s+)?item\s*\.?$/i.test(rawMsg) || /^add\s+(?:an?\s+)?item\s*\.?$/i.test(rawMsg);
+  if (vagueAddItem) {
+    const supplierId = order.supplier?._id || order.supplier;
+    if (supplierId) {
+      try {
+        const supplier = await supplierService.getSupplierById(supplierId);
+        const supplierName = supplier?.brandName || order.supplier?.brandName || 'this supplier';
+        const yarnDetails = supplier?.yarnDetails || [];
+        const yarnNames = [...new Set((yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))];
+        if (yarnNames.length > 0) {
+          const pageSize = EDIT_ADD_ITEM_PAGE_SIZE;
+          const page = 1;
+          const slice = yarnNames.slice(0, pageSize);
+          const hasMore = yarnNames.length > pageSize;
+          const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+          const html = generateHTMLResponse(
+            'Add item',
+            `<p>Here are yarn items from <strong>${supplierName}</strong> (top ${slice.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, then I'll ask for quantity and rate.</p>`
+          ) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+          return {
+            html,
+            editOrderContext: { purchaseOrderId, poNumber, addItemState: { step: 'choose_yarn', yarnNames, page: 1, supplierId: supplierId.toString?.() || supplierId, supplierName } }
+          };
+        }
+      } catch (e) {
+        console.warn('Failed to load supplier yarn list for add item:', e?.message);
+      }
     }
   }
 
@@ -8195,59 +9509,21 @@ export const getYarnSuppliers = async (params = {}) => {
     const inactiveCount = suppliers.results.filter(s => s.status === 'Inactive' || s.status === 'inactive').length;
     const brands = [...new Set(suppliers.results.map(s => s.brandName).filter(Boolean))];
     
+    const numberedList = suppliers.results
+      .map((s, i) => {
+        const name = s.brandName || s.supplierName || 'N/A';
+        const extra = [s.supplierName && s.supplierName !== name ? s.supplierName : null, s.contactPerson || s.email].filter(Boolean).join(' • ');
+        return `${i + 1}. ${name}${extra ? ` <span class="summary" style="color:#64748b;">(${extra})</span>` : ''}`;
+      })
+      .join('<br/>');
+
     const html = AI_TOOL_STYLES + `
       <div class="ai-tool-response">
         <h3>🏷️ Yarn Suppliers/Brands</h3>
-        
-        <!-- Summary KPIs -->
-        <div class="kpi-grid">
-          <div class="kpi-item">
-            <div class="kpi-label">Total Suppliers</div>
-            <div class="kpi-value">${totalCount.toLocaleString()}</div>
-            <div class="kpi-change">In System</div>
-          </div>
-          <div class="kpi-item">
-            <div class="kpi-label">Active Suppliers</div>
-            <div class="kpi-value">${activeCount.toLocaleString()}</div>
-            <div class="kpi-change">Currently Active</div>
-          </div>
-          <div class="kpi-item">
-            <div class="kpi-label">Unique Brands</div>
-            <div class="kpi-value">${brands.length}</div>
-            <div class="kpi-change">Brand Count</div>
-          </div>
-        </div>
-        
-        <!-- Suppliers Table -->
-        <div class="chart-container">
-          <h4>📋 Suppliers List</h4>
-          <div class="table-container">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th>Supplier Name</th>
-                  <th>Brand</th>
-                  <th>Contact</th>
-                  <th>Created At</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${suppliers.results.map((supplier) => `
-                  <tr>
-                    <td><strong>${supplier.supplierName || 'N/A'}</strong></td>
-                    <td>${supplier.brandName || 'N/A'}</td>
-                    <td>${supplier.contactPerson || supplier.email || 'N/A'}</td>
-                    <td>${supplier.createdAt ? new Date(supplier.createdAt).toLocaleString() : 'N/A'}</td>
-                    <td><span style="background: ${supplier.status === 'active' ? '#d4edda' : '#f8d7da'}; padding: 4px 8px; border-radius: 4px; font-weight: 500; text-transform: capitalize;">${supplier.status || 'N/A'}</span></td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-          </div>
-        </div>
-        
-        <p class="summary">Found ${totalCount.toLocaleString()} suppliers${suppliers.totalResults > suppliers.results.length ? ` (showing ${suppliers.results.length} of ${suppliers.totalResults})` : ''} representing ${brands.length} unique brands with ${activeCount} active suppliers.</p>
+        <p class="summary" style="margin: 0.4em 0;">Total: <strong>${totalCount}</strong> suppliers${suppliers.totalResults > suppliers.results.length ? ` (showing ${suppliers.results.length} of ${suppliers.totalResults})` : ''} • <strong>${activeCount}</strong> active • <strong>${brands.length}</strong> unique brands.</p>
+        <p class="summary" style="margin: 0.6em 0;"><strong>Numbered list:</strong></p>
+        <p class="summary" style="margin: 0.4em 0; padding-left: 1em; line-height: 1.6;">${numberedList}</p>
+        <p class="summary" style="margin-top: 0.8em;">You can place an order by saying <strong>place order</strong> and then typing a supplier name from this list, or <strong>show supplier list</strong> to choose in the wizard.</p>
       </div>
     `;
     
@@ -8425,6 +9701,50 @@ export const getYarnColors = async (params = {}) => {
   } catch (error) {
     console.error('Error in getYarnColors:', error);
     return generateHTMLResponse('Error', `Failed to retrieve colors: ${error.message}`);
+  }
+};
+
+/**
+ * Get suppliers that have yarn matching a given colour (keyword in yarn name).
+ * @param {Object} params - { colour: string }
+ * @returns {Promise<string>} HTML list of suppliers with that colour yarn
+ */
+export const getSuppliersByYarnColour = async (params = {}) => {
+  try {
+    const colour = (params?.colour || params?.color || '').trim();
+    if (!colour) {
+      return generateHTMLResponse('Colour needed', 'Please specify a colour, e.g. "which supplier has blue yarn".');
+    }
+    const colourLower = colour.toLowerCase();
+    const suppliersResult = await supplierService.querySuppliers({}, { limit: 200, page: 1 });
+    const suppliers = suppliersResult?.results ?? suppliersResult ?? [];
+    const matchingSuppliers = [];
+    for (const s of suppliers) {
+      const id = (s._id || s.id)?.toString?.() || '';
+      const supplier = await supplierService.getSupplierById(id);
+      const yarnNames = supplier?.yarnDetails?.length
+        ? (supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean)
+        : [];
+      const hasMatch = yarnNames.some((name) => name.toLowerCase().includes(colourLower));
+      if (hasMatch) {
+        matchingSuppliers.push({ id, brandName: supplier?.brandName || supplier?.name || s.brandName || s.name || 'Unknown' });
+      }
+    }
+    if (matchingSuppliers.length === 0) {
+      return generateHTMLResponse(
+        'No suppliers found',
+        `No supplier has yarn with "<strong>${colour}</strong>" in the name. Try another colour or ask for the supplier list to place an order.`
+      );
+    }
+    const listHtml = matchingSuppliers.map((s, i) => `${i + 1}. ${s.brandName}`).join('<br/>');
+    const hint = `Say <strong>buy yarn from [supplier name] in ${colour}</strong> to start an order.`;
+    return generateHTMLResponse(
+      `Suppliers with ${colour} yarn`,
+      `<p>Suppliers that have <strong>${colour}</strong> yarn:</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml}</p><p class="summary" style="margin-top: 0.8em;">${hint}</p>`
+    );
+  } catch (error) {
+    console.error('Error in getSuppliersByYarnColour:', error);
+    return generateHTMLResponse('Error', `Failed to find suppliers by colour: ${error.message}`);
   }
 };
 
@@ -9672,6 +10992,12 @@ const clearPendingConfirmation = (sessionId) => {
   if (sessionId) pendingConfirmations.delete(sessionId);
 };
 
+/** Set pending "place yarn order" confirmation so that when user says "yes" we create the PO */
+export const setPendingPlaceOrderConfirmation = (sessionId, { placeOrderContext }) => {
+  if (!sessionId || !placeOrderContext) return;
+  setPendingConfirmation(sessionId, { action: 'placeYarnOrder', params: { placeOrderContext }, label: 'Place yarn purchase order' });
+};
+
 const CONFIRM_VARIANTS = ['yes', 'y', 'confirm'];
 const CANCEL_VARIANTS = ['no', 'n', 'cancel'];
 
@@ -9699,6 +11025,15 @@ export const resolvePendingConfirmation = async (sessionId, message) => {
   }
   clearPendingConfirmation(sessionId);
   if (isConfirm) {
+    if (pending.action === 'placeYarnOrder' && pending.params?.placeOrderContext) {
+      try {
+        const { created, total, poItems } = await createPurchaseOrderFromPlaceContext(pending.params.placeOrderContext);
+        const response = generateHTMLResponse('Order Placed', `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}.`);
+        return { resolved: true, response, poNumber: created.poNumber };
+      } catch (err) {
+        return { resolved: true, response: generateHTMLResponse('Error', err.message || 'Failed to place order.') };
+      }
+    }
     try {
       const response = await executeAITool(
         { action: pending.action, params: pending.params },
@@ -9723,19 +11058,30 @@ export const resolvePendingConfirmation = async (sessionId, message) => {
  */
 export const executeAITool = async (intent, options = {}) => {
   const { sessionId, skipConfirmation } = options;
-  const needsConfirmation = sessionId && !skipConfirmation &&
-    (intent.action === 'deleteYarnPurchaseOrder' || intent.action === 'updateYarnPurchaseOrderStatus');
+  const idOrPo = intent.params?.purchaseOrderId || intent.params?.poNumber || intent.params?.orderId;
+  const hasOrder = !!idOrPo;
+  const statusRaw = intent.params?.status_code || intent.params?.status;
+  const hasValidStatus = intent.action === 'updateYarnPurchaseOrderStatus' ? isValidStatusForConfirmation(statusRaw) : true;
+  const needsConfirmation = sessionId && !skipConfirmation && (
+    (intent.action === 'deleteYarnPurchaseOrder' && hasOrder) ||
+    (intent.action === 'updateYarnPurchaseOrderStatus' && hasOrder && hasValidStatus)
+  );
 
   if (needsConfirmation) {
-    const idOrPo = intent.params?.purchaseOrderId || intent.params?.poNumber || intent.params?.orderId || 'this order';
+    const idOrPoLabel = idOrPo || 'this order';
+    const statusCode = intent.params?.status_code || intent.params?.status;
+    const statusLabel = statusCode ? String(statusCode).replace(/_/g, ' ') : '';
     const label = intent.action === 'deleteYarnPurchaseOrder'
-      ? `Delete purchase order ${idOrPo}`
-      : `Update status of purchase order ${idOrPo}`;
+      ? `Delete purchase order ${idOrPoLabel}`
+      : `Update status of purchase order ${idOrPoLabel} to ${statusLabel}`;
     setPendingConfirmation(sessionId, { action: intent.action, params: intent.params, label });
     const actionVerb = intent.action === 'deleteYarnPurchaseOrder' ? 'delete' : 'update the status of';
+    const confirmDetail = intent.action === 'updateYarnPurchaseOrderStatus' && statusLabel
+      ? ` to <strong>${statusLabel}</strong>`
+      : '';
     return generateHTMLResponse(
       'Confirm',
-      `<p><strong>Are you sure</strong> you want to ${actionVerb} <strong>${idOrPo}</strong>?</p><p>Type <strong>yes</strong> to confirm or <strong>no</strong> to cancel.</p>`
+      `<p><strong>Are you sure</strong> you want to ${actionVerb} <strong>${idOrPoLabel}</strong>${confirmDetail}?</p><p>Type <strong>yes</strong> to confirm or <strong>no</strong> to cancel.</p>`
     );
   }
 
@@ -9812,6 +11158,8 @@ export const executeAITool = async (intent, options = {}) => {
         return await getYarnCountSizes(intent.params);
       case 'getYarnColors':
         return await getYarnColors(intent.params);
+      case 'getSuppliersByYarnColour':
+        return await getSuppliersByYarnColour(intent.params);
       case 'getYarnBlends':
         return await getYarnBlends(intent.params);
       // Raw Materials, Processes, Attributes
@@ -9889,6 +11237,7 @@ export default {
   getYarnSuppliers,
   getYarnCountSizes,
   getYarnColors,
+  getSuppliersByYarnColour,
   getYarnBlends,
   getYarnBoxes,
   getYarnCones,
