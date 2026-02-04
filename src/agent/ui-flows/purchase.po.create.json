@@ -1,0 +1,64 @@
+{
+  "flowKey": "purchase.po.create.ui",
+  "description": "Visual playback for Purchase Order creation (UI only, no real submit)",
+  "version": 1,
+
+  "steps": [
+    {
+      "type": "NAVIGATE",
+      "page": "purchase.po.list"
+    },
+
+    {
+      "type": "CLICK",
+      "target": "purchase.po.new.btn"
+    },
+
+    {
+      "type": "WAIT_FOR_PAGE",
+      "page": "purchase.po.create"
+    },
+
+    {
+      "type": "SET_VALUE",
+      "target": "purchase.po.form.date",
+      "from": "order.purchaseDate"
+    },
+
+    {
+      "type": "SET_VALUE",
+      "target": "purchase.po.form.supplier",
+      "from": "order.supplierName"
+    },
+
+    {
+      "type": "CLICK",
+      "target": "purchase.po.items.add.btn"
+    },
+
+    {
+      "type": "SET_ITEMS",
+      "from": "order.items"
+    },
+
+    {
+      "type": "SET_VALUE",
+      "target": "purchase.po.form.notes",
+      "from": "order.notes"
+    },
+
+    {
+      "type": "CLICK",
+      "target": "purchase.po.submit.btn"
+    },
+
+    {
+      "type": "WAIT_FOR_MODAL",
+      "target": "purchase.po.success"
+    },
+
+    {
+      "type": "DONE"
+    }
+  ]
+}

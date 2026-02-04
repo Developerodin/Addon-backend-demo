@@ -32,6 +32,7 @@ import * as yarnConeService from './yarnManagement/yarnCone.service.js';
 import * as storageSlotService from './storageManagement/storageSlot.service.js';
 import Machine from '../models/machine.model.js';
 import { Article, ProductionOrder } from '../models/production/index.js';
+import * as agentUiFlowService from './agent/agentUiFlow.service.js';
 
 const openai = new OpenAI({
   apiKey: config.openai.apiKey,
@@ -11299,9 +11300,42 @@ export const resolvePendingConfirmation = async (sessionId, message) => {
   if (isConfirm) {
     if (pending.action === 'placeYarnOrder' && pending.params?.placeOrderContext) {
       try {
-        const { created, total, poItems } = await createPurchaseOrderFromPlaceContext(pending.params.placeOrderContext);
-        const response = generateHTMLResponse('Order Placed', `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}.`);
-        return { resolved: true, response, poNumber: created.poNumber };
+        const ctx = pending.params.placeOrderContext;
+        const { created, total, poItems } = await createPurchaseOrderFromPlaceContext(ctx);
+        const response = generateHTMLResponse('Order Placed', `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}. Opening the form so you can see it.`);
+        const agentJobId = `JOB_${Date.now()}`;
+        try {
+          const purchaseDate = new Date().toISOString().slice(0, 10);
+          const deliveryDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+          const agentContext = {
+            order: {
+              purchaseDate,
+              supplierName: ctx.supplierName || '',
+              notes: '',
+              items: (poItems || []).map((p) => ({
+                yarnName: p.yarnName || '',
+                size: p.sizeCount || 'N/A',
+                shade: p.shadeCode || '',
+                rate: p.rate,
+                qty: p.quantity,
+                delivery: deliveryDate,
+                gst: p.gstRate ?? 0
+              }))
+            }
+          };
+          await agentUiFlowService.createJob({
+            jobId: agentJobId,
+            flowKey: 'purchase.po.create.ui',
+            refType: 'PO',
+            refId: created.poNumber,
+            context: agentContext
+          });
+          await agentUiFlowService.startUiFlow(agentJobId);
+        } catch (agentErr) {
+          console.warn('Agent UI flow create/start failed (order still placed):', agentErr?.message);
+        }
+        if (!agentJobId) console.warn('[aiToolService] placeYarnOrder success but agentJobId missing');
+        return { resolved: true, response, poNumber: created.poNumber, agentJobId };
       } catch (err) {
         return { resolved: true, response: generateHTMLResponse('Error', err.message || 'Failed to place order.') };
       }

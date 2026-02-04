@@ -35,6 +35,7 @@ import yarnInventoryRoute from './yarn/yarnInventory.route.js';
 import storageRoute from './storage.route.js';
 import yarnReqRoute from './yarn/yarnReq.route.js';
 import crmRoute from './crm.route.js';
+import agentRoute from './agent.route.js';
 import config from '../../config/config.js';
 
 const router = express.Router();
@@ -179,6 +180,10 @@ const defaultRoutes = [
   {
     path: '/crm',
     route: crmRoute,
+  },
+  {
+    path: '/agent',
+    route: agentRoute,
   },
 ];
 

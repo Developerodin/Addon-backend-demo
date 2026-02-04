@@ -15,6 +15,7 @@ import * as yarnTransactionService from './yarnManagement/yarnTransaction.servic
 import * as rawMaterialService from './rawMaterial.service.js';
 import * as processService from './process.service.js';
 import * as productAttributeService from './productAttribute.service.js';
+import * as agentUiFlowService from './agent/agentUiFlow.service.js';
 
 const openai = new OpenAI({
   apiKey: config.openai.apiKey,
@@ -704,7 +705,7 @@ export const askQuestion = async (question, options = {}) => {
         if (isConfirmPlace && hasCollectedItems) {
           try {
             const { created, total, poItems } = await aiToolService.createPurchaseOrderFromPlaceContext(context.placeOrderContext);
-            const html = `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}.`;
+            const html = `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}. Opening the form so you can see it.`;
             const out = {
               type: 'ai_tool',
               intent: { action: 'createYarnPurchaseOrder' },
@@ -715,6 +716,38 @@ export const askQuestion = async (question, options = {}) => {
               source: 'ai_tool_service',
               contextUsed: true
             };
+            const jobId = `JOB_${Date.now()}`;
+            out.agentJobId = jobId;
+            try {
+              const purchaseDate = new Date().toISOString().slice(0, 10);
+              const deliveryDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+              const agentContext = {
+                order: {
+                  purchaseDate,
+                  supplierName: context.placeOrderContext.supplierName || '',
+                  notes: '',
+                  items: (poItems || []).map((p) => ({
+                    yarnName: p.yarnName || '',
+                    size: p.sizeCount || 'N/A',
+                    shade: p.shadeCode || '',
+                    rate: p.rate,
+                    qty: p.quantity,
+                    delivery: deliveryDate,
+                    gst: p.gstRate ?? 0
+                  }))
+                }
+              };
+              await agentUiFlowService.createJob({
+                jobId,
+                flowKey: 'purchase.po.create.ui',
+                refType: 'PO',
+                refId: created.poNumber,
+                context: agentContext
+              });
+              await agentUiFlowService.startUiFlow(jobId);
+            } catch (agentErr) {
+              console.warn('Agent UI flow create/start failed (order still placed):', agentErr?.message);
+            }
             persistAgentFlowIfNeeded(sessionId, out);
             return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: `Order placed with PO number ${created.poNumber}.`, poNumber: created.poNumber });
           } catch (placeErr) {
@@ -751,6 +784,7 @@ export const askQuestion = async (question, options = {}) => {
             source: 'ai_tool_service',
             contextUsed: true
           };
+          persistAgentFlowIfNeeded(sessionId, out);
           return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: result.summary || 'Review order. Type yes to place or no to cancel.' });
         }
         const out = {
@@ -1008,6 +1042,10 @@ export const askQuestion = async (question, options = {}) => {
           source: 'ai_tool_service',
           confirmationResolved: true
         };
+        if (resolved.agentJobId != null) out.agentJobId = resolved.agentJobId;
+        if (resolved.poNumber && out.agentJobId == null) {
+          console.warn('[faq] Order placed but agentJobId missing from resolvePendingConfirmation', { poNumber: resolved.poNumber });
+        }
         const summary = resolved.poNumber ? `Order placed with PO number ${resolved.poNumber}.` : 'Done.';
         return await addNaturalReply(out, normalizedQuestion, { action: 'confirm action', summary });
       }
