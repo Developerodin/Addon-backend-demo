@@ -148,7 +148,7 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
   const paginationId = `pagination-${categoryName}-${currentPage}-${Date.now()}`;
   
   return `
-    <div class="pagination-container" data-pagination-id="${paginationId}" style="margin-top: 20px; padding: 15px; background: rgba(30, 41, 59, 0.8); border-radius: 8px; text-align: center; border: 1px solid rgba(148, 163, 184, 0.2);">
+    <div class="pagination-container" data-pagination-id="${paginationId}" style="margin-top: 20px; padding: 15px; background: #fff; border-radius: 12px; text-align: center; border: 1px solid #e5e7eb;">
       <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 15px;">
         <div style="flex: 1; text-align: left;">
           ${prevPage ? `
@@ -156,19 +156,19 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
               class="pagination-btn pagination-prev" 
               data-category="${categoryName}" 
               data-page="${prevPage}"
-              style="padding: 8px 16px; background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; transition: all 0.2s ease; box-shadow: 0 2px 4px rgba(59, 130, 246, 0.3);"
-              onmouseover="this.style.transform='translateY(-1px)'; this.style.boxShadow='0 4px 8px rgba(59, 130, 246, 0.4)';"
-              onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 4px rgba(59, 130, 246, 0.3)';"
+              style="padding: 8px 16px; background: #3b82f6; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-weight: 500; transition: all 0.2s ease;"
+              onmouseover="this.style.opacity='0.9';"
+              onmouseout="this.style.opacity='1';"
             >
               ← Previous Page
             </button>
           ` : `
-            <span style="color: #94a3b8; padding: 8px 16px;">No previous page</span>
+            <span style="color: #6b7280; padding: 8px 16px;">No previous page</span>
           `}
         </div>
         <div style="flex: 1; text-align: center;">
-          <strong style="color: #f1f5f9; font-size: 1.1em;">Page ${currentPage} of ${totalPages}</strong>
-          <br><span style="color: #94a3b8; font-size: 0.9em;">(${totalCount.toLocaleString()} total items)</span>
+          <strong style="color: #000; font-size: 1.1em;">Page ${currentPage} of ${totalPages}</strong>
+          <br><span style="color: #6b7280; font-size: 0.9em;">(${totalCount.toLocaleString()} total items)</span>
         </div>
         <div style="flex: 1; text-align: right;">
           ${nextPage ? `
@@ -176,14 +176,14 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
               class="pagination-btn pagination-next" 
               data-category="${categoryName}" 
               data-page="${nextPage}"
-              style="padding: 8px 16px; background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; transition: all 0.2s ease; box-shadow: 0 2px 4px rgba(59, 130, 246, 0.3);"
-              onmouseover="this.style.transform='translateY(-1px)'; this.style.boxShadow='0 4px 8px rgba(59, 130, 246, 0.4)';"
-              onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 4px rgba(59, 130, 246, 0.3)';"
+              style="padding: 8px 16px; background: #3b82f6; color: #fff; border: none; border-radius: 8px; cursor: pointer; font-weight: 500; transition: all 0.2s ease;"
+              onmouseover="this.style.opacity='0.9';"
+              onmouseout="this.style.opacity='1';"
             >
               Next Page →
             </button>
           ` : `
-            <span style="color: #94a3b8; padding: 8px 16px;">No next page</span>
+            <span style="color: #6b7280; padding: 8px 16px;">No next page</span>
           `}
         </div>
       </div>
@@ -192,7 +192,7 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
       <div style="display: flex; justify-content: center; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 15px;">
         ${pageButtons.map(btn => {
           if (btn.page === null) {
-            return `<span style="color: #94a3b8; padding: 8px;">${btn.label}</span>`;
+            return `<span style="color: #6b7280; padding: 8px;">${btn.label}</span>`;
           }
           const isCurrent = btn.page === currentPage;
           return `
@@ -202,17 +202,16 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
               data-page="${btn.page}"
               style="
                 padding: 8px 14px; 
-                background: ${isCurrent ? 'linear-gradient(135deg, #10b981 0%, #059669 100%)' : 'rgba(51, 65, 85, 0.9)'}; 
-                color: ${isCurrent ? 'white' : '#e2e8f0'}; 
-                border: ${isCurrent ? 'none' : '1px solid rgba(148, 163, 184, 0.3)'}; 
-                border-radius: 6px; 
+                background: ${isCurrent ? '#10b981' : '#f3f4f6'}; 
+                color: ${isCurrent ? '#fff' : '#000'}; 
+                border: ${isCurrent ? 'none' : '1px solid #e5e7eb'}; 
+                border-radius: 8px; 
                 cursor: ${isCurrent ? 'default' : 'pointer'}; 
                 font-weight: ${isCurrent ? '600' : '500'}; 
                 transition: all 0.2s ease;
-                ${isCurrent ? 'box-shadow: 0 2px 4px rgba(16, 185, 129, 0.3);' : ''}
               "
-              ${!isCurrent ? `onmouseover="this.style.background='rgba(59, 130, 246, 0.2)'; this.style.borderColor='#3b82f6'; this.style.transform='translateY(-1px)';"` : ''}
-              ${!isCurrent ? `onmouseout="this.style.background='rgba(51, 65, 85, 0.9)'; this.style.borderColor='rgba(148, 163, 184, 0.3)'; this.style.transform='translateY(0)';"` : ''}
+              ${!isCurrent ? `onmouseover="this.style.background='#e5e7eb';"` : ''}
+              ${!isCurrent ? `onmouseout="this.style.background='#f3f4f6';"` : ''}
               ${isCurrent ? 'disabled' : ''}
             >
               ${btn.label}
@@ -221,9 +220,9 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
         }).join('')}
       </div>
       
-      <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(148, 163, 184, 0.2);">
-        <p style="margin: 0; color: #94a3b8; font-size: 0.9em;">
-          💡 <strong style="color: #e2e8f0;">Tip:</strong> Click the buttons above to navigate, or ask me: 
+      <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #e5e7eb;">
+        <p style="margin: 0; color: #6b7280; font-size: 0.9em;">
+          💡 <strong style="color: #000;">Tip:</strong> Click the buttons above to navigate, or ask me: 
           ${prevPage ? `"Show ${categoryName} page ${prevPage}"` : ''} 
           ${prevPage && nextPage ? ' or ' : ''} 
           ${nextPage ? `"Show ${categoryName} page ${nextPage}"` : ''}
@@ -2199,176 +2198,179 @@ const AI_TOOL_STYLES = `
 <style>
 .ai-tool-response {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  margin: 20px 0;
-  padding: 20px;
-  background-color: #f8f9fa;
-  border-radius: 8px;
-  border-left: 4px solid #007bff;
+  margin: 12px 0;
+  padding: 12px;
+  background-color: #fff;
+  border-radius: 12px;
+  border: 1px solid #e5e7eb;
 }
 
 .ai-tool-response h3 {
-  margin: 0 0 15px 0;
-  color: #2c3e50;
-  font-size: 18px;
+  margin: 0 0 8px 0;
+  color: #000;
+  font-size: 13px;
   font-weight: 600;
 }
 
 .city-info, .report-info {
-  background-color: #e9ecef;
-  padding: 15px;
-  border-radius: 6px;
-  margin-bottom: 20px;
+  background-color: #fff;
+  padding: 10px;
+  border-radius: 12px;
+  margin-bottom: 10px;
+  border: 1px solid #e5e7eb;
 }
 
 .city-info p, .report-info p {
-  margin: 5px 0;
-  color: #495057;
-  font-size: 14px;
+  margin: 4px 0;
+  color: #000;
+  font-size: 12px;
 }
 
 .city-info strong, .report-info strong {
-  color: #2c3e50;
+  color: #000;
 }
 
 .table-container {
-  margin: 20px 0;
+  margin: 10px 0;
   overflow-x: auto;
 }
 
 .data-table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 14px;
-  background-color: white;
-  border-radius: 6px;
+  font-size: 12px;
+  background-color: #fff;
+  border-radius: 12px;
   overflow: hidden;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  border: 1px solid #e5e7eb;
 }
 
 .data-table th,
 .data-table td {
-  padding: 12px;
+  padding: 8px 10px;
   text-align: left;
-  border-bottom: 1px solid #e1e5e9;
+  border-bottom: 1px solid #e5e7eb;
+  color: #000;
 }
 
 .data-table th {
-  background-color: #007bff;
-  color: white;
+  background-color: #f3f4f6;
+  color: #000;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 11px;
 }
 
 .data-table tr:hover {
-  background-color: #f8f9fa;
+  background-color: #f9fafb;
 }
 
 .data-table tr:nth-child(even) {
-  background-color: #f8f9fa;
+  background-color: #fafafa;
 }
 
 .summary-card {
   display: inline-block;
-  margin: 10px;
-  padding: 20px;
-  min-width: 150px;
+  margin: 6px;
+  padding: 10px 12px;
+  min-width: 90px;
   text-align: center;
-  background-color: white;
-  border-radius: 8px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  background-color: #fff;
+  border-radius: 12px;
+  border: 1px solid #e5e7eb;
 }
 
 .card-content h3 {
-  margin: 0 0 10px 0;
-  font-size: 14px;
+  margin: 0 0 4px 0;
+  font-size: 11px;
   font-weight: 500;
-  color: #2c3e50;
+  color: #000;
 }
 
 .card-value {
-  font-size: 24px;
-  font-weight: 700;
-  margin: 10px 0;
-  color: #007bff;
+  font-size: 16px;
+  font-weight: 600;
+  margin: 4px 0;
+  color: #000;
 }
 
 .card-subtitle {
-  font-size: 12px;
-  color: #6c757d;
+  font-size: 10px;
+  color: #374151;
 }
 
 .summary {
-  margin-top: 15px;
-  padding: 10px;
-  background-color: #d4edda;
-  border: 1px solid #c3e6cb;
-  border-radius: 4px;
-  color: #155724;
-  font-size: 14px;
+  margin-top: 10px;
+  padding: 8px;
+  background-color: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  color: #000;
+  font-size: 12px;
   text-align: center;
 }
 
 .response-content {
-  background-color: white;
-  padding: 15px;
-  border-radius: 6px;
-  border: 1px solid #dee2e6;
+  background-color: #fff;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid #e5e7eb;
 }
 
 .response-content p {
-  margin: 8px 0;
-  color: #495057;
-  line-height: 1.6;
+  margin: 6px 0;
+  color: #000;
+  line-height: 1.5;
+  font-size: 12px;
 }
 
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 15px;
-  margin: 20px 0;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 8px;
+  margin: 10px 0;
 }
 
 .kpi-item {
-  background-color: white;
-  padding: 15px;
-  border-radius: 6px;
+  background-color: #fff;
+  padding: 10px;
+  border-radius: 12px;
   text-align: center;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  border: 1px solid #e5e7eb;
 }
 
 .kpi-label {
-  font-size: 12px;
-  color: #6c757d;
-  margin-bottom: 5px;
+  font-size: 10px;
+  color: #374151;
+  margin-bottom: 2px;
 }
 
 .kpi-value {
-  font-size: 20px;
-  font-weight: 700;
-  color: #2c3e50;
-  margin-bottom: 5px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #000;
+  margin-bottom: 2px;
 }
 
 .kpi-change {
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 600;
 }
 
-.kpi-change.positive { color: #28a745; }
-.kpi-change.negative { color: #dc3545; }
+.kpi-change.positive { color: #16a34a; }
+.kpi-change.negative { color: #dc2626; }
 
 .chart-container {
-  margin: 20px 0;
-  padding: 15px;
-  background-color: white;
-  border-radius: 6px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  margin: 10px 0;
+  padding: 10px;
+  background-color: #fff;
+  border-radius: 12px;
+  border: 1px solid #e5e7eb;
 }
 
 .chart-container h4 {
-  margin: 0 0 15px 0;
-  color: #2c3e50;
-  font-size: 16px;
+  margin: 0 0 8px 0;
+  color: #000;
+  font-size: 12px;
   font-weight: 600;
 }
 </style>
@@ -2996,7 +2998,7 @@ export const getStoresList = async (params = {}) => {
                     <td>${store.contactPerson || 'N/A'}</td>
                     <td>${store.contactEmail || 'N/A'}</td>
                     <td>${store.contactPhone || 'N/A'}</td>
-                    <td>${store.isActive ? '<span style="color: #10b981;">Active</span>' : '<span style="color: #ef4444;">Inactive</span>'}</td>
+                    <td><span style="color: ${store.isActive ? '#10b981' : '#ef4444'}; font-weight: 600;">${store.isActive ? 'Active' : 'Inactive'}</span></td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -5406,7 +5408,7 @@ export const getYarnCatalog = async (params = {}) => {
                   <td>${yarn.pantonName || 'N/A'}</td>
                   <td>${yarn.gst !== undefined && yarn.gst !== null ? `${yarn.gst}%` : 'N/A'}</td>
                   <td>${yarn.minQuantity !== undefined && yarn.minQuantity !== null ? yarn.minQuantity.toLocaleString() : 'N/A'}</td>
-                  <td><span style="background: ${yarn.status === 'active' ? '#d4edda' : yarn.status === 'inactive' ? '#f8d7da' : '#fff3cd'}; padding: 4px 8px; border-radius: 4px; font-weight: 500; text-transform: capitalize;">${yarn.status || 'N/A'}</span></td>
+                  <td><span style="background: ${yarn.status === 'active' ? '#d4edda' : yarn.status === 'inactive' ? '#f8d7da' : '#fff3cd'}; color: ${yarn.status === 'active' ? '#155724' : yarn.status === 'inactive' ? '#721c24' : '#856404'}; padding: 4px 8px; border-radius: 6px; font-weight: 600; text-transform: capitalize;">${yarn.status || 'N/A'}</span></td>
                 </tr>
               `).join('')}
             </tbody>
@@ -9705,7 +9707,7 @@ export const getYarnTypes = async (params = {}) => {
                     <td><strong>${type.name || 'N/A'}</strong></td>
                     <td>${detailsList}</td>
                     <td>${type.createdAt ? new Date(type.createdAt).toLocaleString() : 'N/A'}</td>
-                    <td><span style="background: ${type.status === 'active' ? '#d4edda' : '#f8d7da'}; padding: 4px 8px; border-radius: 4px; font-weight: 500; text-transform: capitalize;">${type.status || 'N/A'}</span></td>
+                    <td><span style="background: ${type.status === 'active' ? '#d4edda' : '#f8d7da'}; color: ${type.status === 'active' ? '#155724' : '#721c24'}; padding: 4px 8px; border-radius: 6px; font-weight: 600; text-transform: capitalize;">${type.status || 'N/A'}</span></td>
                   </tr>
                 `;
                 }).join('')}
@@ -9831,7 +9833,7 @@ export const getYarnCountSizes = async (params = {}) => {
                   <tr>
                     <td><strong>${size.name || 'N/A'}</strong></td>
                     <td>${size.createdAt ? new Date(size.createdAt).toLocaleString() : 'N/A'}</td>
-                    <td><span style="background: ${size.status === 'active' ? '#d4edda' : '#f8d7da'}; padding: 4px 8px; border-radius: 4px; font-weight: 500; text-transform: capitalize;">${size.status || 'N/A'}</span></td>
+                    <td><span style="background: ${size.status === 'active' ? '#d4edda' : '#f8d7da'}; color: ${size.status === 'active' ? '#155724' : '#721c24'}; padding: 4px 8px; border-radius: 6px; font-weight: 600; text-transform: capitalize;">${size.status || 'N/A'}</span></td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -9921,7 +9923,7 @@ export const getYarnColors = async (params = {}) => {
                     <td>${color.colorCode || 'N/A'}</td>
                     <td>${color.pantoneName || 'N/A'}</td>
                     <td>${color.createdAt ? new Date(color.createdAt).toLocaleString() : 'N/A'}</td>
-                    <td><span style="background: ${color.status === 'active' ? '#d4edda' : '#f8d7da'}; padding: 4px 8px; border-radius: 4px; font-weight: 500; text-transform: capitalize;">${color.status || 'N/A'}</span></td>
+                    <td><span style="background: ${(color.status || '').toString().toLowerCase() === 'active' ? '#d4edda' : '#f8d7da'}; color: ${(color.status || '').toString().toLowerCase() === 'active' ? '#155724' : '#721c24'}; padding: 4px 8px; border-radius: 6px; font-weight: 600; text-transform: capitalize;">${color.status || 'N/A'}</span></td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -10045,7 +10047,7 @@ export const getYarnBlends = async (params = {}) => {
                   <tr>
                     <td><strong>${blend.name || 'N/A'}</strong></td>
                     <td>${blend.createdAt ? new Date(blend.createdAt).toLocaleString() : 'N/A'}</td>
-                    <td><span style="background: ${blend.status === 'active' ? '#d4edda' : '#f8d7da'}; padding: 4px 8px; border-radius: 4px; font-weight: 500; text-transform: capitalize;">${blend.status || 'N/A'}</span></td>
+                    <td><span style="background: ${blend.status === 'active' ? '#d4edda' : '#f8d7da'}; color: ${blend.status === 'active' ? '#155724' : '#721c24'}; padding: 4px 8px; border-radius: 6px; font-weight: 600; text-transform: capitalize;">${blend.status || 'N/A'}</span></td>
                   </tr>
                 `).join('')}
               </tbody>
