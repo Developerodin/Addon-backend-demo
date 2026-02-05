@@ -38,7 +38,9 @@ export const handleTelegramWebhook = catchAsync(async (req, res) => {
   }
 
   try {
-    const { summary } = await messengerSummaryService.getSummary(text);
+    // Per-chat session so multi-turn flows (edit PO, create PO) work in Telegram
+    const sessionId = `telegram_${chatId}`;
+    const { summary } = await messengerSummaryService.getSummary(text, { sessionId });
     await bot.sendMessage(chatId, summary || 'No response.', { parse_mode: undefined });
   } catch (err) {
     logger.error('Telegram webhook chatbot error:', err);
