@@ -112,10 +112,25 @@ function summarizeAiToolHtml(html) {
     if (title) parts.push(title);
   }
 
-  // Extract <p class="summary">...</p> (human-readable summary)
-  const summaryMatch = cleanHtml.match(/<p\s+class="summary"[^>]*>([\s\S]*?)<\/p>/i);
-  if (summaryMatch) {
-    parts.push(stripHtml(summaryMatch[1], 600).trim());
+  // Extract all <p class="summary">...</p> (wizard steps often have several: list + "Reply with number")
+  const summaryRegex = /<p\s+class="summary"[^>]*>([\s\S]*?)<\/p>/gi;
+  const summaryParts = [];
+  let summaryMatch;
+  while ((summaryMatch = summaryRegex.exec(cleanHtml)) !== null) {
+    const text = stripHtml(summaryMatch[1], 600).trim();
+    if (text && !summaryParts.includes(text)) summaryParts.push(text);
+  }
+  if (summaryParts.length > 0) {
+    parts.push(summaryParts.join('\n'));
+  }
+
+  // For place-order wizard: capture "Reply with the number or name" from any <p> (may contain <strong> etc.)
+  const replyPMatch = cleanHtml.match(/<p[^>]*>([\s\S]*?reply with[\s\S]*?)<\/p>/i);
+  if (replyPMatch) {
+    const instruction = stripHtml(replyPMatch[1], 150).trim();
+    if (instruction && !parts.some((p) => p.includes(instruction))) {
+      parts.push(instruction);
+    }
   }
 
   // Extract kpi-item: kpi-label + kpi-value as "Label: Value" (first 8)
@@ -194,6 +209,10 @@ export function getResponseText(result, maxLength = 12000) {
  */
 export async function getSummary(question, options = {}) {
   const result = await faqService.askQuestion(question, options);
+  // Persist assistant reply to session so next Telegram message has full conversation (multi-turn purchase, edit PO, etc.)
+  if (options.sessionId && result) {
+    faqService.persistSessionConversationFromResponse(options.sessionId, question, result);
+  }
   const summary = summarizeForMessenger(result);
   return {
     summary: summary.length > TELEGRAM_MAX_LENGTH ? summary.slice(0, TELEGRAM_MAX_LENGTH - 20) + '…' : summary,
