@@ -14,6 +14,10 @@ const askQuestion = {
     sessionId: Joi.string().optional().max(128).trim(),
     context: Joi.object().keys({
       lastOrderWizardPrompt: Joi.string().optional(),
+      matchingSuppliers: Joi.array().items(Joi.object().keys({
+        id: Joi.string().required(),
+        brandName: Joi.string().optional().allow('')
+      })).optional(),
       awaitingFollowUp: Joi.string().optional().max(64),
       editOrderPo: Joi.object().keys({
         purchaseOrderId: Joi.string().required(),

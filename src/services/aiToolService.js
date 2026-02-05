@@ -809,7 +809,7 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
       if (jsonMatch) {
         const intent = JSON.parse(jsonMatch[0]);
         
-        // Validate: action is required; params may be null (e.g. createYarnPurchaseOrder opens wizard)
+        // Validate: action is required; params may be null (e.g. createYarnPurchaseOrder returns numbered list / chat flow)
         if (intent.action) {
           return {
             action: intent.action,
@@ -1092,14 +1092,14 @@ export const detectIntent = async (question, options = {}) => {
         pattern: /^SUPPLIER_SELECTED:(.+)$/i,
         action: 'createYarnPurchaseOrder',
         extractParams: (match) => ({ preSelectedSupplierId: match[1].trim(), showSupplierList: true }),
-        description: 'Open wizard with pre-selected supplier'
+        description: 'Start place-order flow with pre-selected supplier (numbered list)'
       },
       // YARN PURCHASE ORDER: "Show supplier list" when user chose to see list (must be before generic place order)
       {
         pattern: /show\s+(?:me\s+)?(?:the\s+)?supplier\s+list|supplier\s+list|see\s+(?:the\s+)?supplier\s+list|option\s*2|choose\s+from\s+(?:the\s+)?list|show\s+list/i,
         action: 'createYarnPurchaseOrder',
         extractParams: () => ({ showSupplierList: true }),
-        description: 'Show supplier list for place order wizard'
+        description: 'Show supplier list for place order (numbered list)'
       },
       // YARN PURCHASE ORDER: "buy [yarn] from [supplier]" — capture both so we ask only quantity/rate, no supplier list
       {
@@ -7964,10 +7964,10 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
 
 /**
  * Create yarn purchase order (place new order) from agent params
- * When params are empty, returns orderWizardData (suppliers + yarn catalog) for frontend wizard.
+ * When params are empty, returns numbered list (choose_supplier / disambiguate_supplier) or yarn list (choose_yarn_from_supplier).
  * Expects: poNumber, supplierName, poItems: [{ yarnName, quantity, rate, sizeCount?, shadeCode?, gstRate? }], notes?
  * @param {Object} params
- * @returns {Promise<string|{html: string, orderWizardData: Object}>} HTML or wizard payload
+ * @returns {Promise<string|{html: string, orderWizardPrompt?: string, matchingSuppliers?: Array, placeOrderContext?: Object}>} HTML and prompt/context for chat flow
  */
 
 /**
@@ -8282,7 +8282,7 @@ export const createYarnPurchaseOrder = async (params = {}) => {
     const hasOrderDetails = poNumber && (supplierName || supplierId) && Array.isArray(rawItems) && rawItems.length > 0;
 
     if (!hasOrderDetails) {
-      // "Buy [yarn] from [supplier]" — resolve supplier, validate yarn(s); if all items have qty+rate, create order directly; else return wizard
+      // "Buy [yarn] from [supplier]" — resolve supplier, validate yarn(s); if all items have qty+rate, create order directly; else return numbered-list flow
       const initialItems = Array.isArray(rawItems) ? rawItems : (rawItems && typeof rawItems === 'object' ? [rawItems] : []);
       const yarnOnlyItems = initialItems.filter((it) => (it.yarnName || it.yarn_name || it.name || '').trim());
       const allItemsHaveQtyAndRate = yarnOnlyItems.length > 0 && yarnOnlyItems.every(
@@ -8497,19 +8497,29 @@ export const createYarnPurchaseOrder = async (params = {}) => {
           brandName: s.brandName || s.name || 'Unknown'
         }));
         const yarnNamesList = catalogYarns.map((y) => y.yarnName).join(', ');
-        const multiVariantNote = catalogYarns.length > yarnOnlyItems.length
-          ? ' <strong>Same product with different size/count — choose the variant you need below.</strong>'
-          : '';
-        const introHtml = `<p>Got it — you want <strong>${yarnNamesList}</strong> from <strong>${supplierBrandName}</strong>.</p>${multiVariantNote}<p>Enter quantity, rate (₹/unit), and other details below — no need to pick from the supplier list.</p>`;
-        const initialPoItems = yarnOnlyItems.map((it) => ({
-          quantity: it.quantity ?? 0,
-          rate: it.rate ?? 0,
-          gstRate: it.gstRate ?? 0,
-          sizeCount: it.sizeCount || undefined
-        }));
+        // Numbered-list flow: show yarn list and continue in chat (no wizard). Pre-fill collectedItems from initial request.
+        const supplierForYarns = await supplierService.getSupplierById(supplierId);
+        const yarnNames = supplierForYarns?.yarnDetails?.length
+          ? [...new Set((supplierForYarns.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+          : [];
+        const pageSize = 5;
+        const slice = yarnNames.slice(0, pageSize);
+        const hasMore = yarnNames.length > pageSize;
+        const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+        const collectedItems = yarnOnlyItems.map((it) => ({
+          yarnName: it.yarnName || it.name || 'Unknown',
+          quantity: Number(it.quantity) || 0,
+          rate: Number(it.rate) || 0,
+          gstRate: Number(it.gstRate) ?? 0
+        })).filter((it) => it.yarnName && (it.quantity > 0 || it.rate > 0));
+        const introHtml = generateHTMLResponse(
+          'Choose yarn',
+          `<p>You want <strong>${yarnNamesList}</strong> from <strong>${supplierBrandName}</strong>.</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of a yarn to add, or <strong>done</strong> to place order${collectedItems.length > 0 ? ` (you already have ${collectedItems.length} item(s)).` : '.'}</p>`
+        );
         return {
           html: introHtml,
-          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogYarns, nextPoNumber, preSelectedSupplierId: supplierId, initialPoItems }
+          orderWizardPrompt: 'choose_yarn_from_supplier',
+          placeOrderContext: { supplierId, supplierName: supplierBrandName, yarnNames, page: 1, collectedItems }
         };
       }
 
@@ -8805,63 +8815,23 @@ export const createYarnPurchaseOrder = async (params = {}) => {
         };
       }
 
-      // If user chose "Show supplier list" (no pre-selected), return full wizard data with per-supplier yarn lists so frontend can filter
+      // If user chose "Show supplier list" (no pre-selected), return numbered list of suppliers (same as choose_supplier / disambiguate_supplier flow)
       if (showSupplierList) {
-        const [suppliersResult, catalogResult, nextPoNumber] = await Promise.all([
-          supplierService.querySuppliers({}, { limit: 200, page: 1 }),
-          yarnCatalogService.queryYarnCatalogs({}, { limit: 500, page: 1 }),
-          yarnPurchaseOrderService.getNextSuggestedPoNumber()
-        ]);
+        const suppliersResult = await supplierService.querySuppliers({}, { limit: 200, page: 1 });
         const suppliers = suppliersResult?.results ?? suppliersResult ?? [];
-        const yarnCatalog = catalogResult?.results ?? catalogResult ?? [];
-        const suppliersList = suppliers.map((s) => ({
-          id: s._id?.toString?.() || s.id,
+        const matchingSuppliers = suppliers.map((s) => ({
+          id: (s._id || s.id)?.toString?.() || s.id,
           brandName: s.brandName || s.name || 'Unknown'
         }));
-        const suppliersWithYarns = suppliers.map((s) => {
-          const yarnNames = (s.yarnDetails || [])
-            .map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim())
-            .filter(Boolean);
-          return {
-            id: (s._id || s.id)?.toString?.() || '',
-            brandName: s.brandName || s.name || 'Unknown',
-            yarnNames: [...new Set(yarnNames)]
-          };
-        });
-        const catalogList = yarnCatalog.map((y) => {
-        const countSizes = [];
-        if (y.countSize && (y.countSize._id || y.countSize.id)) {
-          const id = (y.countSize._id || y.countSize.id).toString?.() || y.countSize._id || y.countSize.id;
-          const name = y.countSize.name || id;
-          if (!countSizes.some((cs) => cs.id === id)) countSizes.push({ id, name });
-        }
-        const subtypeCountSizes = y.yarnSubtype?.countSize || [];
-        if (Array.isArray(subtypeCountSizes)) {
-          subtypeCountSizes.forEach((cs) => {
-            const id = (cs?._id || cs?.id)?.toString?.() || cs;
-            const name = (typeof cs === 'object' && (cs?.name || cs?.label)) || id;
-            if (id && !countSizes.some((c) => c.id === (id.toString?.() || id))) {
-              countSizes.push({ id: id.toString?.() || id, name });
-            }
-          });
-        }
-        let shadeCode = (y.pantonShade || y.pantonName || (y.colorFamily?.name || '')).trim() || undefined;
-        if (!shadeCode && (y.yarnName || y.name)) {
-          const nameStr = (y.yarnName || y.name || '').trim();
-          const parts = nameStr.split('-').map((p) => p.trim()).filter(Boolean);
-          if (parts.length >= 2) shadeCode = parts[1] || parts[2] || undefined;
-        }
+        const numberedList = matchingSuppliers.map((s, i) => `${i + 1}. ${s.brandName}`).join('<br/>');
+        const html = generateHTMLResponse(
+          'Choose supplier',
+          `<p>Reply with the <strong>number</strong> (1–${matchingSuppliers.length}) or supplier name to continue:</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${numberedList}</p>`
+        );
         return {
-          id: y._id?.toString?.() || y.id,
-          yarnName: y.yarnName || y.name || 'Unknown',
-          countSizes: countSizes.length ? countSizes : undefined,
-          shadeCode
-        };
-      });
-        const introHtml = '<p>Select a supplier and yarn items below to place your order. Choose one supplier, then select yarns and enter quantity and rate for each.</p>';
-        return {
-          html: introHtml,
-          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogList, nextPoNumber, suppliersWithYarns }
+          html,
+          orderWizardPrompt: 'disambiguate_supplier',
+          matchingSuppliers
         };
       }
 
@@ -9987,7 +9957,7 @@ export const getYarnSuppliers = async (params = {}) => {
         <p class="summary" style="margin: 0.4em 0;">Total: <strong>${totalCount}</strong> suppliers${suppliers.totalResults > suppliers.results.length ? ` (showing ${suppliers.results.length} of ${suppliers.totalResults})` : ''} • <strong>${activeCount}</strong> active • <strong>${brands.length}</strong> unique brands.</p>
         <p class="summary" style="margin: 0.6em 0;"><strong>Numbered list:</strong></p>
         <p class="summary" style="margin: 0.4em 0; padding-left: 1em; line-height: 1.6;">${numberedList}</p>
-        <p class="summary" style="margin-top: 0.8em;">You can place an order by saying <strong>place order</strong> and then typing a supplier name from this list, or <strong>show supplier list</strong> to choose in the wizard.</p>
+        <p class="summary" style="margin-top: 0.8em;">You can place an order by saying <strong>place order</strong> and then typing a supplier name from this list, or <strong>show supplier list</strong> to pick by number.</p>
       </div>
     `;
     

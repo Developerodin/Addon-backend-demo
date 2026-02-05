@@ -77,9 +77,9 @@ export const querySales = async (filter, options) => {
       delete filter.category;
     }
     
-    // Resolve string/number identifiers to ObjectIds
-    if (filter.plant && !Array.isArray(filter.plant)) {
-      // Convert to string for consistent lookup
+    // Resolve string/number identifiers to ObjectIds (skip when plant is already a query e.g. { $in: [...] } from city filter)
+    const plantIsQuery = filter.plant && typeof filter.plant === 'object' && !Array.isArray(filter.plant) && (filter.plant.$in != null || filter.plant.$eq != null);
+    if (filter.plant && !Array.isArray(filter.plant) && !plantIsQuery) {
       const storeId = String(filter.plant).trim();
       const store = await Store.findOne({ storeId: storeId }).select('_id').lean();
       if (!store) {

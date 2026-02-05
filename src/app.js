@@ -1,4 +1,5 @@
 import express from 'express';
+import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import xss  from 'xss-clean';
 import mongoSanitize from 'express-mongo-sanitize';
@@ -39,6 +40,9 @@ app.use(express.urlencoded({
   limit: '50mb' // Increased limit for form data
 }));
 
+// parse cookies (for chat session management)
+app.use(cookieParser());
+
 // sanitize request data
 app.use(xss());
 app.use(mongoSanitize());
@@ -46,9 +50,9 @@ app.use(mongoSanitize());
 // gzip compression
 app.use(compression());
 
-// enable cors
-app.use(cors());
-app.options('*', cors());
+// enable cors (credentials: true so chat session cookie is sent from frontend)
+app.use(cors({ origin: true, credentials: true }));
+app.options('*', cors({ origin: true, credentials: true }));
 
 // jwt authentication
 app.use(passport.initialize());

@@ -1,7 +1,11 @@
 import httpStatus from 'http-status';
+import { v4 as uuidv4 } from 'uuid';
 import catchAsync from '../utils/catchAsync.js';
 import faqService from '../services/faq.service.js';
 import * as messengerSummaryService from '../services/messengerSummary.service.js';
+
+const CHAT_SESSION_COOKIE = 'chat_session';
+const CHAT_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
  * Train FAQ with embeddings
@@ -30,27 +34,48 @@ const trainFaq = catchAsync(async (req, res) => {
 });
 
 /**
- * Ask a question and get relevant answer
+ * Ask a question and get relevant answer.
+ * Session and context window (conversation history) are managed in backend via cookie (chat_session).
  * @route POST /v1/faq/ask
- * @param {Object} req.body - {question: string}
+ * @param {Object} req.body - { question: string } (context and conversationHistory are stored per session in backend)
  * @returns {Object} 200 - Relevant answer with metadata
  */
 const askQuestion = catchAsync(async (req, res) => {
-  const { question, sessionId, context, conversationHistory } = req.body;
-  
+  const { question } = req.body;
+
+  // Session: read from cookie (backend-managed); create and set cookie if missing
+  let sessionId = req.cookies?.[CHAT_SESSION_COOKIE];
+  if (!sessionId || typeof sessionId !== 'string') {
+    sessionId = uuidv4();
+    res.cookie(CHAT_SESSION_COOKIE, sessionId, {
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: CHAT_SESSION_MAX_AGE_MS,
+      path: '/'
+    });
+  }
+
   if (!question || typeof question !== 'string' || question.trim().length === 0) {
     return res.status(httpStatus.BAD_REQUEST).json({
       status: 'error',
       message: 'Question is required and must be a non-empty string'
     });
   }
-  
-  const result = await faqService.askQuestion(question.trim(), {
-    sessionId: sessionId || undefined,
-    context: context || undefined,
-    conversationHistory: conversationHistory || undefined
+
+  const trimmedQuestion = question.trim();
+
+  // Context window in backend: append user message to session history, then pass stored history into askQuestion
+  faqService.appendUserMessageToSession(sessionId, trimmedQuestion);
+  const conversationHistory = faqService.getSessionConversationHistory(sessionId);
+
+  const result = await faqService.askQuestion(trimmedQuestion, {
+    sessionId,
+    conversationHistory
   });
-  
+
+  // Persist assistant response to session conversation history (context window)
+  faqService.persistSessionConversationFromResponse(sessionId, trimmedQuestion, result);
+
   res.status(httpStatus.OK).json({
     status: 'success',
     data: result
