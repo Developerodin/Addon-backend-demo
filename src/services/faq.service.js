@@ -30,6 +30,11 @@ const openai = new OpenAI({
  */
 const addNaturalReply = async (returnObj, userMessage, opts = {}) => {
   try {
+    // Use data-driven intro when provided (e.g. getTopCitiesBySales) to avoid GPT hallucinating (e.g. "New York")
+    if (opts.dataDrivenMessage) {
+      returnObj.conversationalMessage = opts.dataDrivenMessage;
+      return returnObj;
+    }
     const msg = await aiToolService.generateNaturalAgentReply(userMessage, opts);
     if (msg) returnObj.conversationalMessage = msg;
   } catch (e) {
@@ -60,7 +65,8 @@ const persistAgentFlowIfNeeded = (sessionId, out) => {
     });
     return;
   }
-  if (out.orderWizardPrompt === 'disambiguate_supplier' && out.matchingSuppliers?.length > 0) {
+  // Both choose_supplier (initial list) and disambiguate_supplier (multiple matches) show a numbered supplier list — persist so "2" = supplier #2
+  if ((out.orderWizardPrompt === 'disambiguate_supplier' || out.orderWizardPrompt === 'choose_supplier') && out.matchingSuppliers?.length > 0) {
     aiToolService.setAgentFlowSession(sessionId, 'create_po', {
       lastOrderWizardPrompt: out.orderWizardPrompt,
       matchingSuppliers: out.matchingSuppliers
@@ -71,6 +77,82 @@ const persistAgentFlowIfNeeded = (sessionId, out) => {
     aiToolService.setAgentFlowSession(sessionId, 'edit_po', { awaitingFollowUp: out.awaitingFollowUp });
   }
 };
+
+// --- Session conversation store (context window in backend) ---
+const SESSION_CONVERSATION_MAX_TURNS = 20;
+/** @type {Map<string, Array<{ role: 'user' | 'assistant'; content: string }>>} */
+const sessionConversationStore = new Map();
+
+/**
+ * Append a user message to the session's conversation history (backend context window).
+ * @param {string} sessionId
+ * @param {string} userMessage
+ */
+export const appendUserMessageToSession = (sessionId, userMessage) => {
+  if (!sessionId || typeof userMessage !== 'string') return;
+  let arr = sessionConversationStore.get(sessionId);
+  if (!arr) {
+    arr = [];
+    sessionConversationStore.set(sessionId, arr);
+  }
+  arr.push({ role: 'user', content: userMessage.trim() });
+  // Keep only last N turns (each turn = user + assistant, so 2 * max)
+  while (arr.length > SESSION_CONVERSATION_MAX_TURNS * 2) arr.shift();
+};
+
+/**
+ * Get conversation history for a session (for GPT-style context in askQuestion).
+ * @param {string} sessionId
+ * @returns {Array<{ role: 'user' | 'assistant'; content: string }>}
+ */
+export const getSessionConversationHistory = (sessionId) => {
+  if (!sessionId) return [];
+  const arr = sessionConversationStore.get(sessionId);
+  return Array.isArray(arr) ? [...arr] : [];
+};
+
+/**
+ * After askQuestion returns, persist the assistant response into the session's conversation history.
+ * @param {string} sessionId
+ * @param {string} userMessage - The user message that triggered this response
+ * @param {Object} result - The result object from askQuestion (has content in response/html/conversationalMessage etc.)
+ */
+export const persistSessionConversationFromResponse = (sessionId, userMessage, result) => {
+  if (!sessionId || !result) return;
+  let arr = sessionConversationStore.get(sessionId);
+  if (!arr) {
+    arr = [];
+    sessionConversationStore.set(sessionId, arr);
+  }
+  // Ensure last entry is the user message we just processed (might already be added by appendUserMessageToSession)
+  const lastUser = arr.length > 0 && arr[arr.length - 1].role === 'user' ? arr[arr.length - 1].content : null;
+  if (lastUser !== userMessage?.trim()) {
+    arr.push({ role: 'user', content: (userMessage || '').toString().trim() });
+  }
+  // Store a sentinel for ai_tool HTML responses so conversation fallback recognizes "numeric reply = supplier choice"
+  const isAiToolWithData = result.type === 'ai_tool' && (result.response || result.html);
+  const assistantText = isAiToolWithData
+    ? '(Response with data)'
+    : (result.conversationalMessage || result.response || result.html || '').toString().trim().slice(0, 2000) || '(Response)';
+  arr.push({ role: 'assistant', content: assistantText });
+  while (arr.length > SESSION_CONVERSATION_MAX_TURNS * 2) arr.shift();
+};
+
+/** Central disambiguation when intent is null or unclear — same response everywhere so the agent handles ambiguity consistently. */
+const getGlobalDisambiguationResponse = () => ({
+  type: 'faq',
+  response: "I didn't quite get that. You can ask me for: **Sales** (e.g. \"sales from Delhi\", \"sales data highest to lowest\"), **Raw materials** (e.g. \"finished goods in raw material\", \"goods Packing Material\"), **Products** (e.g. \"socks\", \"products in socks category\"), **Yarn** (inventory, orders, catalog, suppliers), **Chat** (e.g. \"what have we discussed\"), or **Orders** (edit order PO-XXX, place order). What do you need?",
+  confidence: 0.5,
+  source: 'disambiguation',
+  clarification: true,
+  suggestions: [
+    'Sales from Delhi',
+    'Finished goods in raw material',
+    'Show me socks (products)',
+    'Yarn inventory',
+    'What have we discussed?'
+  ]
+});
 
 /**
  * Generate embedding for text using OpenAI
@@ -407,70 +489,10 @@ const fetchContextData = async (category) => {
   }
 };
 
-// --- Context window (conversation history) stored per session in backend ---
-const CONVERSATION_HISTORY_MAX_TURNS = 10;
-const CONVERSATION_HISTORY_MAX_ASSISTANT_CHARS = 1500;
-const sessionConversationStore = new Map(); // sessionId -> { conversationHistory: Array<{ role, content }> }
-
-/**
- * Get conversation history for a session (for context window). Returns empty array if none.
- * @param {string} sessionId
- * @returns {Array<{ role: 'user' | 'assistant'; content: string }>}
- */
-export const getSessionConversationHistory = (sessionId) => {
-  if (!sessionId) return [];
-  const entry = sessionConversationStore.get(sessionId);
-  return Array.isArray(entry?.conversationHistory) ? [...entry.conversationHistory] : [];
-};
-
-/**
- * Append user message to session's conversation history (call before askQuestion).
- * @param {string} sessionId
- * @param {string} userMessage
- * @returns {Array<{ role: 'user' | 'assistant'; content: string }>} Updated history including the new user message
- */
-export const appendUserMessageToSession = (sessionId, userMessage) => {
-  if (!sessionId || typeof userMessage !== 'string') return getSessionConversationHistory(sessionId);
-  let entry = sessionConversationStore.get(sessionId);
-  if (!entry) {
-    entry = { conversationHistory: [] };
-    sessionConversationStore.set(sessionId, entry);
-  }
-  entry.conversationHistory.push({ role: 'user', content: userMessage.trim() });
-  // Cap at max turns (keep last N turns)
-  const maxMessages = CONVERSATION_HISTORY_MAX_TURNS * 2;
-  if (entry.conversationHistory.length > maxMessages) {
-    entry.conversationHistory = entry.conversationHistory.slice(-maxMessages);
-  }
-  return [...entry.conversationHistory];
-};
-
-/**
- * Append assistant response to session's conversation history (call after askQuestion returns).
- * @param {string} sessionId
- * @param {string} userMessage - The user message that triggered this response (for ordering)
- * @param {Object} responseResult - The result object returned from askQuestion (has response, conversationalMessage, etc.)
- */
-export const persistSessionConversationFromResponse = (sessionId, userMessage, responseResult) => {
-  if (!sessionId || !responseResult) return;
-  let entry = sessionConversationStore.get(sessionId);
-  if (!entry) {
-    entry = { conversationHistory: [] };
-    sessionConversationStore.set(sessionId, entry);
-  }
-  const content = (responseResult.conversationalMessage || (responseResult.response ? '(Response with data)' : '(Response)') || '(Response)').toString();
-  const truncated = content.length > CONVERSATION_HISTORY_MAX_ASSISTANT_CHARS ? content.slice(0, CONVERSATION_HISTORY_MAX_ASSISTANT_CHARS) : content;
-  entry.conversationHistory.push({ role: 'assistant', content: truncated });
-  const maxMessages = CONVERSATION_HISTORY_MAX_TURNS * 2;
-  if (entry.conversationHistory.length > maxMessages) {
-    entry.conversationHistory = entry.conversationHistory.slice(-maxMessages);
-  }
-};
-
 /**
  * Ask question with AI tool calling and FAQ vector search
  * @param {string} question - User's question
- * @param {Object} options - { sessionId?, context?, conversationHistory? } (context/conversationHistory normally from session store)
+ * @param {Object} options - { sessionId?: string } for confirmation guardrails
  * @returns {Promise<Object>} Response object
  */
 export const askQuestion = async (question, options = {}) => {
@@ -479,13 +501,19 @@ export const askQuestion = async (question, options = {}) => {
       throw new ApiError(400, 'Question is required and must be a string');
     }
     
-    const normalizedQuestion = question.trim();
+    // Global typo normalization so intent and disambiguation work across all flows (not just a few components)
+    const normalizedQuestion = aiToolService.normalizeTyposForAgent(question.trim());
     if (normalizedQuestion.length === 0) {
       throw new ApiError(400, 'Question cannot be empty');
     }
 
     let { sessionId, context, conversationHistory } = options;
     context = context && typeof context === 'object' ? { ...context } : {};
+    // Use backend session conversation store when no history provided. Read history BEFORE appending current message so numeric-reply disambiguate (e.g. "3" = supplier choice) can use previous turn.
+    if ((!conversationHistory || !Array.isArray(conversationHistory) || conversationHistory.length === 0) && sessionId) {
+      conversationHistory = getSessionConversationHistory(sessionId);
+    }
+    const historyBeforeCurrentMessage = conversationHistory ? [...conversationHistory] : [];
 
     // Merge session-stored flow context so agent stays in the same flow (e.g. edit PO add-item) and doesn't fetch unrelated data when client didn't send context
     if (sessionId) {
@@ -536,23 +564,46 @@ export const askQuestion = async (question, options = {}) => {
       }
     }
 
+    // Early sales intent: if message clearly asks for sales data, run detectIntent and handle getSalesData before any yarn/purchase flow (so "sales from Delhi" is never interpreted as supplier)
+    const looksLikeSalesRequest = /\bsales\b/i.test(normalizedQuestion) && /\b(?:data|from|in|for|show|list|records|me)\b/i.test(normalizedQuestion);
+    if (looksLikeSalesRequest) {
+      const salesIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+      if (salesIntent?.action === 'getSalesData') {
+        try {
+          const salesResponse = await aiToolService.executeAITool(salesIntent, { sessionId });
+          const html = typeof salesResponse === 'string' ? salesResponse : (salesResponse?.html ?? '');
+          const out = {
+            type: 'ai_tool',
+            intent: salesIntent,
+            response: html,
+            confidence: salesIntent.confidence ?? 0.95,
+            source: 'ai_tool_service'
+          };
+          if (salesResponse?.salesDataPagination) out.salesDataPagination = salesResponse.salesDataPagination;
+          return await addNaturalReply(out, normalizedQuestion, { action: 'sales data', summary: 'Showing sales data.' });
+        } catch (err) {
+          console.warn('Early sales intent execution failed:', err?.message);
+        }
+      }
+    }
+
     // When user replied with a number (1, 2) after "which supplier?" — handle first so intent/conversation never see "1" as product or vague query
     const disambiguateStored = sessionId ? aiToolService.getAgentFlowSession(sessionId) : null;
     let disambiguatePrompt = context?.lastOrderWizardPrompt ?? disambiguateStored?.context?.lastOrderWizardPrompt;
     let disambiguateSuppliers = context?.matchingSuppliers ?? disambiguateStored?.context?.matchingSuppliers;
 
-    // Fallback: recover from conversation when session/context lost — last assistant asked "which supplier?" and user replied with a number
+    // Fallback: recover from conversation when session/context lost — last assistant asked "which supplier?" and user replied with a number (use history before current message so "3" is not yet in history)
     const isNumericReply = /^\d+$/.test(normalizedQuestion.trim());
-    if (isNumericReply && (!disambiguateSuppliers?.length || disambiguatePrompt !== 'disambiguate_supplier') && Array.isArray(conversationHistory) && conversationHistory.length >= 2) {
-      const lastAssistant = [...conversationHistory].reverse().find((m) => m.role === 'assistant');
+    if (isNumericReply && (!disambiguateSuppliers?.length || disambiguatePrompt !== 'disambiguate_supplier') && Array.isArray(historyBeforeCurrentMessage) && historyBeforeCurrentMessage.length >= 2) {
+      const lastAssistant = [...historyBeforeCurrentMessage].reverse().find((m) => m.role === 'assistant');
       const lastContent = (lastAssistant?.content || '').toString();
       // Previous user message that triggered the list (e.g. "purchase yarn from wampum") — the one before the last assistant
       let prevUserContent = '';
-      for (let i = conversationHistory.length - 1; i >= 0; i--) {
-        if (conversationHistory[i].role === 'assistant') {
+      for (let i = historyBeforeCurrentMessage.length - 1; i >= 0; i--) {
+        if (historyBeforeCurrentMessage[i].role === 'assistant') {
           for (let j = i - 1; j >= 0; j--) {
-            if (conversationHistory[j].role === 'user') {
-              prevUserContent = (conversationHistory[j].content || '').toString();
+            if (historyBeforeCurrentMessage[j].role === 'user') {
+              prevUserContent = (historyBeforeCurrentMessage[j].content || '').toString();
               break;
             }
           }
@@ -560,60 +611,95 @@ export const askQuestion = async (question, options = {}) => {
         }
       }
       const assistantAskedWhichSupplier = /which one do you mean|reply with the number\s*\(e\.g\.\s*1 or 2\)|matching\s+["']/i.test(lastContent) || /there are \d+ suppliers matching/i.test(lastContent);
-      const assistantWasDataResponse = /^\(Response with data\)$|^\(Response\)$/i.test(lastContent.trim()) && /\byarn\s+from\s+/i.test(prevUserContent);
+      // Last assistant was supplier list (Response with data) and user had any purchase/buy/order yarn message (e.g. "i wanna purchase yarn", "buy yarn from wampum")
+      const purchaseYarnInPrev = /\b(?:purchase|buy|order|get|want|wanna)\s+.*yarn|\byarn\s+from\s+/i.test(prevUserContent);
+      const assistantWasDataResponse = /^\(Response with data\)$|^\(Response\)$/i.test(lastContent.trim()) && purchaseYarnInPrev;
       const looksLikeSupplierDisambiguation = assistantAskedWhichSupplier || assistantWasDataResponse;
       if (looksLikeSupplierDisambiguation && prevUserContent) {
         const fromMatch = prevUserContent.match(/(?:purchase|buy|order|get)\s+(?:some\s+)?(?:.+?\s+)?yarn\s+from\s+(.+)/i) || prevUserContent.match(/yarn\s+from\s+(.+)/i);
-        const supplierQuery = fromMatch ? fromMatch[1].replace(/\s+in\s+colou?r\s+.+$/i, '').replace(/\s+something\s+(?:in\s+)?.+$/i, '').trim() : null;
-        if (supplierQuery && supplierQuery.length >= 2 && supplierQuery.length <= 80) {
-          try {
-            const refetch = await aiToolService.executeAITool(
-              { action: 'createYarnPurchaseOrder', params: { supplierQuery }, confidence: 0.95 },
-              { sessionId }
-            );
-            if (refetch?.orderWizardPrompt === 'disambiguate_supplier' && refetch?.matchingSuppliers?.length > 0) {
-              disambiguatePrompt = 'disambiguate_supplier';
-              disambiguateSuppliers = refetch.matchingSuppliers;
-            }
-          } catch (e) {
-            // ignore
+        const specificSupplier = fromMatch ? fromMatch[1].replace(/\s+in\s+colou?r\s+.+$/i, '').replace(/\s+something\s+(?:in\s+)?.+$/i, '').trim() : null;
+        // Use empty params to get full supplier list (choose_supplier); only use supplierQuery when user had named a supplier (e.g. "yarn from wampum")
+        const refetchParams = specificSupplier && specificSupplier.length >= 2 && specificSupplier.length <= 80
+          ? { supplierQuery: specificSupplier }
+          : {};
+        try {
+          const refetch = await aiToolService.executeAITool(
+            { action: 'createYarnPurchaseOrder', params: refetchParams, confidence: 0.95 },
+            { sessionId }
+          );
+          if (refetch?.matchingSuppliers?.length > 0 && (refetch?.orderWizardPrompt === 'disambiguate_supplier' || refetch?.orderWizardPrompt === 'choose_supplier')) {
+            disambiguatePrompt = refetch.orderWizardPrompt;
+            disambiguateSuppliers = refetch.matchingSuppliers;
           }
+        } catch (e) {
+          // ignore
         }
       }
     }
 
-    if (disambiguatePrompt === 'disambiguate_supplier' && disambiguateSuppliers?.length > 0 && isNumericReply) {
+    // Helper: show yarn list for chosen supplier (by id), used for both number and name selection
+    const showYarnListForSupplier = async (chosen) => {
+      if (!chosen?.id) return null;
+      if (sessionId) appendUserMessageToSession(sessionId, normalizedQuestion);
+      const aiResponse = await aiToolService.executeAITool(
+        { action: 'createYarnPurchaseOrder', params: { showSupplierList: true, preSelectedSupplierId: chosen.id }, confidence: 0.95 },
+        { sessionId }
+      );
+      const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+      const responsePayload = isPromptPayload
+        ? {
+            response: aiResponse.html,
+            orderWizardPrompt: aiResponse.orderWizardPrompt,
+            ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
+          }
+        : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+      const out = {
+        type: 'ai_tool',
+        intent: { action: 'createYarnPurchaseOrder', params: { preSelectedSupplierId: chosen.id } },
+        ...responsePayload,
+        confidence: 0.95,
+        source: 'ai_tool_service',
+        contextUsed: true
+      };
+      persistAgentFlowIfNeeded(sessionId, out);
+      return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Found supplier; choose yarn next.' });
+    };
+
+    // choose_supplier / disambiguate_supplier: user selects by NUMBER (e.g. "3") → show top 5 yarn items for that supplier
+    if ((disambiguatePrompt === 'choose_supplier' || disambiguatePrompt === 'disambiguate_supplier') && disambiguateSuppliers?.length > 0 && isNumericReply) {
       const num = parseInt(normalizedQuestion.trim(), 10);
       if (num >= 1 && num <= disambiguateSuppliers.length) {
         const chosen = disambiguateSuppliers[num - 1];
         try {
-          const aiResponse = await aiToolService.executeAITool(
-            { action: 'createYarnPurchaseOrder', params: { showSupplierList: true, preSelectedSupplierId: chosen.id }, confidence: 0.95 },
-            { sessionId }
-          );
-          const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
-          const responsePayload = isPromptPayload
-            ? {
-                response: aiResponse.html,
-                orderWizardPrompt: aiResponse.orderWizardPrompt,
-                ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
-              }
-            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
-          const out = {
-            type: 'ai_tool',
-            intent: { action: 'createYarnPurchaseOrder', params: { preSelectedSupplierId: chosen.id } },
-            ...responsePayload,
-            confidence: 0.95,
-            source: 'ai_tool_service',
-            contextUsed: true
-          };
-          persistAgentFlowIfNeeded(sessionId, out);
-          return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Found supplier; choose yarn next.' });
+          return await showYarnListForSupplier(chosen);
         } catch (err) {
           console.warn('Disambiguate supplier selection failed:', err?.message);
         }
       }
     }
+
+    // choose_supplier / disambiguate_supplier: user selects by NAME (e.g. "WAMPUM", "Premier Threads") → show top 5 yarn items for that supplier
+    if ((disambiguatePrompt === 'choose_supplier' || disambiguatePrompt === 'disambiguate_supplier') && disambiguateSuppliers?.length > 0 && !isNumericReply) {
+      const query = normalizedQuestion.trim();
+      if (query.length >= 2 && query.length <= 80) {
+        const queryLower = query.toLowerCase();
+        const chosen = disambiguateSuppliers.find((s) => {
+          const name = (s.brandName || s.name || '').toLowerCase();
+          return name.includes(queryLower) || queryLower.includes(name) || name.replace(/\s+/g, '').includes(queryLower.replace(/\s+/g, ''));
+        });
+        if (chosen) {
+          try {
+            return await showYarnListForSupplier(chosen);
+          } catch (err) {
+            console.warn('Supplier name selection failed:', err?.message);
+          }
+        }
+      }
+    }
+
+    // Append current user message to session so context window and persistSessionConversationFromResponse have full history
+    if (sessionId) appendUserMessageToSession(sessionId, normalizedQuestion);
+    if (sessionId && (!conversationHistory || conversationHistory.length === 0)) conversationHistory = getSessionConversationHistory(sessionId);
 
     // ─── Four separate PO flows (do not merge; they may share helpers but must not conflict) ───
     // 1. Create PO: placeOrderContext — new order, choose supplier, choose yarn, place.
@@ -621,6 +707,29 @@ export const askQuestion = async (question, options = {}) => {
     // 3. Update status PO: orderRefForStatus, awaitingFollowUp 'update_status_po' | 'update_status_choice' — change status only.
     // 4. Delete PO: deleteYarnPurchaseOrder intent — delete order (no persistent context).
     // When in edit flow, explicit "update status" or "delete this order" is routed to flow 3 or 4 below.
+
+    // Resolve pending confirmation FIRST (delete/status/place-order yes/no) so "yes" to delete does not trigger place-order or create-PO UI flow
+    if (sessionId) {
+      const resolved = await aiToolService.resolvePendingConfirmation(sessionId, normalizedQuestion);
+      if (resolved.resolved && resolved.response != null) {
+        const out = {
+          type: 'ai_tool',
+          intent: { action: 'confirm_or_cancel' },
+          response: resolved.response,
+          confidence: 1,
+          source: 'ai_tool_service',
+          confirmationResolved: true
+        };
+        if (resolved.agentJobId != null) out.agentJobId = resolved.agentJobId;
+        if (resolved.poNumber && out.agentJobId == null) {
+          console.warn('[faq] Order placed but agentJobId missing from resolvePendingConfirmation', { poNumber: resolved.poNumber });
+        }
+        const summary = resolved.poNumber ? `Order placed with PO number ${resolved.poNumber}.` : 'Done.';
+        // When we re-prompted for yes/no (user typed something else), use a clear message so GPT doesn't say "Action confirmed"
+        const dataDrivenMessage = resolved.isRePrompt ? 'Please type **yes** to confirm or **no** to cancel.' : undefined;
+        return await addNaturalReply(out, normalizedQuestion, { action: 'confirm action', summary, dataDrivenMessage });
+      }
+    }
 
     // Fallback: "add item" / "add more yarn" without editOrderPo — recover edit context from last assistant message (e.g. "What would you like to edit?" + PO-2026-975) so we show order's supplier yarn list, not create-PO supplier list
     const vagueAddItemOnly = /^(?:i\s+)?(?:wanna|want\s+to)\s+add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$|^add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$/i.test(normalizedQuestion.trim());
@@ -794,6 +903,39 @@ export const askQuestion = async (question, options = {}) => {
         return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: resolvedPoNum });
       } catch (err) {
         console.warn('Apply edit failed:', err?.message);
+      }
+    }
+
+    // Run order-action intent (edit/delete/update status) early so "i wanna edit order PO-2026-979" is never treated as place-order keyword
+    const orderActionRegex = /\b(delete|cancel|remove|update|mark|set|edit)\b.*\b(?:purchase\s+)?order\b|edit\s+order|edit\s+po-?[\w\-]+/i;
+    if (orderActionRegex.test(normalizedQuestion)) {
+      const orderIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+      if (orderIntent && (orderIntent.action === 'deleteYarnPurchaseOrder' || orderIntent.action === 'updateYarnPurchaseOrderStatus' || orderIntent.action === 'editYarnPurchaseOrder')) {
+        try {
+          const aiResponse = await aiToolService.executeAITool(orderIntent, { sessionId });
+          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
+          const isAskingWhichOrderToEdit = orderIntent.action === 'editYarnPurchaseOrder' && /please specify which order to edit/i.test(responseStr);
+          const isChoosingStatus = aiResponse?.needsStatusChoice && aiResponse?.orderRef;
+          const isAskingOrderForStatus = orderIntent.action === 'updateYarnPurchaseOrderStatus' && /please specify which order/i.test(responseStr);
+          const actionLabel = orderIntent.action === 'deleteYarnPurchaseOrder' ? 'delete order' : orderIntent.action === 'updateYarnPurchaseOrderStatus' ? 'update order status' : 'edit order';
+          const summary = isAskingWhichOrderToEdit ? 'Need the PO number to open it for editing.' : isChoosingStatus ? 'Choose status by number (1–8).' : isAskingOrderForStatus ? 'Need the PO number to update status.' : (orderIntent.action === 'editYarnPurchaseOrder' ? 'Showing order details.' : orderIntent.description || 'Done.');
+          const out = {
+            type: 'ai_tool',
+            intent: orderIntent,
+            response: responseStr,
+            confidence: orderIntent.confidence ?? 0.95,
+            source: 'ai_tool_service',
+            orderActionHandled: true,
+            ...(isAskingWhichOrderToEdit ? { awaitingFollowUp: 'edit_order_po' } : {}),
+            ...(isAskingOrderForStatus ? { awaitingFollowUp: 'update_status_po' } : {}),
+            ...(isChoosingStatus ? { awaitingFollowUp: 'update_status_choice', orderRefForStatus: aiResponse.orderRef } : {}),
+            ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
+          };
+          persistAgentFlowIfNeeded(sessionId, out);
+          return await addNaturalReply(out, normalizedQuestion, { action: actionLabel, summary, poNumber: orderIntent.params?.poNumber });
+        } catch (orderErr) {
+          console.warn('Order action execution failed, continuing:', orderErr?.message);
+        }
       }
     }
 
@@ -1033,9 +1175,7 @@ export const askQuestion = async (question, options = {}) => {
               { sessionId }
             );
             const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
-            const responsePayload = isPromptPayload
-              ? { response: aiResponse.html, orderWizardPrompt: aiResponse.orderWizardPrompt, ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }) }
-              : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
+            const responsePayload = isPromptPayload ? { response: aiResponse.html, orderWizardPrompt: aiResponse.orderWizardPrompt } : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
             const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params: {} }, ...responsePayload, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
             return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Choose a supplier and optionally a colour.' });
           }
@@ -1055,17 +1195,19 @@ export const askQuestion = async (question, options = {}) => {
               const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder' }, response: aiResponse.html, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
               return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: aiResponse.summary || 'Review order. Type yes to place or no to cancel.' });
             }
+            const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
             const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
-            const responsePayload = isPromptPayload
-              ? {
-                  response: aiResponse.html,
-                  orderWizardPrompt: aiResponse.orderWizardPrompt,
-                  ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
-                  ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
-                }
-              : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+            const responsePayload = isWizardPayload
+              ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+              : isPromptPayload
+                ? {
+                    response: aiResponse.html,
+                    orderWizardPrompt: aiResponse.orderWizardPrompt,
+                    ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
+                  }
+                : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
             const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params }, ...responsePayload, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
-            const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : 'Processing your order.';
+            const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : isWizardPayload ? 'Starting purchase order.' : 'Processing your order.';
             return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary });
           }
         }
@@ -1142,16 +1284,19 @@ export const askQuestion = async (question, options = {}) => {
           const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: supplierFromPhrase } }, response: aiResponse.html, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
           return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: aiResponse.summary || 'Review order. Type yes to place or no to cancel.' });
         }
+        const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
         const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
-        const responsePayload = isPromptPayload
-          ? {
-              response: aiResponse.html,
-              orderWizardPrompt: aiResponse.orderWizardPrompt,
-              ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
-              ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
-              ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
-            }
-          : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+        const responsePayload = isWizardPayload
+          ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+          : isPromptPayload
+            ? {
+                response: aiResponse.html,
+                orderWizardPrompt: aiResponse.orderWizardPrompt,
+                ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
+                ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
+                ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
+              }
+            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
         const out = {
           type: 'ai_tool',
           intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: supplierFromPhrase } },
@@ -1161,7 +1306,7 @@ export const askQuestion = async (question, options = {}) => {
           contextUsed: true
         };
         persistAgentFlowIfNeeded(sessionId, out);
-        const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : 'Processing your order.';
+        const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : isWizardPayload ? 'Starting purchase order.' : 'Processing your order.';
         return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary });
       } catch (err) {
         console.warn('Purchase yarn from supplier failed, continuing:', err?.message);
@@ -1182,16 +1327,19 @@ export const askQuestion = async (question, options = {}) => {
             const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion } }, response: aiResponse.html, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
             return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: aiResponse.summary || 'Review order. Type yes to place or no to cancel.' });
           }
+          const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
           const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
-          const responsePayload = isPromptPayload
-            ? {
-                response: aiResponse.html,
-                orderWizardPrompt: aiResponse.orderWizardPrompt,
-                ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
-                ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
-                ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
-              }
-            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+          const responsePayload = isWizardPayload
+            ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+            : isPromptPayload
+              ? {
+                  response: aiResponse.html,
+                  orderWizardPrompt: aiResponse.orderWizardPrompt,
+                  ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
+                  ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
+                  ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
+                }
+              : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
           const out = {
             type: 'ai_tool',
             intent: { action: 'createYarnPurchaseOrder', params: { supplierQuery: normalizedQuestion } },
@@ -1200,32 +1348,11 @@ export const askQuestion = async (question, options = {}) => {
             source: 'ai_tool_service',
             contextUsed: true
           };
-          const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : 'Processing your order.';
+          const summary = isPromptPayload ? 'Found supplier; choose yarn next.' : isWizardPayload ? 'Starting purchase order.' : 'Processing your order.';
           return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary });
         } catch (contextErr) {
           console.warn('Context createYarnPurchaseOrder failed, falling back to normal flow:', contextErr.message);
         }
-      }
-    }
-
-    // Resolve pending confirmation first when session has a pending action (yes/no/y/n/confirm/cancel or re-prompt)
-    if (sessionId) {
-      const resolved = await aiToolService.resolvePendingConfirmation(sessionId, normalizedQuestion);
-      if (resolved.resolved && resolved.response != null) {
-        const out = {
-          type: 'ai_tool',
-          intent: { action: 'confirm_or_cancel' },
-          response: resolved.response,
-          confidence: 1,
-          source: 'ai_tool_service',
-          confirmationResolved: true
-        };
-        if (resolved.agentJobId != null) out.agentJobId = resolved.agentJobId;
-        if (resolved.poNumber && out.agentJobId == null) {
-          console.warn('[faq] Order placed but agentJobId missing from resolvePendingConfirmation', { poNumber: resolved.poNumber });
-        }
-        const summary = resolved.poNumber ? `Order placed with PO number ${resolved.poNumber}.` : 'Done.';
-        return await addNaturalReply(out, normalizedQuestion, { action: 'confirm action', summary });
       }
     }
 
@@ -1255,39 +1382,6 @@ export const askQuestion = async (question, options = {}) => {
         }
       }
     }
-    
-    // Run order-action intent (delete/update status/edit order) before FAQ so they are never overridden by FAQ match
-    // Match "edit order", "edit order PO-xxx", "edit po-2026-975", "update status", "delete order", etc.
-    const orderActionPattern = /\b(delete|cancel|remove|update|mark|set|edit)\b.*\b(?:purchase\s+)?order\b|edit\s+order|edit\s+po-?[\w\-]+/i;
-    if (orderActionPattern.test(normalizedQuestion)) {
-      const orderIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
-      if (orderIntent && (orderIntent.action === 'deleteYarnPurchaseOrder' || orderIntent.action === 'updateYarnPurchaseOrderStatus' || orderIntent.action === 'editYarnPurchaseOrder')) {
-        try {
-          const aiResponse = await aiToolService.executeAITool(orderIntent, { sessionId });
-          const responseStr = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse));
-          const isAskingWhichOrderToEdit = orderIntent.action === 'editYarnPurchaseOrder' && /please specify which order to edit/i.test(responseStr);
-          const isChoosingStatus = aiResponse?.needsStatusChoice && aiResponse?.orderRef;
-          const isAskingOrderForStatus = orderIntent.action === 'updateYarnPurchaseOrderStatus' && /please specify which order/i.test(responseStr);
-          const actionLabel = orderIntent.action === 'deleteYarnPurchaseOrder' ? 'delete order' : orderIntent.action === 'updateYarnPurchaseOrderStatus' ? 'update order status' : 'edit order';
-          const summary = isAskingWhichOrderToEdit ? 'Need the PO number to open it for editing.' : isChoosingStatus ? 'Choose status by number (1–8).' : isAskingOrderForStatus ? 'Need the PO number to update status.' : (orderIntent.action === 'editYarnPurchaseOrder' ? 'Showing order details.' : orderIntent.description || 'Done.');
-          const out = {
-            type: 'ai_tool',
-            intent: orderIntent,
-            response: responseStr,
-            confidence: orderIntent.confidence ?? 0.95,
-            source: 'ai_tool_service',
-            orderActionHandled: true,
-            ...(isAskingWhichOrderToEdit ? { awaitingFollowUp: 'edit_order_po' } : {}),
-            ...(isAskingOrderForStatus ? { awaitingFollowUp: 'update_status_po' } : {}),
-            ...(isChoosingStatus ? { awaitingFollowUp: 'update_status_choice', orderRefForStatus: aiResponse.orderRef } : {}),
-            ...(aiResponse?.editOrderContext && { editOrderContext: aiResponse.editOrderContext })
-          };
-          return await addNaturalReply(out, normalizedQuestion, { action: actionLabel, summary, poNumber: orderIntent.params?.poNumber });
-        } catch (orderErr) {
-          console.warn('Order action execution failed, continuing to FAQ:', orderErr?.message);
-        }
-      }
-    }
 
     // Check for slash commands (e.g., /commands, /help)
     if (normalizedQuestion.startsWith('/')) {
@@ -1308,7 +1402,32 @@ export const askQuestion = async (question, options = {}) => {
         };
       }
     }
-    
+
+    // Conversation summary: "what have we discussed?", "summarize our chat" — answer from session history only; no tool/search (guardrail: don't misuse as data request)
+    const conversationMetaPatterns = [
+      /what\s+have\s+we\s+(?:discussed|chatted|talked)\s+about/i,
+      /what\s+(?:have\s+we|did\s+we)\s+discuss/i,
+      /summar(?:y|ies|ize)\s+(?:our\s+)?(?:chat|conversation|discussion)/i,
+      /summari[sz]e?\s+(?:it|so\s+far)?/i,
+      /(?:our\s+)?(?:chat|conversation)\s+summar/i,
+      /what\s+(?:were\s+we|did\s+we)\s+talking\s+about/i,
+      /recap\s+(?:our\s+)?(?:conversation|chat)/i,
+      /remind\s+me\s+what\s+we\s+discussed/i,
+      /what\s+have\s+we\s+talked\s+about/i,
+      /so\s+far\s+(?:what\s+)?(?:have\s+we|did\s+we)/i,
+      /what\s+did\s+we\s+talk\s+about/i,
+      /(?:can\s+you\s+)?(?:tell\s+me\s+)?what\s+we\s+(?:discussed|chatted|talked)/i
+    ];
+    if (conversationMetaPatterns.some(p => p.test(normalizedQuestion))) {
+      const summary = await aiToolService.summarizeConversation(historyBeforeCurrentMessage, normalizedQuestion);
+      return {
+        type: 'conversation_summary',
+        response: summary,
+        confidence: 0.95,
+        source: 'conversation_summary'
+      };
+    }
+
     // Step 1: Check FAQ vector search first for existing knowledge
     console.log('Checking FAQ vector search for:', normalizedQuestion);
     
@@ -1426,7 +1545,10 @@ Please provide a helpful response based on this FAQ knowledge.`
       if (aiIntent && aiIntent.action === 'getCapabilities') {
         try {
           let aiResponse = await aiToolService.executeAITool(aiIntent, { sessionId });
-          const responsePayload = { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
+          const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
+          const responsePayload = isWizardPayload
+            ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
           const out = { type: 'ai_tool', intent: aiIntent, ...responsePayload, confidence: aiIntent.confidence, source: 'ai_tool_service' };
           return await addNaturalReply(out, normalizedQuestion, { action: 'capabilities', summary: 'Here’s what I can help you with.' });
         } catch (aiError) {
@@ -1440,7 +1562,19 @@ Please provide a helpful response based on this FAQ knowledge.`
     console.log('No good FAQ match found, checking AI tool intent for:', normalizedQuestion);
     
     const aiIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
-    
+
+    // Fallback: detectIntent returned null (e.g. conversation-meta PRE-CHECK); if message still looks like "what we discussed/summary", answer from history
+    const conversationMetaLoose = /\b(?:what\s+we\s+discussed|summar(?:y|ies|ize)|our\s+chat|what\s+did\s+we\s+talk|what\s+have\s+we\s+chat|so\s+far)\b/i.test(normalizedQuestion);
+    if (!aiIntent && conversationMetaLoose) {
+      const summary = await aiToolService.summarizeConversation(historyBeforeCurrentMessage, normalizedQuestion);
+      return {
+        type: 'conversation_summary',
+        response: summary,
+        confidence: 0.95,
+        source: 'conversation_summary'
+      };
+    }
+
     // Don't route "do you have anything in blue" / "anythin in 20-blue" (no "raw material" in message) to getRawMaterials — that's usually yarn/order context; raw materials need explicit "raw materials in blue"
     const looksLikeYarnColourQuestion = (/^(?:do\s+you\s+have\s+)(?:anything\s+in\s+|something\s+in\s+)[a-z0-9\s\-]+$|^(?:anything|something|anythin)\s+in\s+[a-z0-9\s\-]+$/i.test(normalizedQuestion.trim()) && !/\braw\s+material/i.test(normalizedQuestion) && normalizedQuestion.trim().length >= 8)
       || (aiIntent?.params?.color && !/\braw\s+material/i.test(normalizedQuestion) && /\b(?:anything|something|anythin)\s+in\s+/i.test(normalizedQuestion.trim()) && normalizedQuestion.trim().length >= 8);
@@ -1455,6 +1589,32 @@ Please provide a helpful response based on this FAQ knowledge.`
         source: 'faq_service'
       };
       return await addNaturalReply(out, normalizedQuestion, { action: 'clarify', summary: 'Clarifying yarn vs raw materials.' });
+    }
+
+    // "Remove item" with no intent (or lost context): if session says we're in edit_po, run edit flow so we show the item list to remove, not delete order
+    const isRemoveItemPhrase = /^(?:remove|delete)\s+(?:an?\s+)?(?:item|line)\s*\.?$/i.test(normalizedQuestion.trim()) || /^(?:remove|delete)\s+items?\s*\.?$/i.test(normalizedQuestion.trim());
+    if ((!aiIntent || aiIntent.action === 'getCapabilities') && isRemoveItemPhrase && storedFlowForYarn?.flow === 'edit_po' && storedFlowForYarn?.context?.editOrderPo?.purchaseOrderId) {
+      try {
+        const poId = storedFlowForYarn.context.editOrderPo.purchaseOrderId;
+        const poNum = storedFlowForYarn.context.editOrderPo.poNumber;
+        const result = await aiToolService.applyYarnPurchaseOrderEdit(poId, normalizedQuestion, storedFlowForYarn.context.editOrderPo);
+        const responseStr = result.html || '';
+        const resolvedPoNum = result.editOrderContext?.poNumber ?? poNum;
+        const editSummary = (responseStr.includes('Remove item') && result.editOrderContext?.removeItemState?.step === 'choose_items') ? 'Pick item(s) to remove by number (e.g. 1 or 1, 3).' : 'Processed your order edit.';
+        const out = {
+          type: 'ai_tool',
+          intent: { action: 'applyYarnPurchaseOrderEdit' },
+          response: responseStr,
+          confidence: 0.95,
+          source: 'ai_tool_service',
+          contextUsed: true,
+          ...(result.editOrderContext !== undefined && { editOrderContext: result.editOrderContext })
+        };
+        persistAgentFlowIfNeeded(sessionId, out);
+        return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: resolvedPoNum });
+      } catch (err) {
+        console.warn('Edit flow (remove item from session) failed:', err?.message);
+      }
     }
 
     if (aiIntent && aiIntent.action !== 'getCapabilities') {
@@ -1559,17 +1719,19 @@ Please provide a helpful response based on this FAQ knowledge.`
       try {
         // Execute AI tool and return HTML response (sessionId enables confirmation guardrails for update/delete)
         let aiResponse = await aiToolService.executeAITool(aiIntent, { sessionId });
-        // Normalize: createYarnPurchaseOrder returns numbered-list flow (orderWizardPrompt + matchingSuppliers / placeOrderContext)
+        // Normalize: createYarnPurchaseOrder can return wizard data, choose_supplier, choose_yarn_for_supplier, or disambiguate_supplier
+        const isWizardPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardData != null;
         const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
-        const responsePayload = isPromptPayload
-          ? {
-              response: aiResponse.html,
-              orderWizardPrompt: aiResponse.orderWizardPrompt,
-              ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
-              ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers }),
-              ...(aiResponse.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext })
-            }
-          : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)), ...(aiResponse?.placeOrderContext != null && { placeOrderContext: aiResponse.placeOrderContext }) };
+        const responsePayload = isWizardPayload
+          ? { response: aiResponse.html, orderWizardData: aiResponse.orderWizardData }
+          : isPromptPayload
+            ? {
+                response: aiResponse.html,
+                orderWizardPrompt: aiResponse.orderWizardPrompt,
+                ...(aiResponse.preSelectedSupplier != null && { preSelectedSupplier: aiResponse.preSelectedSupplier }),
+                ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
+              }
+            : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
         // Include editOrderContext etc. so frontend can persist them (e.g. "edit PO-2026-975" → next "add item" stays in edit flow with order's supplier)
         const contextPayload = {
           ...(aiResponse?.editOrderContext !== undefined && { editOrderContext: aiResponse.editOrderContext }),
@@ -1581,7 +1743,12 @@ Please provide a helpful response based on this FAQ knowledge.`
         const out = { type: 'ai_tool', intent: aiIntent, ...responsePayload, ...contextPayload, confidence: aiIntent.confidence, source: 'ai_tool_service' };
         persistAgentFlowIfNeeded(sessionId, out);
         const summary = aiIntent.description || 'Retrieved the requested information.';
-        return await addNaturalReply(out, normalizedQuestion, { action: aiIntent.action, summary, poNumber: aiIntent.params?.poNumber });
+        return await addNaturalReply(out, normalizedQuestion, {
+          action: aiIntent.action,
+          summary,
+          poNumber: aiIntent.params?.poNumber,
+          dataDrivenMessage: aiResponse?.dataDrivenMessage
+        });
       } catch (aiError) {
         console.error('AI Tool execution failed:', aiError);
         // Continue to fallback response
@@ -1590,6 +1757,10 @@ Please provide a helpful response based on this FAQ knowledge.`
 
     // Step 4: Final fallback - no FAQ match and no AI tool
     if (allFAQs.length === 0) {
+      if (!aiIntent) {
+        console.log('No intent detected, returning global disambiguation');
+        return getGlobalDisambiguationResponse();
+      }
       // Use conversation service for natural conversation handling
       console.log('No FAQ knowledge, using conversation service for:', normalizedQuestion);
       try {
@@ -1635,6 +1806,10 @@ Please provide a helpful response based on this FAQ knowledge.`
       }
     } else {
       // Step 5: Use conversation service for queries not covered by FAQ or AI tools
+      if (!aiIntent) {
+        console.log('No intent detected, returning global disambiguation');
+        return getGlobalDisambiguationResponse();
+      }
       console.log('No FAQ or AI tool match found, using conversation service for:', normalizedQuestion);
       
       try {
@@ -1878,5 +2053,8 @@ export default {
   getFAQStats,
   getFaqVectors,
   deleteFaqVector,
-  clearAllFaqs
+  clearAllFaqs,
+  appendUserMessageToSession,
+  getSessionConversationHistory,
+  persistSessionConversationFromResponse
 };

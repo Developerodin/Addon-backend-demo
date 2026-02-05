@@ -64,6 +64,68 @@ const levenshtein = (a, b) => {
 };
 
 /**
+ * Global typo normalization for the agent: correct common misspellings so intent and params work across all flows.
+ * Used once at FAQ entry and inside detectIntent so the whole pipeline sees corrected text.
+ * @param {string} text - Raw user message (will be trimmed)
+ * @returns {string} Typo-corrected message (trimmed, not lowercased)
+ */
+export const normalizeTyposForAgent = (text) => {
+  if (!text || typeof text !== 'string') return text || '';
+  let s = text.trim();
+  const replacements = [
+    [/quatity/gi, 'quantity'],
+    [/invetory/gi, 'inventory'],
+    [/invntory/gi, 'inventory'],
+    [/colour/gi, 'color'],
+    [/colours/gi, 'colors'],
+    [/summieries/gi, 'summaries'],
+    [/summeries/gi, 'summaries'],
+    [/summari[sz]e/gi, 'summarise'],
+    [/reselient/gi, 'resilient'],
+    [/disambiguity/gi, 'disambiguation'],
+    [/higherst/gi, 'highest'],
+    [/lowerst/gi, 'lowest'],
+    [/higest/gi, 'highest'],
+    [/produnt/gi, 'product'],
+    [/produts/gi, 'products'],
+    [/packaging/gi, 'packing'],
+    [/materail/gi, 'material'],
+    [/materials/gi, 'materials'],
+    [/suplier/gi, 'supplier'],
+    [/supliers/gi, 'suppliers'],
+    [/catalog(ue)?/gi, 'catalog'],
+    [/recieve/gi, 'receive'],
+    [/recieved/gi, 'received'],
+    [/occured/gi, 'occurred'],
+    [/seperate/gi, 'separate'],
+    [/refered/gi, 'referred'],
+    [/bu\b/gi, 'by'],
+    [/teh\b/gi, 'the'],
+    [/taht\b/gi, 'that'],
+    [/waht\b/gi, 'what'],
+    [/whcih/gi, 'which'],
+    [/cna\b/gi, 'can'],
+    [/adn\b/gi, 'and'],
+    [/fo\b/gi, 'for'],
+    [/ot\b/gi, 'to'],
+    [/onw\b/gi, 'one'],
+    [/twp\b/gi, 'two'],
+    [/thrid/gi, 'third'],
+    [/finsihed/gi, 'finished'],
+    [/finshed/gi, 'finished'],
+    [/purcahse/gi, 'purchase'],
+    [/ordr\b/gi, 'order'],
+    [/ordres/gi, 'orders'],
+    [/analutics/gi, 'analytics'],
+    [/reciecved/gi, 'received']
+  ];
+  for (const [regex, replacement] of replacements) {
+    s = s.replace(regex, replacement);
+  }
+  return s;
+};
+
+/**
  * Find nearest supplier(s) by typo-tolerant word matching (for "did you mean" when no exact match).
  * @param {string} query - User input (e.g. "wampum priviate limited")
  * @param {Array<{brandName?: string, name?: string, _id?: string, id?: string}>} suppliers - All suppliers
@@ -331,7 +393,7 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           
           Analyze the user's question and return a JSON object with the following structure:
           {
-            "action": "one of: getProductForecast, getProductAnalysis, getStoreAnalysisByName, getTopProducts, getProductCount, getProductsList, getStoresList, getSalesReport, getSalesData, getAnalyticsDashboard, getBrandPerformance, getCapabilities, getMachineStatistics, getMachinesByStatus, getMachinesByFloor, getYarnCatalog, getYarnInventory, getLiveInventory, getRecentPOStatus, getYarnTransactions, getYarnRequisitions, getYarnPurchaseOrders, getYarnPurchaseOrderById, createYarnPurchaseOrder, editYarnPurchaseOrder, updateYarnPurchaseOrderStatus, deleteYarnPurchaseOrder, getYarnIssue, getYarnReturn, getYarnTypes, getYarnSuppliers, getYarnCountSizes, getYarnColors, getYarnBlends, getRawMaterials, getProcesses, getProductAttributes, getProductionOrders, getProductionDashboard, getOrders",
+            "action": "one of: getProductForecast, getProductAnalysis, getStoreAnalysisByName, getTopProducts, getProductCount, getProductsList, getStoresList, getSalesReport, getSalesData, getTopCitiesBySales, getAnalyticsDashboard, getBrandPerformance, getCapabilities, getMachineStatistics, getMachinesByStatus, getMachinesByFloor, getYarnCatalog, getYarnInventory, getLiveInventory, getRecentPOStatus, getYarnTransactions, getYarnRequisitions, getYarnPurchaseOrders, getYarnPurchaseOrderCounts, getYarnPurchaseOrderById, createYarnPurchaseOrder, editYarnPurchaseOrder, updateYarnPurchaseOrderStatus, deleteYarnPurchaseOrder, getYarnIssue, getYarnReturn, getYarnTypes, getYarnSuppliers, getYarnCountSizes, getYarnColors, getYarnBlends, getRawMaterials, getProcesses, getProductAttributes, getProductionOrders, getProductionDashboard, getOrders",
             "params": {
               // Common filters
               "limit": "extracted number limit or null",
@@ -345,6 +407,7 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
               // Store filters
               "city": "extracted city name or null", 
               "storeName": "extracted store name or null",
+              "citiesOnly": "true only when user asks for list of cities only / which cities have our stores / how many stores and in which cities, else null",
               "storeId": "extracted store ID or null",
               "bpCode": "extracted BP code or null",
               "brand": "extracted brand name or null",
@@ -355,6 +418,9 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
               "period": "extracted time period or null",
               "dateFrom": "extracted start date or null",
               "dateTo": "extracted end date or null",
+              "sortBy": "for getSalesData: gsv:desc, gsv:asc, date:desc, date:asc; for getTopCitiesBySales: nsv or gsv (metric to rank by); or null",
+              "order": "for getTopCitiesBySales only: 'highest' or 'lowest' (ranking order); or null",
+              "top": "for getTopCitiesBySales: number of cities to return (e.g. 5, 10); or null",
               "mrpMin": "extracted minimum MRP (e.g. when user says mrp above 299, price above 299) or null",
               "mrpMax": "extracted maximum MRP (e.g. when user says mrp below 500) or null",
               
@@ -431,6 +497,9 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           }
           
           Rules:
+          - **CRITICAL: Conversation-meta questions:** If the user is asking about the conversation itself (e.g. "what have we discussed", "summarize our chat", "what did we talk about", "recap", "summary of our conversation"), do NOT use any data action. Do NOT extract floor, city, product, or any param from the message text. Return action "getCapabilities" or a generic conversational action so the system can answer from chat history instead of running a data search.
+          - **CRITICAL SALES vs PURCHASE ORDER:** If the user message contains "sales", "sales data", "data of sales", "sales from", "sales in", "sales for [city]", "show (me) sales", or any request to show/display/list SALES (retail transaction data), you MUST use action "getSalesData" and extract all applicable params (city, sortBy, dateFrom, dateTo, period, productName, storeName, limit, page). NEVER use createYarnPurchaseOrder for sales-related queries. "From Delhi" / "sales from Delhi" means city=Delhi (sales filter), NOT a supplier name.
+          - For getSalesData when user says "sort from highest to lowest", "highest to lowest", "sort by value", "sort by amount", "higher to lower" (including typos like "higherst to lowerst") → include sortBy: "gsv:desc". When "lowest to highest" or "ascending" → sortBy: "gsv:asc".
           - For yarn catalog: action = "getYarnCatalog" if asking about yarn catalog/list/types
           - For yarn catalog pagination: action = "getYarnCatalog", extract page parameter (e.g., "yarn catalog page 2", "page 3 yarn catalog", "show yarn catalog page 2")
           - CRITICAL: When user says "Show yarn catalog page 2" or "yarn catalog page 2", extract page=2 in params
@@ -449,6 +518,7 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - For yarn requisitions: action = "getYarnRequisitions" if asking about yarn requisitions/requests
           - For placing a new yarn purchase order: action = "createYarnPurchaseOrder" if user says "place order", "place new order", "place another yarn purchase order", "place yarn order", "create purchase order" (do NOT use getYarnPurchaseOrders for these)
           - For showing/list of yarn purchase orders: action = "getYarnPurchaseOrders" if user says "show yarn purchase orders", "show yarn place order", "list orders", "yarn purchase orders", "get yarn purchase orders"
+          - For "how many orders received" / "how many in transit" / "orders received so far and in transit": action = "getYarnPurchaseOrderCounts" (returns real counts from DB). Do NOT use getOrders (placeholder) or invent numbers.
           - For single purchase order details: action = "getYarnPurchaseOrderById" if asking for one order by PO number or ID (e.g. "order details PO-2024-001", "show purchase order PO-xxx")
           - For editing order details (items, quantities, supplier): action = "editYarnPurchaseOrder" if user says "edit order", "I wanna edit order PO-xxx", "edit order details" (this is NOT status change)
           - For updating order STATUS only: action = "updateYarnPurchaseOrderStatus" only when user explicitly says "update status", "mark PO-xxx as in transit", "set order to goods received", "change status to ..."
@@ -492,7 +562,8 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           **SALES DATA (full access for chatbot):**
           - getSalesData = transaction-level sales records (filterable list with Date, Store, Product, Category, Quantity, MRP, Discount, GSV, NSV, Tax). Use for: "show sales", "sales data", "sales records", "sales in [city]", "sales for [product]", "sales at [store]", "sales from [date] to [date]", "last month sales", "sales by category".
           - getSalesReport = aggregated report (KPIs, trends, summaries). Use for: "sales report", "sales summary", "sales trend", "monthly sales".
-          - For getSalesData ALWAYS extract any mentioned: city, productName, storeName, dateFrom, dateTo, category, limit (default 50), page, mrpMin (when user says "mrp above X", "MRP > X", "price above X"), mrpMax (when user says "mrp below X", "MRP < X").
+          - For getSalesData ALWAYS extract any mentioned: city, productName, storeName, dateFrom, dateTo, category, limit (default 50), page, sortBy, mrpMin (when user says "mrp above X", "MRP > X", "price above X"), mrpMax (when user says "mrp below X", "MRP < X").
+          - For sales sorted "highest to lowest" / "sort by value" / "higher to lower": params: { sortBy: "gsv:desc" }; for "lowest to highest": sortBy: "gsv:asc".
           - For sales filtered by city: action = "getSalesData", params: { city: "extracted city" }
           - For sales filtered by product: action = "getSalesData", params: { productName: "extracted product name" }
           - For sales filtered by store: action = "getSalesData", params: { storeName: "extracted store name" }
@@ -503,7 +574,10 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - For brand performance: action = "getBrandPerformance" if asking about brand performance, brand data, or brand analysis
           - For product count: action = "getProductCount" if asking about product inventory
           - For products list or items: action = "getProductsList" if asking about list of products/items from master catalog
+          - For products filtered by CATEGORY (e.g. Socks, Towel, Handkerchief): action = "getProductsList", params: { category: "CategoryName" }. Do NOT use productName when user asks for products in a category (e.g. "do you have socks", "socks", "products in socks", "socks category", "socks is category not name").
+          - CRITICAL: "socks", "do you have socks", "what about socks", "socks as product", "products in socks", "products with socks category" → getProductsList with category: "Socks", NOT productName. Same for Towel, Handkerchief — use category filter for master catalog, not name search.
           - For stores list: action = "getStoresList" if asking about list of stores
+          - CRITICAL: "list of cities only", "give me list of cities only", "cities only", "which cities have our stores", "how many stores and in which cities" → getStoresList with citiesOnly: true (return derived data from DB). Do NOT use getCapabilities for these — the system has store data and can return the city list.
           - For stores filtered by city: action = "getStoresList", extract city parameter
           - For stores filtered by status: action = "getStoresList", extract status parameter (active/inactive)
           - For stores filtered by city and status: action = "getStoresList", extract both city and status parameters
@@ -594,6 +668,8 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - "show me active stores" → getStoresList with status="active"
           - "what stores are closed" → getStoresList with status="inactive"
           - "show me inactive stores" → getStoresList with status="inactive"
+          - "give me list of cities only", "list of cities only", "cities only", "which cities have our stores", "how many stores and in which cities" → getStoresList with citiesOnly: true
+          - Cities by sales (getTopCitiesBySales): "which city has highest/lowest sales", "city with highest/lowest sales", "top/bottom N cities by sales", "cities ranked by sales last month". Params: top (number of cities), order ("highest" or "lowest"), sortBy ("nsv" or "gsv"), period ("last month", "last week", "today"), dateFrom, dateTo. Extract whatever the user asks for (e.g. "top 5 cities by sales" → top: 5; "lowest sales city" → order: "lowest"; "last month" → period: "last month"). Do NOT use getCapabilities or invent city names — data comes from DB.
           
           **TOP PRODUCTS - Natural Language Variations:**
           - "what products sell the most" → getTopProducts
@@ -639,6 +715,9 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - "tell me about items" → getProductsList
           - "what products are in the catalog" → getProductsList
           - "show me master catalog" → getProductsList
+          - "socks", "do you have socks", "what about socks", "socks as product", "products in socks category", "socks is category not name" → getProductsList with category: "Socks" (not productName)
+          - "towel", "products in towel", "towel category" → getProductsList with category: "Towel"
+          - "handkerchief", "products in handkerchief" → getProductsList with category: "Handkerchief"
           
           **Raw Materials:**
           - "what raw materials are available" → getRawMaterials
@@ -651,6 +730,9 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - "raw materials in black" → getRawMaterials with color="black"
           - "show me raw materials by Packing Material" → getRawMaterials with groupName="Packing Material"
           - "what raw materials are in Packing Material group" → getRawMaterials with groupName="Packing Material"
+          - CRITICAL: "finished goods in raw material", "show me finished goods in raw materials" → getRawMaterials with groupName="Finished Goods" (filter BY group, do NOT return all raw materials like Packing Material)
+          - "[group name] in raw material(s)" (e.g. "Finished Goods in raw material") → getRawMaterials with groupName="[Group Name]"
+          - Be type-resilient: "goods Packing Material", "show me goods Packing Material", "goods Packaging Material", "Packing Material goods" → getRawMaterials with groupName "Packing Material" or "Packaging Material" (both map to same group). "Finished goods", "Finished Goods" → groupName "Finished Goods".
           
           **Attributes:**
           - "what attributes can products have" → getProductAttributes
@@ -762,8 +844,10 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - "sales from Jan 1 to Jan 31", "sales between [date] and [date]" → getSalesData with dateFrom and dateTo (use ISO or YYYY-MM-DD when possible)
           - "last month sales", "sales last week", "this week sales" → getSalesData with period: "last month" or "last week" or "today"
           - "sales in Mumbai for product X", "Mumbai sales last month" → getSalesData with city, productName and/or period (combine filters)
+          - "show me data of sales from Delhi and sort it from highest to lowest", "sales from Mumbai sort by value" → getSalesData with city and sortBy: "gsv:desc"
           - "sales with MRP above 299", "products mrp above 299", "sales of products which has mrp above 299" → getSalesData with mrpMin: 299 (and city/product/date if mentioned)
           - "sales report", "sales summary", "sales trend" → getSalesReport
+          - Cities by sales: "which city has highest sales" → getTopCitiesBySales (order: highest). "which city has lowest sales" / "city with least sales" → getTopCitiesBySales with order: "lowest". "top 5 cities by sales" → getTopCitiesBySales with top: 5. "bottom 3 cities last month" → getTopCitiesBySales with order: "lowest", top: 3, period: "last month". "cities ranked by GSV" → getTopCitiesBySales with sortBy: "gsv". Use dateFrom/dateTo or period whenever user mentions a time range.
           - "production orders" → getProductionOrders
           - "production dashboard" → getProductionDashboard
           
@@ -809,7 +893,7 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
       if (jsonMatch) {
         const intent = JSON.parse(jsonMatch[0]);
         
-        // Validate: action is required; params may be null (e.g. createYarnPurchaseOrder returns numbered list / chat flow)
+        // Validate: action is required; params may be null (e.g. createYarnPurchaseOrder opens wizard)
         if (intent.action) {
           return {
             action: intent.action,
@@ -943,6 +1027,46 @@ Reply in 1-2 short, natural sentences as the agent.`
 };
 
 /**
+ * Answer "what have we discussed?" using conversation history. Guardrail: only summarize what's in history; do not search or retrieve any project data.
+ * @param {Array<{role: 'user'|'assistant', content: string}>} conversationHistory
+ * @param {string} userMessage - e.g. "what have we discussed so far summary"
+ * @returns {Promise<string>} Natural language summary or short message if no history
+ */
+export const summarizeConversation = async (conversationHistory, userMessage) => {
+  try {
+    const history = Array.isArray(conversationHistory) ? conversationHistory : [];
+    const historyText = history.length === 0
+      ? '(No prior messages in this chat.)'
+      : history.map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${(m.content || '').toString().slice(0, 500)}`).join('\n');
+
+    const openaiResponse = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a friendly business assistant. The user is asking about what was discussed in this chat so far.
+- Answer ONLY from the conversation history below. Summarize briefly and naturally (2–4 sentences).
+- Do NOT search, retrieve, or mention any data (machines, sales, orders, yarn, etc.) that is not explicitly in the history.
+- If the history is empty or very short, say something like "We haven't chatted much yet—ask me about sales, orders, yarn, or machines and I'll help!"
+- Be warm and concise. No bullet lists unless the history clearly had multiple distinct topics.`
+        },
+        {
+          role: 'user',
+          content: `User's question: ${(userMessage || '').slice(0, 300)}\n\nConversation history:\n${historyText}`
+        }
+      ],
+      temperature: 0.5,
+      max_tokens: 250
+    });
+    const text = openaiResponse.choices[0]?.message?.content?.trim();
+    return text || "We haven't chatted much yet—ask me about sales, orders, yarn, or machines and I'll help!";
+  } catch (err) {
+    console.warn('summarizeConversation failed:', err?.message);
+    return "I couldn't summarize our chat right now. You can ask me about sales, orders, yarn, or machines anytime!";
+  }
+};
+
+/**
  * Enhanced intent detection for AI tool calling
  * @param {string} question - User's question
  * @param {Object} [options] - { conversationHistory?: Array<{role, content}> } for GPT-style context
@@ -950,18 +1074,42 @@ Reply in 1-2 short, natural sentences as the agent.`
  */
 export const detectIntent = async (question, options = {}) => {
   const { conversationHistory } = options;
-  // Normalize: fix common typos
-  let normalizedQuestion = question.trim();
-  normalizedQuestion = normalizedQuestion.replace(/quatity/gi, 'quantity');
-  normalizedQuestion = normalizedQuestion.replace(/invetory/gi, 'inventory');
-  normalizedQuestion = normalizedQuestion.replace(/colour/gi, 'color');
+  // Global typo normalization (shared with FAQ entry) then lowercase for pattern matching
+  let normalizedQuestion = normalizeTyposForAgent(question);
   normalizedQuestion = normalizedQuestion.toLowerCase();
   
+  // PRE-CHECK: User asking about the conversation itself (what we discussed, summarize chat) — return null so FAQ/conversation flow answers from history; NEVER treat as a data request (e.g. getMachinesByFloor with message as "floor")
+  const conversationMetaPatterns = [
+    /what\s+have\s+we\s+(?:discussed|chatted|talked)\s+about/i,
+    /what\s+(?:have\s+we|did\s+we)\s+discuss/i,
+    /summar(?:y|ies|ize)\s+(?:our\s+)?(?:chat|conversation|discussion)/i,
+    /summari[sz]e?\s+(?:it|so\s+far)?/i,
+    /(?:our\s+)?(?:chat|conversation)\s+summar/i,
+    /what\s+(?:were\s+we|did\s+we)\s+talking\s+about/i,
+    /recap\s+(?:our\s+)?(?:conversation|chat)/i,
+    /remind\s+me\s+what\s+we\s+discussed/i,
+    /what\s+have\s+we\s+talked\s+about/i,
+    /so\s+far\s+(?:what\s+)?(?:have\s+we|did\s+we)/i,
+    /what\s+did\s+we\s+talk\s+about/i,
+    /(?:can\s+you\s+)?(?:tell\s+me\s+)?what\s+we\s+(?:discussed|chatted|talked)/i
+  ];
+  if (conversationMetaPatterns.some(p => p.test(question.trim()))) {
+    console.log(`[detectIntent] Conversation-meta question (what we discussed/summary) — returning null, no tool`);
+    return null;
+  }
+
   // PRE-CHECK: Handle greetings - return null so conversation service handles it
   const greetingPatterns = [/^hey$/i, /^hi$/i, /^hello$/i, /^greetings$/i];
   if (greetingPatterns.some(pattern => pattern.test(normalizedQuestion))) {
     console.log(`[detectIntent] Detected greeting, returning null for conversation service`);
     return null; // Let conversation service handle greetings naturally
+  }
+
+  // PRE-CHECK: "remove item" / "remove items" = remove a line from an order (edit flow), NOT delete the entire order
+  const isRemoveItemNotOrder = /^(?:remove|delete)\s+(?:an?\s+)?(?:item|line)\s*\.?$/i.test(question.trim()) || /^(?:remove|delete)\s+items?\s*\.?$/i.test(question.trim());
+  if (isRemoveItemNotOrder) {
+    console.log(`[detectIntent] "Remove item" (edit flow) — returning null so FAQ/edit flow handles it, not delete`);
+    return null;
   }
   
   // PRE-CHECK: Direct yarn color queries
@@ -1000,6 +1148,164 @@ export const detectIntent = async (question, options = {}) => {
       action: 'getYarnInventory',
       params: {},
       description: 'Get yarn inventory',
+      confidence: 0.95
+    };
+  }
+
+  // PRE-CHECK: "edit order PO-xxx" / "i wanna edit order PO-2026-979" — resolve before GPT so we always open that order for editing
+  const rawQ = question.trim();
+  const poInQuestion = rawQ.match(/\bpo-?(\d{4}-\d{2,})\b/i) || rawQ.match(/\b(\d{4}-\d{2,})\b/);
+  const editOrderPoMatch = /(?:i\s+)?(?:wanna|want\s+to)\s+edit\s+(?:the\s+)?order\b|edit\s+(?:the\s+)?(?:order\s+)?(?:details?\s+)?(?:for\s+)?\b|edit\s+order\s+/i.test(rawQ);
+  if (editOrderPoMatch && poInQuestion) {
+    const poVal = (poInQuestion[1] || poInQuestion[0] || '').trim();
+    const poNumber = /^po-?/i.test(poVal) ? poVal.replace(/^po-?/i, 'PO-') : (poVal.match(/^\d{4}-\d{2,}$/) ? `PO-${poVal}` : `PO-${poVal}`);
+    console.log(`[detectIntent] PRE-CHECK: edit order with PO number -> editYarnPurchaseOrder(${poNumber})`);
+    return {
+      action: 'editYarnPurchaseOrder',
+      params: { poNumber },
+      description: 'Edit yarn purchase order details (not status)',
+      confidence: 0.98
+    };
+  }
+  const updateOrderPoMatch = /(?:i\s+)?(?:wanna|want\s+to)\s+update\s+(?:an?\s+)?(?:the\s+)?order\b|update\s+(?:an?\s+)?(?:the\s+)?order\s+/i.test(rawQ);
+  if (updateOrderPoMatch && poInQuestion) {
+    const poVal = (poInQuestion[1] || poInQuestion[0] || '').trim();
+    const poNumber = /^po-?/i.test(poVal) ? poVal.replace(/^po-?/i, 'PO-') : `PO-${poVal}`;
+    console.log(`[detectIntent] PRE-CHECK: update order with PO number -> editYarnPurchaseOrder(${poNumber})`);
+    return {
+      action: 'editYarnPurchaseOrder',
+      params: { poNumber },
+      description: 'Update order (edit order details)',
+      confidence: 0.98
+    };
+  }
+
+  // PRE-CHECK: Products by category (e.g. "socks", "do you have socks", "products in socks category") — use category filter, NOT product name search
+  const productByCategoryPhrase = /\b(?:what\s+about|do\s+you\s+have|products?\s+(?:in|with|by)\s+)?(\w+)\s*(?:as\s+product|as\s+category|category|products?)?\s*$|^(\w+)\s*$|socks\s+is\s+category\s+not\s+name/i.test(question.trim());
+  const categoryWordMatch = question.trim().match(/\b(?:what\s+about|do\s+you\s+have|products?\s+(?:in|with|by)\s+)?(\w+)\s*(?:as\s+product|as\s+category|category)?\s*$/i)
+    || question.trim().match(/^(\w+)\s*$/)
+    || (/\bsocks\s+is\s+category\s+not\s+name/i.test(question.trim()) && ['socks']);
+  const knownCategories = ['socks', 'towel', 'handkerchief'];
+  if (productByCategoryPhrase && categoryWordMatch) {
+    const word = (categoryWordMatch[1] || categoryWordMatch[0] || '').toLowerCase().trim();
+    if (word && (knownCategories.includes(word) || question.trim().toLowerCase().includes('category'))) {
+      const categoryName = word.charAt(0).toUpperCase() + word.slice(1);
+      console.log(`[detectIntent] PRE-CHECK: products by category -> getProductsList(category: ${categoryName})`);
+      return {
+        action: 'getProductsList',
+        params: { category: categoryName },
+        description: `Get products in category ${categoryName}`,
+        confidence: 0.95
+      };
+    }
+  }
+
+  // PRE-CHECK: "goods Packing Material", "show me goods Packing Material", "Packing Material goods" — raw materials by group (type-resilient)
+  const goodsGroupMatch = question.trim().match(/(?:show\s+me\s+|can\s+you\s+show\s+me\s+)?goods\s+(packing\s+material|packaging\s+material|packing\s+materials|packaging\s+materials|finished\s+goods|finished\s+good)/i)
+    || question.trim().match(/(packing\s+material|packaging\s+material|finished\s+goods)\s+goods/i);
+  if (goodsGroupMatch && goodsGroupMatch[1]) {
+    const groupPart = goodsGroupMatch[1].trim();
+    console.log(`[detectIntent] PRE-CHECK: goods + group -> getRawMaterials(groupName: ${groupPart})`);
+    return {
+      action: 'getRawMaterials',
+      params: { groupName: groupPart },
+      description: `Get raw materials in group ${groupPart}`,
+      confidence: 0.95
+    };
+  }
+
+  // PRE-CHECK: "finished goods in raw material" / "[group] in raw material(s)" — filter by groupName, not show all (so we don't return Packing Material when user asked for Finished Goods)
+  const rawMaterialGroupInPhrase = /\b(finished\s+goods)\s+in\s+raw\s+material|(?:show\s+me\s+|can\s+you\s+show\s+me\s+)?(.+?)\s+in\s+raw\s+materials?\s*$/i.test(question.trim());
+  if (rawMaterialGroupInPhrase) {
+    const m = question.trim().match(/\b(finished\s+goods)\s+in\s+raw\s+material/i) || question.trim().match(/(?:show\s+me\s+|can\s+you\s+show\s+me\s+)?(.+?)\s+in\s+raw\s+materials?\s*$/i);
+    const groupPart = (m && (m[1] || m[2] || '').trim()) || '';
+    const colorWords = /^(white|black|red|blue|green|yellow|orange|purple|pink|brown|grey|gray|beige|navy|cream|golden|gold|silver|transparent|maroon|olive|khaki|tan|ivory|pearl|coral|teal|turquoise|lime|magenta|cyan|violet|indigo|amber|bronze|copper)$/i;
+    if (groupPart && !colorWords.test(groupPart.replace(/\s+/g, ''))) {
+      const groupName = groupPart.replace(/\b\w/g, (c) => c.toUpperCase());
+      console.log(`[detectIntent] PRE-CHECK: raw materials by group -> getRawMaterials(groupName: ${groupName})`);
+      return {
+        action: 'getRawMaterials',
+        params: { groupName },
+        description: `Get raw materials in group ${groupName}`,
+        confidence: 0.95
+      };
+    }
+  }
+
+  // PRE-CHECK: "list of cities only", "give me cities only", "how many stores and in which cities" — return cities from DB, not getCapabilities
+  const citiesOnlyPhrase = /\b(?:give\s+me\s+)?(?:list\s+of\s+)?cities\s+only\b|\bcities\s+only\b|how\s+many\s+stores\s+(?:we\s+have\s+)?and\s+in\s+which\s+cities|which\s+cities\s+(?:have\s+our\s+)?stores\b/i.test(question.trim());
+  if (citiesOnlyPhrase) {
+    console.log(`[detectIntent] PRE-CHECK: cities only -> getStoresList(citiesOnly: true)`);
+    return {
+      action: 'getStoresList',
+      params: { citiesOnly: true },
+      description: 'Get list of cities that have stores',
+      confidence: 0.95
+    };
+  }
+
+  // PRE-CHECK: "which city has highest/lowest sales" / "top/bottom city by sales" — aggregate from DB with optional order
+  const topCityBySalesPhrase = /\b(?:which|what)\s+city\s+(?:has\s+)?(?:the\s+)?(?:highest|most|lowest|least)\s+sales\b|\bcity\s+with\s+(?:the\s+)?(?:highest|lowest)\s+sales\b|(?:highest|top|lowest|bottom)\s+sales\s+(?:by\s+)?city\b|top\s+city\s+by\s+sales\b|(?:bottom|lowest)\s+city\s+by\s+sales\b/i.test(question.trim());
+  if (topCityBySalesPhrase) {
+    const q = question.trim().toLowerCase();
+    const isLowest = /\blowest\b|\bleast\b|\bbottom\b/.test(q);
+    const params = { top: 10, order: isLowest ? 'lowest' : 'highest' };
+    // Optional: extract period from phrase (e.g. "highest sales city last month")
+    const periodMatch = q.match(/\b(?:last\s+month|last\s+week|last\s+30\s+days|today|yesterday)\b/);
+    if (periodMatch) params.period = periodMatch[0].trim();
+    const topMatch = q.match(/\b(?:top|bottom|first)\s+(\d+)\s+(?:cities?|city)\b|\b(\d+)\s+(?:cities?|city)\s+with\s+(?:highest|lowest|most|least)\s+sales\b/);
+    if (topMatch) {
+      const n = parseInt(topMatch[1] || topMatch[2], 10);
+      if (!isNaN(n) && n >= 1) params.top = Math.min(n, 50);
+    }
+    console.log(`[detectIntent] PRE-CHECK: top/bottom city by sales -> getTopCitiesBySales`, params);
+    return {
+      action: 'getTopCitiesBySales',
+      params,
+      description: `Get cities ranked by sales (${isLowest ? 'lowest' : 'highest'} first)`,
+      confidence: 0.95
+    };
+  }
+
+  // PRE-CHECK: "how many orders received", "how many in transit", "orders received so far" — yarn PO counts from DB (not getOrders placeholder, not GPT hallucination)
+  const ordersReceivedInTransitPhrase = /\bhow\s+many\s+orders\s+(?:have\s+we\s+)?(?:recieved|received)\s+(?:so\s+far)?\b|\bhow\s+many\s+(?:are\s+)?in\s+transit\b|\borders\s+(?:we\s+have\s+)?(?:recieved|received)\s+so\s+far\b|\borders\s+in\s+transit\b|\b(?:recieved|received)\s+orders\s+and\s+in\s+transit\b/i.test(question.trim());
+  if (ordersReceivedInTransitPhrase) {
+    console.log(`[detectIntent] PRE-CHECK: orders received / in transit -> getYarnPurchaseOrderCounts`);
+    return {
+      action: 'getYarnPurchaseOrderCounts',
+      params: {},
+      description: 'Get yarn purchase order counts (received, in transit)',
+      confidence: 0.95
+    };
+  }
+
+  // PRE-CHECK: "show me analytics", "analytics data", "analytics" — return getAnalyticsDashboard so we show data, not just capabilities text
+  const analyticsPhrase = /\b(?:show\s+me\s+)?(?:the\s+)?analytics\s+data\b|\b(?:show\s+me\s+)?analytics\b|\banalytics\s+data\b|\b(?:can\s+you\s+)?show\s+me\s+analytics\b/i.test(question.trim());
+  if (analyticsPhrase) {
+    const cityMatch = question.trim().match(/\banalytics\s+(?:for|in)\s+([a-zA-Z\s,]+?)(?:\s+store)?\s*$/i);
+    const params = cityMatch && cityMatch[1] ? { city: cityMatch[1].trim() } : {};
+    console.log(`[detectIntent] PRE-CHECK: analytics -> getAnalyticsDashboard`, params);
+    return {
+      action: 'getAnalyticsDashboard',
+      params,
+      description: 'Get analytics dashboard' + (params.city ? ` for ${params.city}` : ''),
+      confidence: 0.95
+    };
+  }
+
+  // PRE-CHECK: Sales data / sales from [city] — must run before "get ... from [supplier]" so "sales from Delhi" is getSalesData, not createYarnPurchaseOrder
+  const salesDataPhrase = /\b(?:show\s+me\s+)?(?:data\s+of\s+)?sales\b|\bsales\s+(?:data|records?|transactions?|in|for|from)\b|(?:all\s+)?sales\s+data/i.test(question.trim());
+  if (salesDataPhrase) {
+    const q = question.trim();
+    const cityMatch = q.match(/\bsales\s+(?:data\s+)?(?:from|in|for)\s+([a-zA-Z\s,]+?)(?:\s+and\s+|\s+sort\s+|\s*$)/i) || q.match(/\b(?:data\s+of\s+)?sales\s+from\s+([a-zA-Z\s,]+?)(?:\s+and\s+|\s+sort\s+|\s*$)/i) || q.match(/\b(?:in|for)\s+([A-Za-z]+)\b/);
+    const city = cityMatch && cityMatch[1] ? cityMatch[1].trim().replace(/\s+and\s+.*$/i, '').trim() : undefined;
+    const sortHighToLow = /\bsort\s+(?:it\s+)?(?:from\s+)?(?:higherst|highest)\s+to\s+(?:lowerst|lowest)\b|\b(?:higherst|highest)\s+to\s+(?:lowerst|lowest)\b|\bsort\s+by\s+(?:value|amount|gsv|nsv)\s+(?:desc|high)/i.test(q);
+    const params = { ...(city && { city }), ...(sortHighToLow && { sortBy: 'gsv:desc' }) };
+    console.log(`[detectIntent] PRE-CHECK: sales data -> getSalesData(${JSON.stringify(params)})`);
+    return {
+      action: 'getSalesData',
+      params,
+      description: 'Get sales data' + (city ? ` for ${city}` : '') + (sortHighToLow ? ' (highest to lowest)' : ''),
       confidence: 0.95
     };
   }
@@ -1092,14 +1398,14 @@ export const detectIntent = async (question, options = {}) => {
         pattern: /^SUPPLIER_SELECTED:(.+)$/i,
         action: 'createYarnPurchaseOrder',
         extractParams: (match) => ({ preSelectedSupplierId: match[1].trim(), showSupplierList: true }),
-        description: 'Start place-order flow with pre-selected supplier (numbered list)'
+        description: 'Open wizard with pre-selected supplier'
       },
       // YARN PURCHASE ORDER: "Show supplier list" when user chose to see list (must be before generic place order)
       {
         pattern: /show\s+(?:me\s+)?(?:the\s+)?supplier\s+list|supplier\s+list|see\s+(?:the\s+)?supplier\s+list|option\s*2|choose\s+from\s+(?:the\s+)?list|show\s+list/i,
         action: 'createYarnPurchaseOrder',
         extractParams: () => ({ showSupplierList: true }),
-        description: 'Show supplier list for place order (numbered list)'
+        description: 'Show supplier list for place order wizard'
       },
       // YARN PURCHASE ORDER: "buy [yarn] from [supplier]" — capture both so we ask only quantity/rate, no supplier list
       {
@@ -1450,6 +1756,36 @@ export const detectIntent = async (question, options = {}) => {
           return { color };
         },
         description: 'Get raw materials by color'
+      },
+      // "[group] in raw material(s)" e.g. "finished goods in raw material", "show me finished goods in raw materials"
+      {
+        pattern: /(?:show\s+me\s+|can\s+you\s+show\s+me\s+)?(finished\s+goods)\s+in\s+raw\s+materials?|(.+?)\s+in\s+raw\s+materials?\s*$/i,
+        action: 'getRawMaterials',
+        extractParams: (match) => {
+          const groupPart = (match[1] || match[2] || '').trim();
+          if (!groupPart || /^(show|list|get|all|the|page|by|in|of|with|color|colored|type|brand|me|you)$/i.test(groupPart)) return {};
+          const colorWords = /^(white|black|red|blue|green|yellow|orange|purple|pink|brown|grey|gray|beige|navy|cream|golden|gold|silver|transparent)$/i;
+          if (colorWords.test(groupPart)) return {}; // let color pattern handle
+          const groupName = groupPart.replace(/\b\w/g, (c) => c.toUpperCase());
+          return { groupName };
+        },
+        description: 'Get raw materials by group (e.g. finished goods in raw material)'
+      },
+      // "goods Packing Material", "show me goods Packing Material", "Packing Material goods" — type-resilient (normalizer in getRawMaterials handles Packing/Packaging, Material/Materials)
+      {
+        pattern: /(?:show\s+me\s+|can\s+you\s+show\s+me\s+)?goods\s+(packing\s+material|packaging\s+material|packing\s+materials|packaging\s+materials|finished\s+goods|finished\s+good)/i,
+        action: 'getRawMaterials',
+        extractParams: (match) => {
+          const g = (match[1] || '').trim();
+          return g ? { groupName: g } : {};
+        },
+        description: 'Get raw materials by group (goods + group name)'
+      },
+      {
+        pattern: /(packing\s+material|packaging\s+material|finished\s+goods)\s+goods/i,
+        action: 'getRawMaterials',
+        extractParams: (match) => (match[1] ? { groupName: (match[1] || '').trim() } : {}),
+        description: 'Get raw materials by group ([group] goods)'
       },
       {
         pattern: /raw\s+materials?\s+(?:by|in|of|with)\s+(?:group\s+)?([a-zA-Z0-9\s]+)/i,
@@ -1946,9 +2282,12 @@ export const detectIntent = async (question, options = {}) => {
       description: 'Get sales data (transaction list)'
     },
     {
-      pattern: /analytics\s+dashboard|dashboard|business\s+insights/i,
+      pattern: /analytics\s+dashboard|(?:show\s+me\s+)?analytics(?:\s+data)?|analytics\s+data|dashboard|business\s+insights/i,
       action: 'getAnalyticsDashboard',
-      extractParams: () => ({}),
+      extractParams: (_, fullQuestion) => {
+        const cityMatch = (fullQuestion || '').match(/\banalytics\s+(?:for|in)\s+([a-zA-Z\s,]+?)(?:\s+store)?\s*$/i);
+        return cityMatch && cityMatch[1] ? { city: cityMatch[1].trim() } : {};
+      },
       description: 'Get comprehensive analytics dashboard'
     },
     {
@@ -2772,12 +3111,22 @@ export const getProductsList = async (params = {}) => {
       filter.name = { $regex: name, $options: 'i' };
     }
     if (category) {
-      // Category can be ID or name - try both
+      // Category can be ID or name - resolve name to ObjectId so Product filter works (Product.category is ref, not embedded)
       if (category.match(/^[0-9a-fA-F]{24}$/)) {
         filter.category = category;
       } else {
-        // If it's a name, we'll need to populate category
-        filter['category.name'] = { $regex: category, $options: 'i' };
+        const categoryName = String(category).trim();
+        const catResult = await categoryService.queryCategories(
+          { name: { $regex: categoryName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } },
+          { limit: 1, page: 1 }
+        );
+        if (catResult?.results?.length > 0) {
+          filter.category = catResult.results[0]._id;
+        } else {
+          const allCats = await categoryService.queryCategories({}, { limit: 20 });
+          const names = (allCats?.results || []).map(c => c.name).filter(Boolean).join(', ');
+          return generateHTMLResponse('Category Not Found', `No category found matching "${categoryName}".${names ? ` Available categories: ${names}` : ''}`);
+        }
       }
     }
     if (softwareCode) {
@@ -2907,9 +3256,9 @@ export const getProductsList = async (params = {}) => {
 };
 
 /**
- * Get stores list
+ * Get stores list (or cities only when params.citiesOnly is true — for "list of cities only", "which cities have our stores")
  * @param {Object} params - Parameters
- * @returns {Promise<string>} HTML string with stores list
+ * @returns {Promise<string>} HTML string with stores list or cities list
  */
 export const getStoresList = async (params = {}) => {
   try {
@@ -2923,7 +3272,8 @@ export const getStoresList = async (params = {}) => {
       bpCode, 
       brand, 
       state, 
-      pincode 
+      pincode,
+      citiesOnly 
     } = params;
     const currentPage = parseInt(page) || 1;
     const pageLimit = parseInt(limit) || 50;
@@ -2958,6 +3308,42 @@ export const getStoresList = async (params = {}) => {
       } else if (status === 'inactive' || status === false || status === 'false') {
         filter.isActive = false;
       }
+    }
+
+    // When user asks "list of cities only" / "which cities have our stores" — return unique cities from DB (GPT-style derived view)
+    if (citiesOnly) {
+      const cityList = await Store.distinct('city', filter).then((arr) => (arr || []).filter(Boolean).sort((a, b) => String(a).localeCompare(String(b))));
+      const storeCountByCity = await Store.aggregate([
+        { $match: Object.keys(filter).length ? filter : {} },
+        { $group: { _id: '$city', count: { $sum: 1 } } },
+        { $sort: { _id: 1 } }
+      ]).then((arr) => arr || []);
+      const totalStores = storeCountByCity.reduce((s, x) => s + (x.count || 0), 0);
+      if (cityList.length === 0) {
+        return generateHTMLResponse('No Cities Found', 'No cities found for stores in the system.');
+      }
+      const citiesTableRows = cityList.map((c) => {
+        const row = storeCountByCity.find((r) => r._id === c);
+        const count = row ? row.count : 0;
+        return `<tr><td>${c || 'N/A'}</td><td>${count}</td></tr>`;
+      }).join('');
+      const html = AI_TOOL_STYLES + `
+        <div class="ai-tool-response">
+          <h3>🏙️ Cities with stores</h3>
+          <p style="margin: 10px 0;">We have <strong>${totalStores}</strong> store(s) across <strong>${cityList.length}</strong> cities.</p>
+          <div class="chart-container">
+            <h4>📋 List of cities</h4>
+            <div class="table-container">
+              <table class="data-table">
+                <thead><tr><th>City</th><th>Number of stores</th></tr></thead>
+                <tbody>${citiesTableRows}</tbody>
+              </table>
+            </div>
+          </div>
+          <p class="summary">${cityList.length} cities: ${cityList.join(', ')}.</p>
+        </div>
+      `;
+      return html;
     }
     
     const stores = await storeService.queryStores(filter, { 
@@ -7346,6 +7732,63 @@ export const getYarnReturn = async (params = {}) => {
 };
 
 /**
+ * Get yarn purchase order counts (received, in transit) for "how many orders received / in transit" — returns data-driven answer from DB.
+ * @param {Object} params - Optional dateRange
+ * @returns {Promise<{ html: string, dataDrivenMessage: string }>}
+ */
+export const getYarnPurchaseOrderCounts = async (params = {}) => {
+  try {
+    const counts = await yarnPurchaseOrderService.getPurchaseOrderCountsByStatus(params.dateRange ? { startDate: params.dateRange.startDate, endDate: params.dateRange.endDate } : {});
+    const { total, received, inTransit, byStatus } = counts;
+    const dataDrivenMessage = `We have received **${received}** yarn purchase order(s) so far and **${inTransit}** are currently in transit. (Total POs in system: ${total}.)`;
+    const statusRows = Object.entries(byStatus || {})
+      .sort((a, b) => (b[1] || 0) - (a[1] || 0))
+      .map(([status, count]) => `<tr><td>${(status || 'unknown').replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())}</td><td>${(count || 0).toLocaleString()}</td></tr>`)
+      .join('');
+    const html = AI_TOOL_STYLES + `
+      <div class="ai-tool-response">
+        <h3>🛒 Yarn Purchase Order Counts</h3>
+        <p style="margin: 10px 0;"><strong>${dataDrivenMessage.replace(/\*\*/g, '')}</strong></p>
+        <div class="kpi-grid">
+          <div class="kpi-item">
+            <div class="kpi-label">Received</div>
+            <div class="kpi-value">${(received || 0).toLocaleString()}</div>
+            <div class="kpi-change">Goods received / partially received</div>
+          </div>
+          <div class="kpi-item">
+            <div class="kpi-label">In transit</div>
+            <div class="kpi-value">${(inTransit || 0).toLocaleString()}</div>
+            <div class="kpi-change">Currently in transit</div>
+          </div>
+          <div class="kpi-item">
+            <div class="kpi-label">Total POs</div>
+            <div class="kpi-value">${(total || 0).toLocaleString()}</div>
+            <div class="kpi-change">In system</div>
+          </div>
+        </div>
+        ${statusRows ? `
+        <div class="chart-container">
+          <h4>📋 Count by status</h4>
+          <div class="table-container">
+            <table class="data-table">
+              <thead><tr><th>Status</th><th>Count</th></tr></thead>
+              <tbody>${statusRows}</tbody>
+            </table>
+          </div>
+        </div>
+        ` : ''}
+        <p class="summary">Yarn purchase orders: ${received} received, ${inTransit} in transit.</p>
+      </div>
+    `;
+    return { html, dataDrivenMessage };
+  } catch (error) {
+    console.error('Error in getYarnPurchaseOrderCounts:', error);
+    const errHtml = generateHTMLResponse('Error', `Failed to get order counts: ${error.message}`);
+    return { html: errHtml, dataDrivenMessage: 'Sorry, I couldn’t retrieve order counts at the moment.' };
+  }
+};
+
+/**
  * Get yarn purchase orders
  * @param {Object} params - Parameters with optional status
  * @returns {Promise<string>} HTML string with purchase orders
@@ -7506,12 +7949,15 @@ const buildPlaceOrderSummaryHtml = (ctx) => {
   const items = ctx.collectedItems || [];
   let subTotal = 0;
   let gstTotal = 0;
+  const estDeliveryDate = new Date();
+  estDeliveryDate.setDate(estDeliveryDate.getDate() + 30);
+  const estDeliveryStr = estDeliveryDate.toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric' });
   const rows = items.map((it) => {
     const lineTotal = it.rate * it.quantity;
     const lineGst = (it.gstRate || 0) ? (lineTotal * it.gstRate) / 100 : 0;
     subTotal += lineTotal;
     gstTotal += lineGst;
-    return `<tr><td>${it.yarnName}</td><td>₹${Number(it.rate).toLocaleString()}</td><td>${it.quantity}</td><td>${it.gstRate ?? 0}%</td><td>₹${(lineTotal + lineGst).toLocaleString()}</td></tr>`;
+    return `<tr><td>${it.yarnName}</td><td>₹${Number(it.rate).toLocaleString()}</td><td>${it.quantity}</td><td>${it.gstRate ?? 0}%</td><td>₹${(lineTotal + lineGst).toLocaleString()}</td><td>${estDeliveryStr}</td></tr>`;
   }).join('');
   const total = subTotal + gstTotal;
   return AI_TOOL_STYLES + `
@@ -7520,7 +7966,7 @@ const buildPlaceOrderSummaryHtml = (ctx) => {
       <p class="summary" style="margin: 0.4em 0;"><strong>Supplier:</strong> ${ctx.supplierName || 'N/A'}</p>
       <div class="table-container">
         <table class="data-table">
-          <thead><tr><th>Yarn</th><th>Rate (₹)</th><th>Qty</th><th>GST %</th><th>Line Total</th></tr></thead>
+          <thead><tr><th>Yarn</th><th>Rate (₹)</th><th>Qty</th><th>GST %</th><th>Line Total</th><th>Est. Delivery</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -7569,6 +8015,8 @@ export const createPurchaseOrderFromPlaceContext = async (placeOrderContext) => 
   const poItems = [];
   let subTotal = 0;
   let gstTotal = 0;
+  const estimatedDeliveryDate = new Date();
+  estimatedDeliveryDate.setDate(estimatedDeliveryDate.getDate() + 30);
   for (const it of ctx.collectedItems || []) {
     const yarnCatalog = await findYarnCatalogForPlaceOrder(it.yarnName);
     if (!yarnCatalog) throw new Error(`Yarn "${it.yarnName}" not found in catalog. Add the yarn to the catalog first, or use a name that matches an existing catalog entry.`);
@@ -7588,7 +8036,8 @@ export const createPurchaseOrderFromPlaceContext = async (placeOrderContext) => 
       shadeCode: shadeCode || undefined,
       rate: it.rate,
       quantity: it.quantity,
-      gstRate: it.gstRate || undefined
+      gstRate: it.gstRate || undefined,
+      estimatedDeliveryDate
     });
   }
   const total = subTotal + gstTotal;
@@ -7964,10 +8413,10 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
 
 /**
  * Create yarn purchase order (place new order) from agent params
- * When params are empty, returns numbered list (choose_supplier / disambiguate_supplier) or yarn list (choose_yarn_from_supplier).
+ * When params are empty, returns orderWizardData (suppliers + yarn catalog) for frontend wizard.
  * Expects: poNumber, supplierName, poItems: [{ yarnName, quantity, rate, sizeCount?, shadeCode?, gstRate? }], notes?
  * @param {Object} params
- * @returns {Promise<string|{html: string, orderWizardPrompt?: string, matchingSuppliers?: Array, placeOrderContext?: Object}>} HTML and prompt/context for chat flow
+ * @returns {Promise<string|{html: string, orderWizardData: Object}>} HTML or wizard payload
  */
 
 /**
@@ -8282,7 +8731,7 @@ export const createYarnPurchaseOrder = async (params = {}) => {
     const hasOrderDetails = poNumber && (supplierName || supplierId) && Array.isArray(rawItems) && rawItems.length > 0;
 
     if (!hasOrderDetails) {
-      // "Buy [yarn] from [supplier]" — resolve supplier, validate yarn(s); if all items have qty+rate, create order directly; else return numbered-list flow
+      // "Buy [yarn] from [supplier]" — resolve supplier, validate yarn(s); if all items have qty+rate, create order directly; else return wizard
       const initialItems = Array.isArray(rawItems) ? rawItems : (rawItems && typeof rawItems === 'object' ? [rawItems] : []);
       const yarnOnlyItems = initialItems.filter((it) => (it.yarnName || it.yarn_name || it.name || '').trim());
       const allItemsHaveQtyAndRate = yarnOnlyItems.length > 0 && yarnOnlyItems.every(
@@ -8497,29 +8946,19 @@ export const createYarnPurchaseOrder = async (params = {}) => {
           brandName: s.brandName || s.name || 'Unknown'
         }));
         const yarnNamesList = catalogYarns.map((y) => y.yarnName).join(', ');
-        // Numbered-list flow: show yarn list and continue in chat (no wizard). Pre-fill collectedItems from initial request.
-        const supplierForYarns = await supplierService.getSupplierById(supplierId);
-        const yarnNames = supplierForYarns?.yarnDetails?.length
-          ? [...new Set((supplierForYarns.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
-          : [];
-        const pageSize = 5;
-        const slice = yarnNames.slice(0, pageSize);
-        const hasMore = yarnNames.length > pageSize;
-        const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
-        const collectedItems = yarnOnlyItems.map((it) => ({
-          yarnName: it.yarnName || it.name || 'Unknown',
-          quantity: Number(it.quantity) || 0,
-          rate: Number(it.rate) || 0,
-          gstRate: Number(it.gstRate) ?? 0
-        })).filter((it) => it.yarnName && (it.quantity > 0 || it.rate > 0));
-        const introHtml = generateHTMLResponse(
-          'Choose yarn',
-          `<p>You want <strong>${yarnNamesList}</strong> from <strong>${supplierBrandName}</strong>.</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of a yarn to add, or <strong>done</strong> to place order${collectedItems.length > 0 ? ` (you already have ${collectedItems.length} item(s)).` : '.'}</p>`
-        );
+        const multiVariantNote = catalogYarns.length > yarnOnlyItems.length
+          ? ' <strong>Same product with different size/count — choose the variant you need below.</strong>'
+          : '';
+        const introHtml = `<p>Got it — you want <strong>${yarnNamesList}</strong> from <strong>${supplierBrandName}</strong>.</p>${multiVariantNote}<p>Enter quantity, rate (₹/unit), and other details below — no need to pick from the supplier list.</p>`;
+        const initialPoItems = yarnOnlyItems.map((it) => ({
+          quantity: it.quantity ?? 0,
+          rate: it.rate ?? 0,
+          gstRate: it.gstRate ?? 0,
+          sizeCount: it.sizeCount || undefined
+        }));
         return {
           html: introHtml,
-          orderWizardPrompt: 'choose_yarn_from_supplier',
-          placeOrderContext: { supplierId, supplierName: supplierBrandName, yarnNames, page: 1, collectedItems }
+          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogYarns, nextPoNumber, preSelectedSupplierId: supplierId, initialPoItems }
         };
       }
 
@@ -8815,23 +9254,63 @@ export const createYarnPurchaseOrder = async (params = {}) => {
         };
       }
 
-      // If user chose "Show supplier list" (no pre-selected), return numbered list of suppliers (same as choose_supplier / disambiguate_supplier flow)
+      // If user chose "Show supplier list" (no pre-selected), return full wizard data with per-supplier yarn lists so frontend can filter
       if (showSupplierList) {
-        const suppliersResult = await supplierService.querySuppliers({}, { limit: 200, page: 1 });
+        const [suppliersResult, catalogResult, nextPoNumber] = await Promise.all([
+          supplierService.querySuppliers({}, { limit: 200, page: 1 }),
+          yarnCatalogService.queryYarnCatalogs({}, { limit: 500, page: 1 }),
+          yarnPurchaseOrderService.getNextSuggestedPoNumber()
+        ]);
         const suppliers = suppliersResult?.results ?? suppliersResult ?? [];
-        const matchingSuppliers = suppliers.map((s) => ({
-          id: (s._id || s.id)?.toString?.() || s.id,
+        const yarnCatalog = catalogResult?.results ?? catalogResult ?? [];
+        const suppliersList = suppliers.map((s) => ({
+          id: s._id?.toString?.() || s.id,
           brandName: s.brandName || s.name || 'Unknown'
         }));
-        const numberedList = matchingSuppliers.map((s, i) => `${i + 1}. ${s.brandName}`).join('<br/>');
-        const html = generateHTMLResponse(
-          'Choose supplier',
-          `<p>Reply with the <strong>number</strong> (1–${matchingSuppliers.length}) or supplier name to continue:</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${numberedList}</p>`
-        );
+        const suppliersWithYarns = suppliers.map((s) => {
+          const yarnNames = (s.yarnDetails || [])
+            .map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim())
+            .filter(Boolean);
+          return {
+            id: (s._id || s.id)?.toString?.() || '',
+            brandName: s.brandName || s.name || 'Unknown',
+            yarnNames: [...new Set(yarnNames)]
+          };
+        });
+        const catalogList = yarnCatalog.map((y) => {
+        const countSizes = [];
+        if (y.countSize && (y.countSize._id || y.countSize.id)) {
+          const id = (y.countSize._id || y.countSize.id).toString?.() || y.countSize._id || y.countSize.id;
+          const name = y.countSize.name || id;
+          if (!countSizes.some((cs) => cs.id === id)) countSizes.push({ id, name });
+        }
+        const subtypeCountSizes = y.yarnSubtype?.countSize || [];
+        if (Array.isArray(subtypeCountSizes)) {
+          subtypeCountSizes.forEach((cs) => {
+            const id = (cs?._id || cs?.id)?.toString?.() || cs;
+            const name = (typeof cs === 'object' && (cs?.name || cs?.label)) || id;
+            if (id && !countSizes.some((c) => c.id === (id.toString?.() || id))) {
+              countSizes.push({ id: id.toString?.() || id, name });
+            }
+          });
+        }
+        let shadeCode = (y.pantonShade || y.pantonName || (y.colorFamily?.name || '')).trim() || undefined;
+        if (!shadeCode && (y.yarnName || y.name)) {
+          const nameStr = (y.yarnName || y.name || '').trim();
+          const parts = nameStr.split('-').map((p) => p.trim()).filter(Boolean);
+          if (parts.length >= 2) shadeCode = parts[1] || parts[2] || undefined;
+        }
         return {
-          html,
-          orderWizardPrompt: 'disambiguate_supplier',
-          matchingSuppliers
+          id: y._id?.toString?.() || y.id,
+          yarnName: y.yarnName || y.name || 'Unknown',
+          countSizes: countSizes.length ? countSizes : undefined,
+          shadeCode
+        };
+      });
+        const introHtml = '<p>Select a supplier and yarn items below to place your order. Choose one supplier, then select yarns and enter quantity and rate for each.</p>';
+        return {
+          html: introHtml,
+          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogList, nextPoNumber, suppliersWithYarns }
         };
       }
 
@@ -8881,9 +9360,14 @@ ${whichSupplierWhichColourHtml}
       } else {
         chooseSupplierHtml = '<p>To place a yarn purchase order, I need the supplier. No suppliers found in the system — add suppliers in Yarn Management first.</p>';
       }
+      const matchingSuppliers = list.length > 0 ? list.map((s) => ({
+        id: (s._id || s.id)?.toString?.() || '',
+        brandName: s.brandName || s.supplierName || s.name || 'N/A'
+      })) : [];
       return {
         html: chooseSupplierHtml,
-        orderWizardPrompt: 'choose_supplier'
+        orderWizardPrompt: 'choose_supplier',
+        ...(matchingSuppliers.length > 0 && { matchingSuppliers })
       };
     }
     let supplier = null;
@@ -9233,8 +9717,11 @@ const EDIT_ADD_ITEM_PAGE_SIZE = 5;
  * @returns {Promise<{ html: string, editOrderContext?: { purchaseOrderId: string, poNumber: string, addItemState?: Object } | null }>}
  */
 export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, editContext = null) => {
-  const rawMsg = String(userMessage).trim();
+  let rawMsg = String(userMessage).trim();
   const msg = rawMsg.toLowerCase();
+  // Normalize common typo "bu" -> "by" for "increase ... by N" parsing
+  const msgForBy = rawMsg.replace(/\bbu\s+(\d+)\b/gi, 'by $1').trim();
+  const msgForByLower = msgForBy.toLowerCase();
   // Order fetched by ID (or resolved from PO number) always has supplier populated; use that supplier to fetch its yarn list for add-item flows
   const order = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
   if (!order) {
@@ -9244,6 +9731,7 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
   const items = order.poItems || [];
   const orderSupplierId = order.supplier?._id || order.supplier;
 
+  // Complete / done / cancel: handle first so "complete order" exits edit flow and shows only final order (no confirmation table)
   if (/^(done|cancel|exit|stop|complete)\s*(edit(ing)?|order)?$/.test(msg) || /cancel\s*edit/.test(msg) || /complete\s*(the\s+)?order/.test(msg)) {
     const isComplete = /complete|done|finish/.test(msg);
     return {
@@ -9252,8 +9740,52 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
         isComplete
           ? `Order <strong>${poNumber}</strong> edits are complete. Say "edit order PO-xxx" anytime to edit again.`
           : `Stopped editing ${poNumber}. You can say "edit order PO-xxx" again to edit another order.`
-      ),
+      ) + buildOrderDetailsHtml(order),
       editOrderContext: null
+    };
+  }
+
+  // Increase quantity confirmation: user previously asked to add N to items; we showed a table — now yes = apply, no = cancel
+  const increaseQuantityState = editContext?.increaseQuantityState;
+  if (increaseQuantityState?.step === 'confirm' && Array.isArray(increaseQuantityState.proposed) && increaseQuantityState.proposed.length > 0) {
+    const isYes = /^(?:yes|y|confirm)\s*$/i.test(rawMsg.trim());
+    const isNo = /^(?:no|n|cancel)\s*$/i.test(rawMsg.trim());
+    if (isYes) {
+      let workingItems = items.map((it) => (it.toObject ? it.toObject() : { ...it }));
+      for (const { idx, newQty } of increaseQuantityState.proposed) {
+        if (idx >= 0 && idx < workingItems.length) {
+          workingItems = workingItems.map((it, i) => (i === idx ? { ...it, quantity: newQty } : it));
+        }
+      }
+      const { subTotal, gst, total } = recomputeOrderTotals(workingItems);
+      await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: workingItems, subTotal, gst, total });
+      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
+      return {
+        html: generateHTMLResponse('Quantity Updated', 'Changes applied.') + buildOrderDetailsHtml(updated) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber: updated.poNumber }
+      };
+    }
+    if (isNo) {
+      return {
+        html: generateHTMLResponse('Cancelled', 'No quantity changes were made.') + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+        editOrderContext: { purchaseOrderId, poNumber }
+      };
+    }
+    const tableRows = increaseQuantityState.proposed.map((p) => {
+      const label = p.yarnName || items[p.idx]?.yarnName || 'Item';
+      return `<tr><td>${label}</td><td>${p.currentQty}</td><td>+${p.addQty}</td><td><strong>${p.newQty}</strong></td></tr>`;
+    }).join('');
+    return {
+      html: generateHTMLResponse('Confirm quantity increase', `<p>Do you want to apply these changes?</p><table class="data-table" style="margin: 0.6em 0;"><thead><tr><th>Yarn</th><th>Current</th><th>Add</th><th>New Qty</th></tr></thead><tbody>${tableRows}</tbody></table><p>Reply <strong>yes</strong> to apply or <strong>no</strong> to cancel.</p>`) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId, poNumber, increaseQuantityState }
+    };
+  }
+
+  // "Show me order" / "show order" / "display order" — just re-display current order details, don't run add-item keyword search
+  if (/^(?:show\s+(?:me\s+)?|display\s+|view\s+|see\s+)(?:the\s+)?(?:current\s+)?(?:purchase\s+)?order\s*\.?$/i.test(rawMsg) || /^(?:show|display|view)\s+(?:this\s+)?order\s*\.?$/i.test(rawMsg)) {
+    return {
+      html: buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT,
+      editOrderContext: { purchaseOrderId: order._id.toString(), poNumber: order.poNumber, ...(editContext?.addItemState && { addItemState: editContext.addItemState }) }
     };
   }
 
@@ -9514,53 +10046,65 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
     };
   }
 
-  // Increase quantity by N: "increase quantity by 50", "increase it by 50", "increase by 50", "quantity increase by 50"
-  const increaseMatch = msg.match(/(?:increase|add)\s+(?:the\s+|quantity\s+|it\s+)?by\s+(\d+)/i) || msg.match(/(?:quantity\s+)?increase\s+by\s+(\d+)/i);
-  if (increaseMatch && items.length > 0) {
-    const addQty = parseInt(increaseMatch[1], 10);
-    if (addQty > 0) {
-      let idx = 0;
-      const forYarnMatch = msg.match(/(?:for|of)\s+(.+?)(?:\s+by\s+|\s+increase|$)/i);
-      if (forYarnMatch && forYarnMatch[1]) {
-        const search = forYarnMatch[1].trim().toLowerCase();
-        const i = items.findIndex((it) => getYarnName(it).includes(search) || search.includes(getYarnName(it)));
-        if (i !== -1) idx = i;
-      }
-      const currentQty = items[idx].quantity ?? 0;
-      const newQty = currentQty + addQty;
-      const newItems = items.map((it, i) => {
-        const plain = it.toObject ? it.toObject() : { ...it };
-        return i === idx ? { ...plain, quantity: newQty } : plain;
-      });
-      const { subTotal, gst, total } = recomputeOrderTotals(newItems);
-      await yarnPurchaseOrderService.updatePurchaseOrderById(purchaseOrderId, { poItems: newItems, subTotal, gst, total });
-      const updated = await yarnPurchaseOrderService.getPurchaseOrderById(purchaseOrderId);
-      const itemLabel = items[idx].yarnName || items[idx].yarn?.yarnName || 'item';
-      let html = generateHTMLResponse('Quantity Updated', `Increased <strong>${itemLabel}</strong> by <strong>${addQty}</strong> (was ${currentQty}, now ${newQty}).`) + buildOrderDetailsHtml(updated);
-      // If user also asked for supplier yarn list in same message, append it
-      const alsoAskedSupplierYarn = /(?:what|which|list|give\s+me|tell\s+me)\s+(?:more\s+)?(?:yarn|items?)|(?:what\s+items?|what\s+else)\s+(?:does\s+)?(?:this\s+)?supplier|what\s+(?:more\s+)?yarn\s+(?:are\s+)?available/i.test(msg);
-      if (alsoAskedSupplierYarn) {
-        // Order has supplier; fetch that supplier's yarn list only
-        const supplierIdFromOrder = updated.supplier?._id || updated.supplier;
-        if (supplierIdFromOrder) {
-          try {
-            const supplier = await supplierService.getSupplierById(supplierIdFromOrder);
-            const supplierName = supplier?.brandName || updated.supplier?.brandName || 'this supplier';
-            const yarnDetails = supplier?.yarnDetails || [];
-            const yarnNames = [...new Set(yarnDetails.map((d) => d.yarnName).filter(Boolean))];
-            if (yarnNames.length > 0) {
-              const listHtml = yarnNames.map((name) => `<li><strong>${name}</strong></li>`).join('');
-              html += generateHTMLResponse(`Yarn from ${supplierName}`, `<p>Yarn items <strong>${supplierName}</strong> provides:</p><ul>${listHtml}</ul><p>To add: say <strong>add [yarn name] [qty] at [rate]</strong> — e.g. "add 33/2/120-Dark Grey 20 at 100".</p>`);
-            } else {
-              html += generateHTMLResponse(`Yarn from ${supplierName}`, `<p>No yarn list on file for this supplier. You can add by name: "add [yarn name] 20 at 100".</p>`);
-            }
-          } catch (e) {
-            console.warn('Supplier yarn list append failed:', e?.message);
-          }
+  // Increase quantity by N: parse "first item by 100 and second item by 256", show confirmation table, then yes = apply / no = cancel
+  const increasePhrase = /\b(?:increase|add)\s+(?:the\s+)?(?:quantity\s+)?(?:of\s+)?/i.test(msgForByLower) || /\b(?:first|second|third|1st|2nd|3rd)\s+item\b/i.test(msgForByLower) || /\bitem\s*[123]\b.*\s+(?:by|bu)\s+\d+/i.test(msgForByLower);
+  if (increasePhrase && items.length > 0) {
+    const itemIndexFromRef = (ref) => {
+      const r = String(ref).trim().toLowerCase();
+      if (/^(?:first|1st)$/.test(r)) return 0;
+      if (/^(?:second|2nd)$/.test(r)) return 1;
+      if (/^(?:third|3rd)$/.test(r)) return 2;
+      const n = parseInt(r.replace(/^item\s*/, ''), 10);
+      if (!Number.isNaN(n) && n >= 1) return n - 1;
+      return -1;
+    };
+    const parts = msgForBy.split(/\s+and\s+/i).map((p) => p.trim().replace(/\bbu\s+(\d+)\b/gi, 'by $1')).filter(Boolean);
+    const updates = [];
+    for (const part of parts) {
+      const partLower = part.toLowerCase();
+      const byMatch = part.match(/\s+(?:by|bu)\s+(\d+)\s*$/i) || part.match(/\s+(?:by|bu)\s+(\d+)/i);
+      if (!byMatch || !byMatch[1]) continue;
+      const addQty = parseInt(byMatch[1], 10);
+      if (addQty <= 0) continue;
+      let idx = -1;
+      const firstSecondMatch = part.match(/\b(first|1st|second|2nd|third|3rd)\s+item\b/i) || part.match(/\bitem\s*([123])\b/i);
+      if (firstSecondMatch) {
+        idx = itemIndexFromRef(firstSecondMatch[1] || firstSecondMatch[2]);
+      } else {
+        const forOfMatch = part.match(/(?:for|of)\s+(.+?)(?:\s+(?:by|bu)\s+|\s+increase|$)/i);
+        if (forOfMatch && forOfMatch[1]) {
+          const search = forOfMatch[1].trim().toLowerCase();
+          idx = items.findIndex((it) => getYarnName(it).includes(search) || search.includes(getYarnName(it)));
+        } else {
+          idx = 0;
         }
       }
-      html += EDIT_MORE_OR_COMPLETE_PROMPT;
-      return { html, editOrderContext: { purchaseOrderId, poNumber: updated.poNumber } };
+      if (idx >= 0 && idx < items.length) updates.push({ idx, addQty });
+    }
+    if (updates.length === 0) {
+      const singleBy = msgForByLower.match(/(?:increase|add)(?:\s+(?:the\s+)?(?:quantity\s+)?(?:of\s+)?(?:first\s+item(?:\s+in\s+list)?)?)?\s+(?:by|bu)\s+(\d+)/i) || msgForByLower.match(/\s+(?:by|bu)\s+(\d+)\s*$/i);
+      if (singleBy && singleBy[1]) {
+        const addQty = parseInt(singleBy[1], 10);
+        if (addQty > 0) updates.push({ idx: 0, addQty });
+      }
+    }
+    if (updates.length > 0) {
+      const proposed = [];
+      let workingItems = items.map((it) => (it.toObject ? it.toObject() : { ...it }));
+      for (const { idx, addQty } of updates) {
+        const currentQty = workingItems[idx].quantity ?? 0;
+        const newQty = currentQty + addQty;
+        workingItems = workingItems.map((it, i) => (i === idx ? { ...it, quantity: newQty } : it));
+        const yarnName = workingItems[idx].yarnName || workingItems[idx].yarn?.yarnName || 'Item';
+        proposed.push({ idx, yarnName, currentQty, addQty, newQty });
+      }
+      const tableRows = proposed.map((p) => `<tr><td>${p.yarnName}</td><td>${p.currentQty}</td><td>+${p.addQty}</td><td><strong>${p.newQty}</strong></td></tr>`).join('');
+      const increaseQuantityState = { step: 'confirm', proposed };
+      const html = generateHTMLResponse(
+        'Confirm quantity increase',
+        `<p>I'll add these quantities to your order. Please confirm:</p><table class="data-table" style="margin: 0.6em 0;"><thead><tr><th>Yarn</th><th>Current Qty</th><th>Add</th><th>New Qty</th></tr></thead><tbody>${tableRows}</tbody></table><p>Reply <strong>yes</strong> to apply these changes or <strong>no</strong> to cancel.</p>`
+      ) + buildOrderDetailsHtml(order) + EDIT_MORE_OR_COMPLETE_PROMPT;
+      return { html, editOrderContext: { purchaseOrderId, poNumber, increaseQuantityState } };
     }
   }
 
@@ -9957,7 +10501,7 @@ export const getYarnSuppliers = async (params = {}) => {
         <p class="summary" style="margin: 0.4em 0;">Total: <strong>${totalCount}</strong> suppliers${suppliers.totalResults > suppliers.results.length ? ` (showing ${suppliers.results.length} of ${suppliers.totalResults})` : ''} • <strong>${activeCount}</strong> active • <strong>${brands.length}</strong> unique brands.</p>
         <p class="summary" style="margin: 0.6em 0;"><strong>Numbered list:</strong></p>
         <p class="summary" style="margin: 0.4em 0; padding-left: 1em; line-height: 1.6;">${numberedList}</p>
-        <p class="summary" style="margin-top: 0.8em;">You can place an order by saying <strong>place order</strong> and then typing a supplier name from this list, or <strong>show supplier list</strong> to pick by number.</p>
+        <p class="summary" style="margin-top: 0.8em;">You can place an order by saying <strong>place order</strong> and then typing a supplier name from this list, or <strong>show supplier list</strong> to choose in the wizard.</p>
       </div>
     `;
     
@@ -10261,6 +10805,22 @@ export const getYarnBlends = async (params = {}) => {
   }
 };
 
+/** Normalize raw material group name for typo-resistant matching (e.g. "Packaging Material" -> "Packing Material", "finished goods" -> "Finished Goods"). */
+const normalizeRawMaterialGroupName = (groupName) => {
+  if (!groupName || typeof groupName !== 'string') return groupName;
+  const key = groupName.trim().toLowerCase().replace(/\s+/g, ' ');
+  const canonical = {
+    'packing material': 'Packing Material',
+    'packaging material': 'Packing Material',
+    'packing materials': 'Packing Material',
+    'packaging materials': 'Packing Material',
+    'finished goods': 'Finished Goods',
+    'finished good': 'Finished Goods',
+    'finished good\'s': 'Finished Goods'
+  };
+  return canonical[key] || groupName.trim();
+};
+
 /**
  * Get raw materials
  * @param {Object} params - Parameters
@@ -10271,7 +10831,7 @@ export const getRawMaterials = async (params = {}) => {
     const { 
       limit = 50, 
       page = 1,
-      groupName,
+      groupName: groupNameParam,
       type,
       brand,
       color,
@@ -10287,10 +10847,15 @@ export const getRawMaterials = async (params = {}) => {
       description,
       sortBy = 'createdAt:desc'
     } = params;
+
+    const groupName = groupNameParam ? normalizeRawMaterialGroupName(groupNameParam) : undefined;
     
     // Build filter object - support ALL fields
     const filter = {};
-    if (groupName) filter.groupName = { $regex: groupName, $options: 'i' };
+    if (groupName) {
+      const escaped = groupName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      filter.groupName = { $regex: escaped, $options: 'i' };
+    }
     if (type) filter.type = { $regex: type, $options: 'i' };
     if (brand) filter.brand = { $regex: brand, $options: 'i' };
     if (color) filter.color = { $regex: color, $options: 'i' };
@@ -10317,7 +10882,10 @@ export const getRawMaterials = async (params = {}) => {
       const filterSummary = Object.keys(filter).length > 0 
         ? ` with filters: ${Object.keys(filter).join(', ')}` 
         : '';
-      return generateHTMLResponse('No Raw Materials Found', `No raw materials found${filterSummary}.`);
+      const hint = groupName
+        ? ' Try "Packing Material" or "Finished Goods" (e.g. "show me goods Packing Material" or "finished goods in raw material").'
+        : '';
+      return generateHTMLResponse('No Raw Materials Found', `No raw materials found${filterSummary}.${hint}`);
     }
     
     // Get all unique values for categorization
@@ -11479,7 +12047,7 @@ export const getSalesData = async (params = {}, options = {}) => {
     }
     if (options?.sessionId && totalCount > 0) {
       setAgentFlowSession(options.sessionId, 'sales_data', {
-        salesDataParams: { city, category, productName, storeName, dateFrom: filter.dateFrom, dateTo: filter.dateTo, limit: pageLimit, mrpMin, mrpMax },
+        salesDataParams: { city, category, productName, storeName, dateFrom: filter.dateFrom, dateTo: filter.dateTo, limit: pageLimit, sortBy, mrpMin, mrpMax },
         currentPage,
         totalPages
       });
@@ -11488,6 +12056,139 @@ export const getSalesData = async (params = {}, options = {}) => {
   } catch (error) {
     console.error('Error in getSalesData:', error);
     return { html: generateHTMLResponse('Error', `Failed to retrieve sales data: ${error.message}`) };
+  }
+};
+
+/**
+ * Resolve period string to dateFrom/dateTo (shared for getSalesData-style date filtering).
+ * @param {string} period - e.g. "last month", "last week", "today"
+ * @returns {{ dateFrom: Date, dateTo: Date } | null}
+ */
+const resolvePeriodToDates = (period) => {
+  if (!period || typeof period !== 'string') return null;
+  const now = new Date();
+  const p = period.toLowerCase().trim();
+  let dateFrom; let dateTo;
+  if (p === 'today') {
+    dateFrom = new Date(now); dateFrom.setHours(0, 0, 0, 0);
+    dateTo = new Date(now); dateTo.setHours(23, 59, 59, 999);
+  } else if (p === 'yesterday') {
+    dateFrom = new Date(now); dateFrom.setDate(dateFrom.getDate() - 1); dateFrom.setHours(0, 0, 0, 0);
+    dateTo = new Date(dateFrom); dateTo.setHours(23, 59, 59, 999);
+  } else if (p === 'last week' || p === 'lastweek') {
+    dateTo = new Date(now);
+    dateFrom = new Date(now); dateFrom.setDate(dateFrom.getDate() - 7);
+  } else if (p === 'last month' || p === 'lastmonth') {
+    dateTo = new Date(now);
+    dateFrom = new Date(now); dateFrom.setMonth(dateFrom.getMonth() - 1);
+  } else if (p === 'last 30 days' || p === 'last30days') {
+    dateTo = new Date(now);
+    dateFrom = new Date(now); dateFrom.setDate(dateFrom.getDate() - 30);
+  } else {
+    return null;
+  }
+  return { dateFrom, dateTo };
+};
+
+/**
+ * Get top or bottom cities by sales (aggregated from DB). Supports filters so GPT can return data as the user wishes.
+ * @param {Object} params - { top, order: 'highest'|'lowest', sortBy: 'nsv'|'gsv', dateFrom, dateTo, period }
+ * @returns {Promise<{ html: string, dataDrivenMessage: string }>}
+ */
+export const getTopCitiesBySales = async (params = {}) => {
+  try {
+    let { top: topParam, order, sortBy, dateFrom, dateTo, period } = params;
+    const top = Math.min(parseInt(topParam, 10) || 10, 50);
+    const isLowest = (order || '').toString().toLowerCase() === 'lowest' || (sortBy || '').toString().toLowerCase().endsWith('asc');
+    const sortField = (sortBy || 'nsv').toString().toLowerCase().startsWith('gsv') ? 'totalGSV' : 'totalNSV';
+    const sortDir = isLowest ? 1 : -1;
+
+    if ((!dateFrom && !dateTo) && period) {
+      const resolved = resolvePeriodToDates(period);
+      if (resolved) {
+        dateFrom = resolved.dateFrom;
+        dateTo = resolved.dateTo;
+      }
+    }
+    if (dateFrom && !(dateFrom instanceof Date)) dateFrom = new Date(dateFrom);
+    if (dateTo && !(dateTo instanceof Date)) dateTo = new Date(dateTo);
+
+    const pipeline = [];
+    if (dateFrom || dateTo) {
+      const dateMatch = {};
+      if (dateFrom) dateMatch.$gte = dateFrom;
+      if (dateTo) {
+        const end = new Date(dateTo);
+        end.setHours(23, 59, 59, 999);
+        dateMatch.$lte = end;
+      }
+      pipeline.push({ $match: { date: dateMatch } });
+    }
+    pipeline.push(
+      {
+        $lookup: {
+          from: 'stores',
+          localField: 'plant',
+          foreignField: '_id',
+          as: 'store'
+        }
+      },
+      { $unwind: '$store' },
+      {
+        $group: {
+          _id: '$store.city',
+          totalNSV: { $sum: '$nsv' },
+          totalGSV: { $sum: '$gsv' },
+          totalQuantity: { $sum: '$quantity' },
+          recordCount: { $sum: 1 }
+        }
+      },
+      { $sort: { [sortField]: sortDir } },
+      { $limit: top }
+    );
+    const byCity = await Sales.aggregate(pipeline);
+    if (!byCity || byCity.length === 0) {
+      const filterNote = (dateFrom || dateTo) ? ' for the selected period.' : '.';
+      const html = generateHTMLResponse('No Sales by City', `No sales data found to rank cities${filterNote}`);
+      return { html, dataDrivenMessage: `There is no sales data in the system yet to rank cities by sales${filterNote}` };
+    }
+    const first = byCity[0];
+    const cityName = first._id || 'Unknown';
+    const metricLabel = sortField === 'totalGSV' ? 'GSV' : 'NSV';
+    const value = first[sortField] || 0;
+    const valueFormatted = value.toLocaleString('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+    const orderLabel = isLowest ? 'lowest' : 'highest';
+    const dataDrivenMessage = `The city with the ${orderLabel} sales is ${cityName} with ${valueFormatted} in ${metricLabel}.`;
+    const rows = byCity.map((row, i) => {
+      const nsv = (row.totalNSV || 0).toLocaleString('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+      const gsv = (row.totalGSV || 0).toLocaleString('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+      return `<tr><td>${i + 1}</td><td>${row._id || 'N/A'}</td><td>${nsv}</td><td>${gsv}</td><td>${(row.totalQuantity || 0).toLocaleString()}</td></tr>`;
+    }).join('');
+    const periodNote = (dateFrom || dateTo) ? ' (filtered by date)' : '';
+    const tableTitle = isLowest
+      ? `Bottom ${byCity.length} cities by ${metricLabel.toLowerCase()}${periodNote}`
+      : `Top ${byCity.length} cities by ${metricLabel.toLowerCase()}${periodNote}`;
+    const html = AI_TOOL_STYLES + `
+      <div class="ai-tool-response">
+        <h3>🏙️ Cities by sales</h3>
+        <p style="margin: 10px 0;"><strong>${dataDrivenMessage}</strong></p>
+        <div class="chart-container">
+          <h4>📋 ${tableTitle}</h4>
+          <div class="table-container">
+            <table class="data-table">
+              <thead><tr><th>#</th><th>City</th><th>Total NSV</th><th>Total GSV</th><th>Quantity</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>
+        <p class="summary">Ranking based on ${metricLabel} across all stores in each city${periodNote ? ` for the selected period` : ''}.</p>
+      </div>
+    `;
+    return { html, dataDrivenMessage };
+  } catch (error) {
+    console.error('Error in getTopCitiesBySales:', error);
+    const errHtml = generateHTMLResponse('Error', `Failed to get top cities by sales: ${error.message}`);
+    return { html: errHtml, dataDrivenMessage: 'Sorry, I couldn’t retrieve city-wise sales data at the moment.' };
   }
 };
 
@@ -11559,6 +12260,9 @@ export const setPendingPlaceOrderConfirmation = (sessionId, { placeOrderContext 
 
 const CONFIRM_VARIANTS = ['yes', 'y', 'confirm'];
 const CANCEL_VARIANTS = ['no', 'n', 'cancel'];
+// Treat typos / variants: "yesw", "yess" → confirm; "noo", "nope" → cancel
+const CONFIRM_PATTERN = /^yes\w*$|^y$|^confirm\w*$|^yeah$|^ok$|^sure$/i;
+const CANCEL_PATTERN = /^no\w*$|^n$|^cancel\w*$/i;
 
 /**
  * Resolve pending confirmation when user types yes/no (or y/n, confirm/cancel).
@@ -11571,11 +12275,12 @@ export const resolvePendingConfirmation = async (sessionId, message) => {
   const pending = getPendingConfirmation(sessionId);
   if (!pending) return { resolved: false };
   const normalized = String(message).toLowerCase().trim();
-  const isConfirm = CONFIRM_VARIANTS.includes(normalized);
-  const isCancel = CANCEL_VARIANTS.includes(normalized);
+  const isConfirm = CONFIRM_VARIANTS.includes(normalized) || CONFIRM_PATTERN.test(normalized);
+  const isCancel = CANCEL_VARIANTS.includes(normalized) || CANCEL_PATTERN.test(normalized);
   if (!isConfirm && !isCancel) {
     return {
       resolved: true,
+      isRePrompt: true,
       response: generateHTMLResponse(
         'Confirm',
         '<p>Please type <strong>yes</strong> to confirm or <strong>no</strong> to cancel.</p>'
@@ -11732,6 +12437,8 @@ export const executeAITool = async (intent, options = {}) => {
         return await getYarnRequisitions(intent.params);
       case 'getYarnPurchaseOrders':
         return await getYarnPurchaseOrders(intent.params);
+      case 'getYarnPurchaseOrderCounts':
+        return await getYarnPurchaseOrderCounts(intent.params);
       case 'getYarnPurchaseOrderById':
         return await getYarnPurchaseOrderById(intent.params);
       case 'editYarnPurchaseOrder':
@@ -11784,6 +12491,8 @@ export const executeAITool = async (intent, options = {}) => {
         return await getOrders(intent.params);
       case 'getSalesData':
         return await getSalesData(intent.params, { sessionId });
+      case 'getTopCitiesBySales':
+        return await getTopCitiesBySales(intent.params);
       default:
         throw new Error(`Unknown action: ${intent.action}`);
     }
@@ -11820,6 +12529,7 @@ export default {
   getYarnReturn,
   getYarnRequisitions,
   getYarnPurchaseOrders,
+  getYarnPurchaseOrderCounts,
   getYarnPurchaseOrderById,
   createYarnPurchaseOrder,
   editYarnPurchaseOrder,
@@ -11844,6 +12554,7 @@ export default {
   getProductionDashboard,
   getOrders,
   getSalesData,
+  getTopCitiesBySales,
   detectIntent,
   executeAITool
 };

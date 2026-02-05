@@ -35,16 +35,19 @@ const trainFaq = catchAsync(async (req, res) => {
 
 /**
  * Ask a question and get relevant answer.
- * Session and context window (conversation history) are managed in backend via cookie (chat_session).
+ * Session and context window (conversation history) are managed in backend via cookie (chat_session) and in-memory store.
+ * If no context/conversationHistory in body, backend uses session store. Clients can still send them to override (e.g. Telegram).
  * @route POST /v1/faq/ask
- * @param {Object} req.body - { question: string } (context and conversationHistory are stored per session in backend)
+ * @param {Object} req.body - { question: string, context?, conversationHistory? } (context/history optional; backend uses session store when omitted)
  * @returns {Object} 200 - Relevant answer with metadata
  */
 const askQuestion = catchAsync(async (req, res) => {
-  const { question } = req.body;
+  const { question, context, conversationHistory, sessionId: bodySessionId } = req.body;
 
-  // Session: read from cookie (backend-managed); create and set cookie if missing
-  let sessionId = req.cookies?.[CHAT_SESSION_COOKIE];
+  // Session: prefer client-sent sessionId (for cross-origin Chatbot when cookie isn't sent), else cookie, else create new
+  let sessionId = typeof bodySessionId === 'string' && bodySessionId.length > 0
+    ? bodySessionId
+    : req.cookies?.[CHAT_SESSION_COOKIE];
   if (!sessionId || typeof sessionId !== 'string') {
     sessionId = uuidv4();
     res.cookie(CHAT_SESSION_COOKIE, sessionId, {
@@ -64,13 +67,11 @@ const askQuestion = catchAsync(async (req, res) => {
 
   const trimmedQuestion = question.trim();
 
-  // Context window in backend: append user message to session history, then pass stored history into askQuestion
-  faqService.appendUserMessageToSession(sessionId, trimmedQuestion);
-  const conversationHistory = faqService.getSessionConversationHistory(sessionId);
-
+  // Ask first (session history is read inside askQuestion before appending, so numeric-reply disambiguate can use previous turns)
   const result = await faqService.askQuestion(trimmedQuestion, {
     sessionId,
-    conversationHistory
+    context: context && Object.keys(context).length > 0 ? context : undefined,
+    conversationHistory: Array.isArray(conversationHistory) && conversationHistory.length > 0 ? conversationHistory : undefined
   });
 
   // Persist assistant response to session conversation history (context window)
@@ -80,7 +81,7 @@ const askQuestion = catchAsync(async (req, res) => {
 
   res.status(httpStatus.OK).json({
     status: 'success',
-    data: { ...result, responseText }
+    data: { ...result, responseText, sessionId }
   });
 });
 

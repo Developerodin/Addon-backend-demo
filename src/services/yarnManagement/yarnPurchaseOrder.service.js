@@ -95,6 +95,38 @@ export const getPurchaseOrderStatusByPoNumber = async (poNumber) => {
 };
 
 /**
+ * Get counts of purchase orders by currentStatus (for "how many received / in transit").
+ * @param {Object} [dateRange] - Optional { startDate, endDate }
+ * @returns {Promise<{ total: number, byStatus: Record<string, number>, received: number, inTransit: number }>}
+ */
+export const getPurchaseOrderCountsByStatus = async (dateRange = {}) => {
+  const filter = {};
+  if (dateRange.startDate || dateRange.endDate) {
+    filter.createDate = {};
+    if (dateRange.startDate) filter.createDate.$gte = new Date(dateRange.startDate);
+    if (dateRange.endDate) {
+      const end = new Date(dateRange.endDate);
+      end.setHours(23, 59, 59, 999);
+      filter.createDate.$lte = end;
+    }
+  }
+  const rows = await YarnPurchaseOrder.aggregate([
+    { $match: Object.keys(filter).length ? filter : {} },
+    { $group: { _id: '$currentStatus', count: { $sum: 1 } } }
+  ]).then((arr) => arr || []);
+  const byStatus = {};
+  let total = 0;
+  rows.forEach((r) => {
+    const status = r._id || 'unknown';
+    byStatus[status] = r.count || 0;
+    total += r.count || 0;
+  });
+  const received = (byStatus.goods_received || 0) + (byStatus.goods_partially_received || 0);
+  const inTransit = byStatus.in_transit || 0;
+  return { total, byStatus, received, inTransit };
+};
+
+/**
  * Suggest next PO number for new orders (e.g. PO-2025-001, PO-2025-002).
  * Finds the highest PO number for the current year and increments it.
  * @returns {Promise<string>} e.g. "PO-2025-001"
