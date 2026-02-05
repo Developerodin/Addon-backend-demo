@@ -10,12 +10,13 @@ import logger from '../config/logger.js';
 export const handleTelegramWebhook = catchAsync(async (req, res) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) {
-    logger.warn('TELEGRAM_BOT_TOKEN not set; telegram webhook ignored');
+    logger.warn('TELEGRAM_BOT_TOKEN not set; telegram webhook ignored. Set in .env and restart. See TELEGRAM_SETUP.md');
     return res.sendStatus(200);
   }
 
   const update = req.body;
   if (!update) {
+    logger.debug('Telegram webhook: empty body');
     return res.sendStatus(200);
   }
 
@@ -24,6 +25,7 @@ export const handleTelegramWebhook = catchAsync(async (req, res) => {
   const text = (message?.text || '').trim();
 
   if (!chatId) {
+    logger.debug('Telegram webhook: no chatId (e.g. channel post)');
     return res.sendStatus(200);
   }
 
@@ -38,10 +40,11 @@ export const handleTelegramWebhook = catchAsync(async (req, res) => {
   }
 
   try {
-    // Per-chat session so multi-turn flows (edit PO, create PO) work in Telegram
     const sessionId = `telegram_${chatId}`;
     const { summary } = await messengerSummaryService.getSummary(text, { sessionId });
-    await bot.sendMessage(chatId, summary || 'No response.', { parse_mode: undefined });
+    const reply = summary || 'No response.';
+    await bot.sendMessage(chatId, reply, { parse_mode: undefined });
+    logger.info(`Telegram reply sent to chat ${chatId} (${reply.length} chars)`);
   } catch (err) {
     logger.error('Telegram webhook chatbot error:', err);
     await bot.sendMessage(chatId, `Sorry, something went wrong: ${err.message}`).catch(() => {});
