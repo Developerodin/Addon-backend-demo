@@ -173,6 +173,18 @@ function summarizeForMessenger(result) {
 }
 
 /**
+ * Plain-text version of FAQ ask result (no HTML). For use in /v1/faq/ask so clients
+ * get both response (HTML) and responseText for readable display / fallback.
+ * @param {Object} result - faqService.askQuestion result
+ * @param {number} maxLength - max length (default 12k for web UI)
+ * @returns {string}
+ */
+export function getResponseText(result, maxLength = 12000) {
+  const raw = summarizeForMessenger(result);
+  return raw.length > maxLength ? raw.slice(0, maxLength - 20) + '…' : raw;
+}
+
+/**
  * Ask question using same FAQ/ask flow as website, return text summary only.
  * For use by Telegram webhook, WhatsApp, etc.
  * Pass sessionId (e.g. telegram_<chatId>) to enable multi-turn flows (edit PO, create PO) per chat.

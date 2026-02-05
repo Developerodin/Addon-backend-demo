@@ -76,9 +76,11 @@ const askQuestion = catchAsync(async (req, res) => {
   // Persist assistant response to session conversation history (context window)
   faqService.persistSessionConversationFromResponse(sessionId, trimmedQuestion, result);
 
+  const responseText = messengerSummaryService.getResponseText(result);
+
   res.status(httpStatus.OK).json({
     status: 'success',
-    data: result
+    data: { ...result, responseText }
   });
 });
 
