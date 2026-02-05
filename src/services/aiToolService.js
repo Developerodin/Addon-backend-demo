@@ -356,6 +356,8 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
               "period": "extracted time period or null",
               "dateFrom": "extracted start date or null",
               "dateTo": "extracted end date or null",
+              "mrpMin": "extracted minimum MRP (e.g. when user says mrp above 299, price above 299) or null",
+              "mrpMax": "extracted maximum MRP (e.g. when user says mrp below 500) or null",
               
               // Machine filters
               "machineStatus": "extracted machine status (Active, Under Maintenance, Idle) or null",
@@ -488,12 +490,16 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - For city-based analytics: action = "getAnalyticsDashboard", extract city (when asking for analytics/performance in a city)
           - For top products: action = "getTopProducts", extract city if mentioned
           - For capabilities: action = "getCapabilities" if asking about what the system can do
-          - For sales reports: action = "getSalesReport", extract period, city if mentioned
-          - For sales data/transactions: action = "getSalesData" if asking about sales records, transactions, or sales details
-          - For sales filtered by city: action = "getSalesData", extract city parameter
-          - For sales filtered by product: action = "getSalesData", extract productName parameter
-          - For sales filtered by store: action = "getSalesData", extract storeName parameter
-          - For sales filtered by date range: action = "getSalesData", extract dateFrom and dateTo parameters
+          **SALES DATA (full access for chatbot):**
+          - getSalesData = transaction-level sales records (filterable list with Date, Store, Product, Category, Quantity, MRP, Discount, GSV, NSV, Tax). Use for: "show sales", "sales data", "sales records", "sales in [city]", "sales for [product]", "sales at [store]", "sales from [date] to [date]", "last month sales", "sales by category".
+          - getSalesReport = aggregated report (KPIs, trends, summaries). Use for: "sales report", "sales summary", "sales trend", "monthly sales".
+          - For getSalesData ALWAYS extract any mentioned: city, productName, storeName, dateFrom, dateTo, category, limit (default 50), page, mrpMin (when user says "mrp above X", "MRP > X", "price above X"), mrpMax (when user says "mrp below X", "MRP < X").
+          - For sales filtered by city: action = "getSalesData", params: { city: "extracted city" }
+          - For sales filtered by product: action = "getSalesData", params: { productName: "extracted product name" }
+          - For sales filtered by store: action = "getSalesData", params: { storeName: "extracted store name" }
+          - For sales filtered by date range: action = "getSalesData", params: { dateFrom: "YYYY-MM-DD or date string", dateTo: "YYYY-MM-DD or date string" }
+          - For "last week/month" sales: action = "getSalesData", params: { period: "last week" or "last month" } (backend will resolve dates)
+          - Combine multiple filters when user says e.g. "sales in Mumbai for product X last month" → getSalesData with city, productName, period
           - For analytics: action = "getAnalyticsDashboard" for general business insights or city-based analysis
           - For brand performance: action = "getBrandPerformance" if asking about brand performance, brand data, or brand analysis
           - For product count: action = "getProductCount" if asking about product inventory
@@ -750,11 +756,15 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
           - "inactive stores" or "stores inactive" → getStoresList with status="inactive"
           - "stores in [city] active" or "active stores in [city]" → getStoresList with city="[city]" and status="active"
           - "stores in mumbai active" → getStoresList with city="mumbai", status="active"
-          - "sales data" or "sales records" or "sales transactions" → getSalesData
-          - "sales in [city]" or "sales for [city]" → getSalesData with city parameter
-          - "sales for [product name]" or "sales of [product]" → getSalesData with productName parameter
-          - "sales for store [store name]" or "sales at [store]" → getSalesData with storeName parameter
-          - "sales from [date] to [date]" → getSalesData with dateFrom and dateTo parameters
+          - "show me sales", "sales data", "all sales", "sales records", "list sales" → getSalesData (no filters, or with limit)
+          - "sales in Mumbai", "sales for Delhi", "sales in [city]", "sales data of [city] store", "[city] store sales" → getSalesData with city ONLY (do NOT set storeName to "[city] store")
+          - "sales for [product name]", "sales of [product]", "how much did we sell of [product]" → getSalesData with productName
+          - "sales at [store]", "sales for store [name]", "store [name] sales" → getSalesData with storeName (only when [name] is a specific store name, not "[city] store")
+          - "sales from Jan 1 to Jan 31", "sales between [date] and [date]" → getSalesData with dateFrom and dateTo (use ISO or YYYY-MM-DD when possible)
+          - "last month sales", "sales last week", "this week sales" → getSalesData with period: "last month" or "last week" or "today"
+          - "sales in Mumbai for product X", "Mumbai sales last month" → getSalesData with city, productName and/or period (combine filters)
+          - "sales with MRP above 299", "products mrp above 299", "sales of products which has mrp above 299" → getSalesData with mrpMin: 299 (and city/product/date if mentioned)
+          - "sales report", "sales summary", "sales trend" → getSalesReport
           - "production orders" → getProductionOrders
           - "production dashboard" → getProductionDashboard
           
@@ -1895,10 +1905,46 @@ export const detectIntent = async (question, options = {}) => {
       description: 'Get total product count'
     },
     {
-      pattern: /sales\s+report|sales\s+data|sales\s+summary/i,
+      pattern: /sales\s+report|sales\s+summary|sales\s+trend|monthly\s+sales\s+report/i,
       action: 'getSalesReport',
       extractParams: () => ({}),
-      description: 'Get sales report'
+      description: 'Get sales report (aggregated)'
+    },
+    {
+      pattern: /sales\s+for\s+(?:product\s+)?(.+?)(?:\s+in\s+[a-zA-Z]+|\s+from|\s+to|$)/i,
+      action: 'getSalesData',
+      extractParams: (match, q) => {
+        const productPart = (match[1] || '').trim();
+        const cityMatch = (q || '').match(/sales\s+for\s+(?:product\s+)?(.+?)\s+in\s+([a-zA-Z\s,]+)/i);
+        const params = { productName: cityMatch ? cityMatch[1].trim() : productPart };
+        if (cityMatch && cityMatch[2]) params.city = cityMatch[2].trim();
+        return params;
+      },
+      description: 'Get sales data for product (optional city)'
+    },
+    {
+      pattern: /sales\s+(?:in|for)\s+([a-zA-Z\s,]+?)(?:\s+from|\s+to|$)/i,
+      action: 'getSalesData',
+      extractParams: (match) => ({ city: match[1].trim() }),
+      description: 'Get sales data filtered by city'
+    },
+    {
+      pattern: /sales\s+(?:from|between)\s+([^\s]+(?:\s+[^\s]+)?)\s+(?:to|and)\s+([^\s]+(?:\s+[^\s]+)?)/i,
+      action: 'getSalesData',
+      extractParams: (match) => ({ dateFrom: match[1].trim(), dateTo: match[2].trim() }),
+      description: 'Get sales data by date range'
+    },
+    {
+      pattern: /sales\s+at\s+(?:store\s+)?([a-zA-Z0-9\s\-]+?)(?:\s+from|\s+to|$)/i,
+      action: 'getSalesData',
+      extractParams: (match) => ({ storeName: match[1].trim() }),
+      description: 'Get sales data by store'
+    },
+    {
+      pattern: /(?:show\s+me\s+)?(?:all\s+)?sales\s+data|sales\s+records?|sales\s+transactions?|list\s+sales/i,
+      action: 'getSalesData',
+      extractParams: () => ({}),
+      description: 'Get sales data (transaction list)'
     },
     {
       pattern: /analytics\s+dashboard|dashboard|business\s+insights/i,
@@ -7481,6 +7527,37 @@ const buildPlaceOrderSummaryHtml = (ctx) => {
     </div>`;
 };
 
+/**
+ * Resolve a yarn name (e.g. from supplier list) to a catalog entry. Tries full name, then prefix matches.
+ * @param {string} yarnName - e.g. "20s-Beige-Bamboo/Bamboo"
+ * @returns {Promise<Object|null>} catalog doc or null
+ */
+const findYarnCatalogForPlaceOrder = async (yarnName) => {
+  if (!yarnName || !String(yarnName).trim()) return null;
+  const name = String(yarnName).trim();
+  let res = await yarnCatalogService.queryYarnCatalogs({ yarnName: name }, { limit: 1 });
+  let catalog = res?.results?.[0] || res?.[0] || null;
+  if (catalog) return catalog;
+  const parts = name.split('-').map((p) => p.trim()).filter(Boolean);
+  if (parts.length >= 2) {
+    const prefix = parts.slice(0, 2).join('-');
+    res = await yarnCatalogService.queryYarnCatalogs({ yarnName: prefix }, { limit: 10 });
+    const list = res?.results ?? res ?? [];
+    const lower = name.toLowerCase();
+    catalog = list.find((c) => (c.yarnName || '').toLowerCase() === lower) ||
+      list.find((c) => (c.yarnName || '').toLowerCase().includes(lower)) ||
+      list.find((c) => lower.includes((c.yarnName || '').toLowerCase())) ||
+      list[0];
+  }
+  if (!catalog && parts.length >= 1) {
+    res = await yarnCatalogService.queryYarnCatalogs({ yarnName: parts[0] }, { limit: 20 });
+    const list = res?.results ?? res ?? [];
+    const lower = name.toLowerCase();
+    catalog = list.find((c) => (c.yarnName || '').toLowerCase().includes(lower)) || list[0];
+  }
+  return catalog || null;
+};
+
 /** Create PO from placeOrderContext (used after user confirms "yes") */
 export const createPurchaseOrderFromPlaceContext = async (placeOrderContext) => {
   const ctx = placeOrderContext || {};
@@ -7491,9 +7568,8 @@ export const createPurchaseOrderFromPlaceContext = async (placeOrderContext) => 
   let subTotal = 0;
   let gstTotal = 0;
   for (const it of ctx.collectedItems || []) {
-    const catalogResult = await yarnCatalogService.queryYarnCatalogs({ yarnName: it.yarnName }, { limit: 1 });
-    const yarnCatalog = catalogResult?.results?.[0] || catalogResult?.[0] || null;
-    if (!yarnCatalog) throw new Error(`Yarn "${it.yarnName}" not found in catalog.`);
+    const yarnCatalog = await findYarnCatalogForPlaceOrder(it.yarnName);
+    if (!yarnCatalog) throw new Error(`Yarn "${it.yarnName}" not found in catalog. Add the yarn to the catalog first, or use a name that matches an existing catalog entry.`);
     const yarnId = yarnCatalog._id?.toString?.() || yarnCatalog.id;
     const fullYarnName = yarnCatalog.yarnName || it.yarnName || '';
     // sizeCount is the start of product name (e.g. "20/40" from "20/40-Black-Black-Nylon/Spandex")
@@ -7541,6 +7617,19 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
   if (/^(cancel|start\s+over|never\s+mind|forget\s+it)$/i.test(msg) || msg === 'no') {
     const html = generateHTMLResponse('Order cancelled', 'Order cancelled. Say <strong>place order</strong> to start a new one.');
     return { html, orderWizardPrompt: null, placeOrderContext: undefined, summary: 'Order cancelled.' };
+  }
+
+  // "yes"/"y"/"confirm" when we have order summary (collectedItems) — place the order (handles both inPlaceOrderYarnFlow and stored create_po path)
+  const hasCollectedItems = (ctx.collectedItems?.length ?? 0) > 0;
+  if (hasCollectedItems && /^(?:yes|y|confirm)\s*$/i.test(msg)) {
+    try {
+      const { created, total, poItems } = await createPurchaseOrderFromPlaceContext(ctx);
+      const html = generateHTMLResponse('Order Placed', `Purchase order <strong>${created.poNumber}</strong> created successfully with ${poItems.length} item(s). Total: ₹${total.toLocaleString()}. Opening the form so you can see it.`);
+      return { html, orderWizardPrompt: null, placeOrderContext: undefined, summary: `Order placed with PO number ${created.poNumber}.` };
+    } catch (err) {
+      const html = generateHTMLResponse('Error', err?.message || 'Failed to place order.');
+      return { html, orderWizardPrompt: null, placeOrderContext: ctxCopy, summary: 'Place order failed.' };
+    }
   }
 
   // "but" = common typo for "buy" (e.g. "wanna but yarn", "i want to but yarn")
@@ -8060,6 +8149,61 @@ Return ONLY a JSON object:
 };
 
 /**
+ * Use GPT to interpret user intent when regex/fuzzy matching fails for supplier selection.
+ * E.g. "ok from allen", "the first one", "allen please" -> supplier name or 1-based index.
+ * @param {string} userMessage - Raw user reply (e.g. "ok from allen")
+ * @param {Array<{ _id?: string, id?: string, brandName?: string, name?: string }>} suppliers - List of suppliers (same order as shown to user, 1-based index)
+ * @returns {Promise<{ supplierNumber?: number, supplierQuery?: string } | null>}
+ */
+const interpretSupplierChoiceWithGPT = async (userMessage, suppliers) => {
+  const text = String(userMessage || '').trim();
+  if (text.length < 1 || !Array.isArray(suppliers) || suppliers.length === 0) return null;
+  try {
+    const listStr = suppliers
+      .slice(0, 30)
+      .map((s, i) => `${i + 1}. ${s.brandName || s.name || 'Unknown'}`)
+      .join('\n');
+    const response = await openai.chat.completions.create({
+      model: config.openai?.model || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are interpreting a user's reply when they were shown a list of suppliers and asked to choose one.
+
+Suppliers (numbered 1 to N):
+${listStr}
+
+The user replied with a short message (e.g. "ok from allen", "the first one", "allen", "number 2", "go with premier threads").
+
+Return ONLY a JSON object, no markdown:
+- If they are clearly choosing by position: { "supplierNumber": <1-based index> }. E.g. "the first one" -> 1, "number 2" -> 2, "second" -> 2.
+- If they are naming the supplier (full or partial): { "supplierQuery": "<supplier name or part of name>" }. E.g. "ok from allen" -> "Allen Solley" or "allen", "from allen" -> "allen", "wampum" -> "WAMPUM", "premier" -> "Premier Threads". Use the closest matching name from the list when possible.
+- If unclear or not a supplier choice: { "supplierNumber": null, "supplierQuery": null }.`
+        },
+        { role: 'user', content: text }
+      ],
+      temperature: 0.1,
+      max_tokens: 120
+    });
+    const content = response.choices[0]?.message?.content?.trim();
+    if (!content) return null;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    const num = parsed.supplierNumber != null ? parseInt(parsed.supplierNumber, 10) : null;
+    const query = (parsed.supplierQuery || '').trim() || undefined;
+    if (num != null && !Number.isNaN(num) && num >= 1 && num <= suppliers.length) {
+      return { supplierNumber: num };
+    }
+    if (query && query.length >= 2) return { supplierQuery: query };
+    return null;
+  } catch (err) {
+    console.warn('interpretSupplierChoiceWithGPT failed:', err?.message);
+    return null;
+  }
+};
+
+/**
  * Parse "supplier yarn1 and yarn2 and yarn3 ... qty1 and qty2 and qty3 pieces for rate1 and rate2 and rate3 with 12% gst" (or "with 12% and 18% gst" for per-item GST).
  * Supports 2 or more items with different pieces, rates, and optional per-item GST.
  * @returns {{ supplierQuery: string, poItems: Array<{yarnName, quantity, rate, gstRate}> } | null}
@@ -8144,6 +8288,16 @@ export const createYarnPurchaseOrder = async (params = {}) => {
       );
       if (supplierQuery && typeof supplierQuery === 'string' && supplierQuery.trim() && yarnOnlyItems.length > 0) {
         let query = supplierQuery.trim();
+        // Normalize "ok from allen" / "from allen" / "go with wampum" etc. to just the supplier name part for matching
+        if (!/^\d+$/.test(query)) {
+          const normalized = query
+            .replace(/^(?:ok(?:ay)?\s+)?from\s+/i, '')
+            .replace(/^(?:go\s+with|lets?\s+go\s+with|i\s+(?:want|ll\s+take)|(?:get|order|buy)\s+from)\s+/i, '')
+            .replace(/^(?:ok(?:ay)?\s+)/i, '')
+            .replace(/\s+(?:please|thanks\.?)$/i, '')
+            .trim();
+          if (normalized.length > 0) query = normalized;
+        }
         const num = supplierNumber != null ? Number(supplierNumber) : (/^\d+$/.test(query) ? parseInt(query, 10) : null);
         if (num != null && !Number.isNaN(num) && num >= 1) {
           const allRes = await supplierService.querySuppliers({}, { limit: 50, page: 1 });
@@ -8192,6 +8346,16 @@ export const createYarnPurchaseOrder = async (params = {}) => {
           const allSuppliers = allSuppliersResult?.results ?? allSuppliersResult ?? [];
           const nearest = findNearestSupplierByTypo(query, allSuppliers, { maxTotalEditDistance: 6, maxPerWord: 2 });
           if (nearest) matches = [{ _id: nearest.best.id, brandName: nearest.best.brandName }];
+          if (matches.length === 0) {
+            const gptChoice = await interpretSupplierChoiceWithGPT(supplierQuery.trim(), allSuppliers);
+            if (gptChoice?.supplierNumber) {
+              const one = allSuppliers[gptChoice.supplierNumber - 1];
+              if (one) matches = [{ _id: one._id, brandName: one.brandName || one.name }];
+            } else if (gptChoice?.supplierQuery) {
+              const nearestGpt = findNearestSupplierByTypo(gptChoice.supplierQuery, allSuppliers, { maxTotalEditDistance: 6, maxPerWord: 2 });
+              if (nearestGpt) matches = [{ _id: nearestGpt.best.id, brandName: nearestGpt.best.brandName }];
+            }
+          }
         }
         if (matches.length === 0) {
           return generateHTMLResponse('Supplier not found', `No supplier found matching "${query}". Please check the name or choose from the supplier list.`);
@@ -8350,6 +8514,16 @@ export const createYarnPurchaseOrder = async (params = {}) => {
       // User mentioned a supplier name only: look up with fuzzy/partial match so "wampum limited 2" finds "WAMPUM SYNTEX PRIVATE LIMITED 2"
       if (supplierQuery && typeof supplierQuery === 'string' && supplierQuery.trim()) {
         let query = supplierQuery.trim();
+        // Normalize "ok from allen" / "from allen" / "go with wampum" etc. to just the supplier name part for matching
+        if (!/^\d+$/.test(query)) {
+          const normalized = query
+            .replace(/^(?:ok(?:ay)?\s+)?from\s+/i, '')
+            .replace(/^(?:go\s+with|lets?\s+go\s+with|i\s+(?:want|ll\s+take)|(?:get|order|buy)\s+from)\s+/i, '')
+            .replace(/^(?:ok(?:ay)?\s+)/i, '')
+            .replace(/\s+(?:please|thanks\.?)$/i, '')
+            .trim();
+          if (normalized.length > 0) query = normalized;
+        }
         const num = supplierNumber != null ? Number(supplierNumber) : (/^\d+$/.test(query) ? parseInt(query, 10) : null);
         if (num != null && !Number.isNaN(num) && num >= 1) {
           const allRes = await supplierService.querySuppliers({}, { limit: 50, page: 1 });
@@ -8463,6 +8637,88 @@ export const createYarnPurchaseOrder = async (params = {}) => {
               matchingSuppliers
             };
           }
+          const gptChoice = await interpretSupplierChoiceWithGPT(supplierQuery.trim(), allSuppliers);
+          if (gptChoice?.supplierNumber) {
+            const one = allSuppliers[gptChoice.supplierNumber - 1];
+            if (one) {
+              const id = one._id?.toString?.() || one.id;
+              const brandName = one.brandName || one.name || 'Unknown';
+              const supplier = await supplierService.getSupplierById(id);
+              let yarnNames = supplier?.yarnDetails?.length
+                ? [...new Set((supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+                : [];
+              let displayYarnNames = yarnNames;
+              let filterLabel = '';
+              let noColourMatchMessage = '';
+              if (yarnHint && String(yarnHint).trim()) {
+                const h = String(yarnHint).trim().toLowerCase();
+                const matching = yarnNames.filter((y) => y.toLowerCase().includes(h));
+                if (matching.length > 0) {
+                  displayYarnNames = matching;
+                  filterLabel = ` with "<strong>${yarnHint}</strong>" in the name`;
+                } else {
+                  noColourMatchMessage = `This supplier has nothing in <strong>${yarnHint}</strong>. You can: <strong>change supplier</strong>, <strong>look for another colour</strong>, or <strong>choose from the table below</strong>.`;
+                }
+              }
+              const pageSize = 5;
+              const slice = displayYarnNames.slice(0, pageSize);
+              const hasMore = displayYarnNames.length > pageSize;
+              const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+              const intro = noColourMatchMessage
+                ? `<p>${noColourMatchMessage}</p><p>Here are yarn items from <strong>${brandName}</strong> (top ${slice.length}):</p>`
+                : filterLabel
+                  ? `Here are yarn items from <strong>${brandName}</strong>${filterLabel}:`
+                  : `You chose <strong>${brandName}</strong>. Here are yarn items (top ${slice.length}):`;
+              const html = generateHTMLResponse(
+                'Choose yarn',
+                `<p>${intro}</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+              );
+              return {
+                html,
+                orderWizardPrompt: 'choose_yarn_from_supplier',
+                placeOrderContext: { supplierId: id, supplierName: brandName, yarnNames: displayYarnNames, page: 1 }
+              };
+            }
+          } else if (gptChoice?.supplierQuery) {
+            const nearestGpt = findNearestSupplierByTypo(gptChoice.supplierQuery, allSuppliers, { maxTotalEditDistance: 6, maxPerWord: 2 });
+            if (nearestGpt && nearestGpt.score <= 2) {
+              const supplier = await supplierService.getSupplierById(nearestGpt.best.id);
+              let yarnNames = supplier?.yarnDetails?.length
+                ? [...new Set((supplier.yarnDetails || []).map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim()).filter(Boolean))]
+                : [];
+              let displayYarnNames = yarnNames;
+              let filterLabel = '';
+              let noColourMatchMessage = '';
+              if (yarnHint && String(yarnHint).trim()) {
+                const h = String(yarnHint).trim().toLowerCase();
+                const matching = yarnNames.filter((y) => y.toLowerCase().includes(h));
+                if (matching.length > 0) {
+                  displayYarnNames = matching;
+                  filterLabel = ` with "<strong>${yarnHint}</strong>" in the name`;
+                } else {
+                  noColourMatchMessage = `This supplier has nothing in <strong>${yarnHint}</strong>. You can: <strong>change supplier</strong>, <strong>look for another colour</strong>, or <strong>choose from the table below</strong>.`;
+                }
+              }
+              const pageSize = 5;
+              const slice = displayYarnNames.slice(0, pageSize);
+              const hasMore = displayYarnNames.length > pageSize;
+              const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+              const intro = noColourMatchMessage
+                ? `<p>${noColourMatchMessage}</p><p>Here are yarn items from <strong>${nearestGpt.best.brandName}</strong> (top ${slice.length}):</p>`
+                : filterLabel
+                  ? `Here are yarn items from <strong>${nearestGpt.best.brandName}</strong>${filterLabel}:`
+                  : `You chose <strong>${nearestGpt.best.brandName}</strong>. Here are yarn items (top ${slice.length}):`;
+              const html = generateHTMLResponse(
+                'Choose yarn',
+                `<p>${intro}</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+              );
+              return {
+                html,
+                orderWizardPrompt: 'choose_yarn_from_supplier',
+                placeOrderContext: { supplierId: nearestGpt.best.id, supplierName: nearestGpt.best.brandName, yarnNames: displayYarnNames, page: 1 }
+              };
+            }
+          }
           return generateHTMLResponse('Supplier not found', `No supplier found matching "${query}". Please check the name or choose from the supplier list.`);
         }
         if (matches.length === 1) {
@@ -8505,13 +8761,16 @@ export const createYarnPurchaseOrder = async (params = {}) => {
             placeOrderContext: { supplierId: id, supplierName: brandName, yarnNames: displayYarnNames, page: 1 }
           };
         }
-        // Multiple suppliers matching (e.g. "Wampum")
+        // Multiple suppliers matching (e.g. "Wampum") — show as numbered list, same style as initial supplier list
         const matchingSuppliers = matches.map((s) => ({
           id: s._id?.toString?.() || s.id,
           brandName: s.brandName || s.name || 'Unknown'
         }));
-        const namesList = matchingSuppliers.map((s) => s.brandName).join(', ');
-        const html = `<p>There are <strong>${matches.length}</strong> suppliers matching "${query}". Which one do you mean?</p><p>${namesList}</p><p>Click the supplier you want below.</p>`;
+        const numberedList = matchingSuppliers.map((s, i) => `${i + 1}. ${s.brandName}`).join('<br/>');
+        const html = generateHTMLResponse(
+          'Choose supplier',
+          `<p>There are <strong>${matches.length}</strong> suppliers matching "${query}". Which one do you mean?</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${numberedList}</p><p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number</strong> (e.g. 1 or 2) or <strong>supplier name</strong>, or click below.</p>`
+        );
         return {
           html,
           orderWizardPrompt: 'disambiguate_supplier',
@@ -8519,62 +8778,28 @@ export const createYarnPurchaseOrder = async (params = {}) => {
         };
       }
 
-      // User selected a supplier from disambiguation or "see yarn list" for one supplier: return wizard with that supplier pre-selected
+      // User selected a supplier from disambiguation or "see yarn list": show numbered list of yarns (same procedure as chat flow), not checkbox wizard
       if (showSupplierList && preSelectedSupplierId) {
         const selectedSupplier = await supplierService.getSupplierById(preSelectedSupplierId);
-        const supplierYarnNames = selectedSupplier?.yarnDetails?.length
+        const supplierId = selectedSupplier?._id?.toString?.() || preSelectedSupplierId;
+        const brandName = selectedSupplier?.brandName || selectedSupplier?.name || 'Unknown';
+        const yarnNames = selectedSupplier?.yarnDetails?.length
           ? [...new Set((selectedSupplier.yarnDetails || [])
               .map((d) => (d.yarnName || (d.yarnType && d.yarnType.name) || '').trim())
               .filter(Boolean))]
           : [];
-        const catalogFilter = supplierYarnNames.length > 0
-          ? { yarnName: { $in: supplierYarnNames } }
-          : {};
-        const [suppliersResult, catalogResult, nextPoNumber] = await Promise.all([
-          supplierService.querySuppliers({}, { limit: 200, page: 1 }),
-          yarnCatalogService.queryYarnCatalogs(catalogFilter, { limit: 500, page: 1 }),
-          yarnPurchaseOrderService.getNextSuggestedPoNumber()
-        ]);
-        const suppliers = suppliersResult?.results ?? suppliersResult ?? [];
-        const yarnCatalog = catalogResult?.results ?? catalogResult ?? [];
-        const suppliersList = suppliers.map((s) => ({
-          id: s._id?.toString?.() || s.id,
-          brandName: s.brandName || s.name || 'Unknown'
-        }));
-        const catalogList = yarnCatalog.map((y) => {
-          const countSizes = [];
-          if (y.countSize && (y.countSize._id || y.countSize.id)) {
-            const id = (y.countSize._id || y.countSize.id).toString?.() || y.countSize._id || y.countSize.id;
-            const name = y.countSize.name || id;
-            if (!countSizes.some((cs) => cs.id === id)) countSizes.push({ id, name });
-          }
-          const subtypeCountSizes = y.yarnSubtype?.countSize || [];
-          if (Array.isArray(subtypeCountSizes)) {
-            subtypeCountSizes.forEach((cs) => {
-              const id = (cs?._id || cs?.id)?.toString?.() || cs;
-              const name = (typeof cs === 'object' && (cs?.name || cs?.label)) || id;
-              if (id && !countSizes.some((c) => c.id === (id.toString?.() || id))) {
-                countSizes.push({ id: id.toString?.() || id, name });
-              }
-            });
-          }
-        let shadeCode = (y.pantonShade || y.pantonName || (y.colorFamily?.name || '')).trim() || undefined;
-        if (!shadeCode && (y.yarnName || y.name)) {
-          const nameStr = (y.yarnName || y.name || '').trim();
-          const parts = nameStr.split('-').map((p) => p.trim()).filter(Boolean);
-          if (parts.length >= 2) shadeCode = parts[1] || parts[2] || undefined;
-        }
+        const pageSize = 5;
+        const slice = yarnNames.slice(0, pageSize);
+        const hasMore = yarnNames.length > pageSize;
+        const listHtml = slice.map((y, i) => `${i + 1}. ${y}`).join('<br/>');
+        const html = generateHTMLResponse(
+          'Choose yarn',
+          `<p>You chose <strong>${brandName}</strong>. Here are yarn items (top ${slice.length}):</p><p class="summary" style="margin: 0.6em 0; padding-left: 1em; line-height: 1.6;">${listHtml || 'No yarn list on file.'}</p>${hasMore ? `<p class="summary">Reply with <strong>load more</strong> for more options.</p>` : ''}<p class="summary" style="margin-top: 0.8em;">Reply with the <strong>number or name</strong> of the yarn to add, or <strong>load more</strong> for more.</p>`
+        );
         return {
-          id: y._id?.toString?.() || y.id,
-          yarnName: y.yarnName || y.name || 'Unknown',
-          countSizes: countSizes.length ? countSizes : undefined,
-          shadeCode
-        };
-      });
-        const introHtml = '<p>Select yarn items and enter quantity and rate for each. Supplier is already chosen.</p>';
-        return {
-          html: introHtml,
-          orderWizardData: { suppliers: suppliersList, yarnCatalog: catalogList, nextPoNumber, preSelectedSupplierId }
+          html,
+          orderWizardPrompt: 'choose_yarn_from_supplier',
+          placeOrderContext: { supplierId, supplierName: brandName, yarnNames, page: 1 }
         };
       }
 
@@ -10897,17 +11122,59 @@ export const getOrders = async (params = {}) => {
 /**
  * Get sales data with filters
  * @param {Object} params - Parameters (city, category, productName, storeName, dateFrom, dateTo, page, limit)
- * @returns {Promise<string>} HTML string with sales data
+ * @param {Object} [options] - { sessionId } for persisting params for pagination
+ * @returns {Promise<{ html: string, salesDataPagination?: { currentPage, totalPages, totalCount } }>}
  */
-export const getSalesData = async (params = {}) => {
+export const getSalesData = async (params = {}, options = {}) => {
   try {
     console.log(`[getSalesData] Called with params:`, JSON.stringify(params));
-    const { limit = 50, page = 1, city, category, productName, storeName, dateFrom, dateTo } = params;
+    let { limit = 50, page = 1, city, category, productName, storeName, dateFrom, dateTo, period, sortBy, mrpMin, mrpMax } = params;
+    // "mumbai store" / "delhi store" etc. usually means city only — avoid treating as store name
+    if (storeName && city && typeof storeName === 'string') {
+      const cityLower = (city || '').toString().trim().toLowerCase();
+      const storeLower = storeName.trim().toLowerCase();
+      if (storeLower === `${cityLower} store` || storeLower === `${cityLower} stores`) {
+        console.log(`[getSalesData] Treating "${storeName}" as city-only, using city filter only`);
+        storeName = undefined;
+      }
+    }
     const currentPage = parseInt(page) || 1;
-    const pageLimit = parseInt(limit) || 50;
-    
-    console.log(`[getSalesData] Parsed params - city: ${city}, page: ${currentPage}, limit: ${pageLimit}`);
-    
+    let pageLimit = Math.min(parseInt(limit) || 50, 200);
+
+    // Resolve period to dateFrom/dateTo when no explicit dates given
+    if ((!dateFrom && !dateTo) && period && typeof period === 'string') {
+      const now = new Date();
+      const p = period.toLowerCase().trim();
+      if (p === 'today') {
+        dateFrom = new Date(now);
+        dateFrom.setHours(0, 0, 0, 0);
+        dateTo = new Date(now);
+        dateTo.setHours(23, 59, 59, 999);
+      } else if (p === 'yesterday') {
+        dateFrom = new Date(now);
+        dateFrom.setDate(dateFrom.getDate() - 1);
+        dateFrom.setHours(0, 0, 0, 0);
+        dateTo = new Date(dateFrom);
+        dateTo.setHours(23, 59, 59, 999);
+      } else if (p === 'last week' || p === 'lastweek') {
+        dateTo = new Date(now);
+        dateFrom = new Date(now);
+        dateFrom.setDate(dateFrom.getDate() - 7);
+      } else if (p === 'last month' || p === 'lastmonth') {
+        dateTo = new Date(now);
+        dateFrom = new Date(now);
+        dateFrom.setMonth(dateFrom.getMonth() - 1);
+      } else if (p === 'last 30 days' || p === 'last30days') {
+        dateTo = new Date(now);
+        dateFrom = new Date(now);
+        dateFrom.setDate(dateFrom.getDate() - 30);
+      }
+      if (dateFrom && dateTo && !(dateFrom instanceof Date)) dateFrom = dateFrom.toISOString ? dateFrom : new Date(dateFrom);
+      if (dateTo && !(dateTo instanceof Date)) dateTo = dateTo.toISOString ? dateTo : new Date(dateTo);
+    }
+
+    console.log(`[getSalesData] Parsed params - city: ${city}, page: ${currentPage}, limit: ${pageLimit}, dateFrom: ${dateFrom}, dateTo: ${dateTo}`);
+
     // Build filter
     const filter = {};
     
@@ -11036,20 +11303,41 @@ export const getSalesData = async (params = {}) => {
     }
     
     if (dateFrom) {
-      filter.dateFrom = dateFrom;
-      console.log(`[getSalesData] Set filter.dateFrom = ${dateFrom}`);
+      filter.dateFrom = dateFrom instanceof Date ? dateFrom.toISOString() : dateFrom;
+      console.log(`[getSalesData] Set filter.dateFrom = ${filter.dateFrom}`);
     }
-    
+
     if (dateTo) {
-      filter.dateTo = dateTo;
-      console.log(`[getSalesData] Set filter.dateTo = ${dateTo}`);
+      filter.dateTo = dateTo instanceof Date ? dateTo.toISOString() : dateTo;
+      console.log(`[getSalesData] Set filter.dateTo = ${filter.dateTo}`);
     }
-    
+
+    // MRP filter: "mrp above 299", "mrp below 500", "products with MRP > 299"
+    if (mrpMin != null && mrpMin !== '') {
+      const num = Number(mrpMin);
+      if (!Number.isNaN(num)) {
+        filter.mrp = filter.mrp || {};
+        filter.mrp.$gte = num;
+        console.log(`[getSalesData] Set filter.mrp.$gte = ${num}`);
+      }
+    }
+    if (mrpMax != null && mrpMax !== '') {
+      const num = Number(mrpMax);
+      if (!Number.isNaN(num)) {
+        filter.mrp = filter.mrp || {};
+        filter.mrp.$lte = num;
+        console.log(`[getSalesData] Set filter.mrp.$lte = ${num}`);
+      }
+    }
+
+    const sortField = (sortBy && typeof sortBy === 'string') ? sortBy.split(':')[0] : 'date';
+    const sortOrder = (sortBy && sortBy.toLowerCase().includes('asc')) ? 'asc' : 'desc';
     console.log(`[getSalesData] Calling salesService.querySales with filter:`, JSON.stringify(filter));
-    const sales = await salesService.querySales(filter, { 
+    const sales = await salesService.querySales(filter, {
       limit: pageLimit,
       page: currentPage,
-      sortBy: 'date:desc'
+      sortBy: sortField,
+      sortOrder
     });
     console.log(`[getSalesData] Query returned ${sales.results?.length || 0} results, total: ${sales.totalResults || 0}`);
     
@@ -11121,6 +11409,15 @@ export const getSalesData = async (params = {}) => {
       if (dateFrom) dateRange.push(`From: ${new Date(dateFrom).toLocaleDateString()}`);
       if (dateTo) dateRange.push(`To: ${new Date(dateTo).toLocaleDateString()}`);
       filterInfo.push(dateRange.join(' '));
+    }
+    if (filter.mrp) {
+      if (filter.mrp.$gte != null && filter.mrp.$lte != null) {
+        filterInfo.push(`MRP: ₹${filter.mrp.$gte}–₹${filter.mrp.$lte}`);
+      } else if (filter.mrp.$gte != null) {
+        filterInfo.push(`MRP ≥ ₹${filter.mrp.$gte}`);
+      } else if (filter.mrp.$lte != null) {
+        filterInfo.push(`MRP ≤ ₹${filter.mrp.$lte}`);
+      }
     }
     const filterText = filterInfo.length > 0 ? ` (Filtered: ${filterInfo.join(', ')})` : '';
     
@@ -11195,13 +11492,30 @@ export const getSalesData = async (params = {}) => {
         </div>
         
         <p class="summary">Found ${totalCount.toLocaleString()} sales records${filterText}${totalPages > 1 ? ` (showing page ${currentPage} of ${totalPages}, ${sales.results.length} items per page)` : ''}.</p>
+        ${totalPages > 1 ? `
+        <div class="sales-pagination" style="margin-top: 1em; padding: 0.75em; border-radius: 8px; background: var(--bg-secondary, #1e293b); display: flex; flex-wrap: wrap; align-items: center; gap: 0.5em;">
+          <span style="margin-right: 0.5em; color: var(--text-secondary, #94a3b8); font-size: 0.9em;">Page ${currentPage} of ${totalPages}</span>
+          <span style="color: var(--text-muted, #64748b); font-size: 0.85em;">Reply with <strong>page 2</strong>, <strong>next page</strong>, or <strong>previous page</strong> to navigate.</span>
+        </div>
+        ` : ''}
       </div>
     `;
-    
-    return html;
+
+    const out = { html };
+    if (totalPages > 1) {
+      out.salesDataPagination = { currentPage, totalPages, totalCount };
+    }
+    if (options?.sessionId && totalCount > 0) {
+      setAgentFlowSession(options.sessionId, 'sales_data', {
+        salesDataParams: { city, category, productName, storeName, dateFrom: filter.dateFrom, dateTo: filter.dateTo, limit: pageLimit, mrpMin, mrpMax },
+        currentPage,
+        totalPages
+      });
+    }
+    return out;
   } catch (error) {
     console.error('Error in getSalesData:', error);
-    return generateHTMLResponse('Error', `Failed to retrieve sales data: ${error.message}`);
+    return { html: generateHTMLResponse('Error', `Failed to retrieve sales data: ${error.message}`) };
   }
 };
 
@@ -11497,7 +11811,7 @@ export const executeAITool = async (intent, options = {}) => {
       case 'getOrders':
         return await getOrders(intent.params);
       case 'getSalesData':
-        return await getSalesData(intent.params);
+        return await getSalesData(intent.params, { sessionId });
       default:
         throw new Error(`Unknown action: ${intent.action}`);
     }
