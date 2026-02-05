@@ -50,6 +50,7 @@ const askQuestion = {
         yarnNames: Joi.array().items(Joi.string()).optional(),
         page: Joi.number().optional(),
         yarnDisambiguationList: Joi.array().items(Joi.string()).optional(),
+        pendingYarnQueue: Joi.array().items(Joi.string()).optional(),
         collectingYarnName: Joi.string().optional(),
         collectingStep: Joi.string().optional(),
         collectingQuantity: Joi.number().optional(),

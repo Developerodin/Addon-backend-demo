@@ -1244,6 +1244,20 @@ export const detectIntent = async (question, options = {}) => {
     };
   }
 
+  // PRE-CHECK: "data of mumbai stores", "show me data of mumbai stores", "mumbai stores data" — getStoresList with city
+  const storeDataByCityPhrase = /\b(?:can\s+you\s+)?(?:show\s+me\s+)?data\s+of\s+([a-zA-Z]+)\s+stores?\b|\b([a-zA-Z]+)\s+stores?\s+(?:data|list)\b|\b(?:show\s+me\s+)?(?:data\s+of\s+)?([a-zA-Z]+)\s+stores?\b/i.test(question.trim());
+  const storeDataCityMatch = question.trim().match(/\b(?:can\s+you\s+)?(?:show\s+me\s+)?data\s+of\s+([a-zA-Z]+)\s+stores?\b/i) || question.trim().match(/\b([a-zA-Z]+)\s+stores?\s+(?:data|list)\b/i) || question.trim().match(/\b(?:show\s+me\s+)?(?:data\s+of\s+)?([a-zA-Z]+)\s+stores?\b/i);
+  if (storeDataByCityPhrase && storeDataCityMatch && storeDataCityMatch[1]) {
+    const city = storeDataCityMatch[1].trim().toLowerCase();
+    console.log(`[detectIntent] PRE-CHECK: store data by city -> getStoresList(city: ${city})`);
+    return {
+      action: 'getStoresList',
+      params: { city },
+      description: `Get stores in ${city}`,
+      confidence: 0.95
+    };
+  }
+
   // PRE-CHECK: "which city has highest/lowest sales" / "top/bottom city by sales" — aggregate from DB with optional order
   const topCityBySalesPhrase = /\b(?:which|what)\s+city\s+(?:has\s+)?(?:the\s+)?(?:highest|most|lowest|least)\s+sales\b|\bcity\s+with\s+(?:the\s+)?(?:highest|lowest)\s+sales\b|(?:highest|top|lowest|bottom)\s+sales\s+(?:by\s+)?city\b|top\s+city\s+by\s+sales\b|(?:bottom|lowest)\s+city\s+by\s+sales\b/i.test(question.trim());
   if (topCityBySalesPhrase) {
@@ -8063,7 +8077,12 @@ export const createPurchaseOrderFromPlaceContext = async (placeOrderContext) => 
  */
 export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
   const msg = (userMessage || '').trim().toLowerCase();
-  const ctxCopy = { ...ctx, yarnNames: ctx.yarnNames || [], collectedItems: ctx.collectedItems || [] };
+  const ctxCopy = {
+    ...ctx,
+    yarnNames: ctx.yarnNames || [],
+    collectedItems: ctx.collectedItems || [],
+    pendingYarnQueue: Array.isArray(ctx.pendingYarnQueue) ? [...ctx.pendingYarnQueue] : []
+  };
 
   if (/^(cancel|start\s+over|never\s+mind|forget\s+it)$/i.test(msg) || msg === 'no') {
     const html = generateHTMLResponse('Order cancelled', 'Order cancelled. Say <strong>place order</strong> to start a new one.');
@@ -8223,31 +8242,44 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
     if (Number.isNaN(rate) || rate <= 0) {
       return { html: generateHTMLResponse('Rate', `Please enter a valid rate (₹ per unit) for <strong>${ctx.collectingYarnName}</strong>.`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy };
     }
-    ctxCopy.collectingRate = rate;
-    ctxCopy.collectingStep = 'gst';
-    const html = generateHTMLResponse('GST', `How much <strong>GST</strong> is there for <strong>${ctx.collectingYarnName}</strong>? (Enter percentage, e.g. 12 or 0)`);
-    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter GST %.' };
-  }
-
-  if (ctx.collectingStep === 'gst') {
-    const gstInput = String(userMessage).trim().replace(/%/g, '');
-    const gstRate = Number.isNaN(parseFloat(gstInput)) ? 0 : Math.max(0, parseFloat(gstInput));
     const yarnNameAdded = ctx.collectingYarnName;
     ctxCopy.collectedItems.push({
       yarnName: ctx.collectingYarnName,
       quantity: ctx.collectingQuantity,
-      rate: ctx.collectingRate,
-      gstRate
+      rate,
+      gstRate: undefined
     });
-    ctxCopy.collectingYarnName = undefined;
-    ctxCopy.collectingStep = undefined;
     ctxCopy.collectingQuantity = undefined;
     ctxCopy.collectingRate = undefined;
-    const html = generateHTMLResponse('Item added', `Added <strong>${yarnNameAdded}</strong>. Add another yarn? Reply with the <strong>number or name</strong> from the list, or <strong>done</strong> to create the order.`);
-    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Item added. Add more or say done.' };
+    if (ctxCopy.pendingYarnQueue.length > 0) {
+      ctxCopy.pendingYarnQueue.shift();
+      if (ctxCopy.pendingYarnQueue.length > 0) {
+        ctxCopy.collectingYarnName = ctxCopy.pendingYarnQueue[0];
+        ctxCopy.collectingStep = 'quantity';
+        const html = generateHTMLResponse('Quantity', `How much yarn do you need for <strong>${ctxCopy.pendingYarnQueue[0]}</strong>?`);
+        return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity for next yarn.' };
+      }
+    }
+    ctxCopy.collectingYarnName = undefined;
+    ctxCopy.collectingStep = undefined;
+    ctxCopy.pendingYarnQueue = [];
+    const wasMulti = ctx.pendingYarnQueue && ctx.pendingYarnQueue.length > 0;
+    const html = generateHTMLResponse(
+      'Item added',
+      wasMulti
+        ? `Item(s) added. Add another yarn? Reply with the <strong>number or name</strong> from the list, or <strong>done</strong> to create the order.`
+        : `Added <strong>${yarnNameAdded}</strong>. Add another yarn? Reply with the <strong>number or name</strong> from the list, or <strong>done</strong> to create the order.`
+    );
+    return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Item(s) added. Add more or say done.' };
   }
 
-  if (msg === 'done' && (ctx.collectedItems || []).length > 0) {
+  if (ctx.collectingStep === 'order_gst') {
+    const gstInput = String(userMessage).trim().replace(/%/g, '');
+    const orderGstRate = Number.isNaN(parseFloat(gstInput)) ? 0 : Math.max(0, parseFloat(gstInput));
+    for (const it of ctxCopy.collectedItems) {
+      if (it.gstRate === undefined || it.gstRate === null) it.gstRate = orderGstRate;
+    }
+    ctxCopy.collectingStep = undefined;
     const html = buildPlaceOrderSummaryHtml(ctxCopy);
     return {
       html,
@@ -8258,12 +8290,87 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
     };
   }
 
-  if (msg === 'done') {
+  // Finalize order: literal "done" or common phrases, or GPT intent "finalize"
+  const finalizePhraseRegex = /^(?:done|that'?s\s+all|thats\s+all|that'?s\s+it|thats\s+it|finish|complete|no\s+more|finalize|place\s+order|i'?m\s+done|im\s+done|stop\s+adding|that\s+is\s+all|nothing\s+else|no\s+more\s+items)\s*\.?$/i;
+  let wantsToFinalize = msg === 'done' || finalizePhraseRegex.test(msg);
+  if (!wantsToFinalize && msg.length >= 2 && msg.length <= 80) {
+    try {
+      const interpreted = await interpretPlaceOrderChatMessage((userMessage || '').trim(), {
+        yarnNames: ctx.yarnNames || [],
+        supplierName: ctx.supplierName,
+        collectedItems: ctx.collectedItems,
+        collectingStep: undefined
+      });
+      if (interpreted?.action === 'finalize') wantsToFinalize = true;
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  if (wantsToFinalize && (ctx.collectedItems || []).length > 0) {
+    const needsOrderGst = (ctx.collectedItems || []).some((it) => it.gstRate === undefined || it.gstRate === null);
+    if (needsOrderGst) {
+      ctxCopy.collectingStep = 'order_gst';
+      const html = generateHTMLResponse('GST', `What <strong>GST %</strong> for the whole order? (Enter percentage, e.g. 12 or 0)`);
+      return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter GST % for the order.' };
+    }
+    const html = buildPlaceOrderSummaryHtml(ctxCopy);
+    return {
+      html,
+      orderWizardPrompt: null,
+      placeOrderContext: ctxCopy,
+      needsPlaceOrderConfirmation: true,
+      summary: 'Review your order. Type yes to place or no to cancel.'
+    };
+  }
+
+  if (wantsToFinalize) {
     return { html: generateHTMLResponse('Order', 'No items added yet. Reply with the number or name of a yarn to add, or start over with "place order".'), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy };
   }
 
   const yarnNames = ctx.yarnNames || [];
   const rawInput = String(userMessage).trim();
+
+  // Multiple yarn selection: "2,3 and 5", "2, 3, 5", "2 and 3 and 5" — parse into list indices and queue
+  if (!ctx.collectingStep && yarnNames.length > 0) {
+    const normalizedForNumbers = rawInput.replace(/\s+and\s+/gi, ',').replace(/\s+/g, ' ').trim();
+    const parts = normalizedForNumbers.split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n) && n >= 1 && n <= yarnNames.length);
+    const uniqueParts = [...new Set(parts)];
+    if (uniqueParts.length >= 2) {
+      const queue = uniqueParts.map((oneBased) => yarnNames[oneBased - 1]).filter(Boolean);
+      if (queue.length >= 2) {
+        ctxCopy.pendingYarnQueue = queue;
+        ctxCopy.collectingYarnName = queue[0];
+        ctxCopy.collectingStep = 'quantity';
+        const html = generateHTMLResponse('Quantity', `You selected ${queue.length} yarn(s). How much yarn do you need for <strong>${queue[0]}</strong>?`);
+        return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity for first yarn.' };
+      }
+    }
+    // GPT: interpret as multiple list indices when simple parse didn't find 2+ (e.g. "second, third and fifth", "items 2 3 5")
+    if (uniqueParts.length < 2 && (/\d.*\d/.test(rawInput) || /\band\b/i.test(rawInput)) && rawInput.length <= 60) {
+      try {
+        const interpreted = await interpretPlaceOrderChatMessage(rawInput, {
+          yarnNames,
+          supplierName: ctx.supplierName,
+          collectedItems: ctx.collectedItems,
+          collectingStep: undefined
+        });
+        if (interpreted?.action === 'list_indices' && Array.isArray(interpreted.value) && interpreted.value.length >= 2) {
+          const oneBasedIndices = interpreted.value.map((v) => (typeof v === 'number' ? v : parseInt(String(v), 10))).filter((n) => !Number.isNaN(n) && n >= 1 && n <= yarnNames.length);
+          const queue = [...new Set(oneBasedIndices)].map((oneBased) => yarnNames[oneBased - 1]).filter(Boolean);
+          if (queue.length >= 2) {
+            ctxCopy.pendingYarnQueue = queue;
+            ctxCopy.collectingYarnName = queue[0];
+            ctxCopy.collectingStep = 'quantity';
+            const html = generateHTMLResponse('Quantity', `You selected ${queue.length} yarn(s). How much yarn do you need for <strong>${queue[0]}</strong>?`);
+            return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity for first yarn.' };
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
 
   // Question-style request: "do you have anything in blue", "do they anything in black", "look for blue", "another colour black" — extract color/keyword
   const questionKeywordMatch = rawInput.match(/^(?:do\s+you\s+have\s+(?:anything\s+in\s+|something\s+in\s+)?|do\s+they\s+(?:have\s+)?(?:anything\s+in\s+|something\s+in\s+)|do\s+we\s+have\s+(?:anything\s+in\s+|something\s+in\s+)?|(?:is\s+there\s+)(?:anything\s+in\s+|something\s+in\s+)|(?:have\s+they\s+)(?:anything\s+in\s+|something\s+in\s+)|anything\s+in\s+|something\s+in\s+|any\s+|show\s+me\s+(?:some\s+)?|got\s+any\s+|what\s+about\s+in\s+|what\s+about\s+|look\s+for\s+|another\s+colou?r\s+)(.+)$/i)
@@ -8295,6 +8402,25 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
     }
     if (matchesInList.length === 0) {
       return { html: generateHTMLResponse('No match', `No yarn found with "<strong>${searchKeyword}</strong>" in the name. Try a different keyword or pick from the list by number.`), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'No match. Try again.' };
+    }
+  }
+
+  // Comma-separated list indices (e.g. "2,3,4") — add multiple yarns; we'll ask quantity and rate for each in sequence, then GST once at the end
+  if (!ctx.collectingStep && /^\s*\d+\s*(,\s*\d+\s*)+$/.test(rawInput)) {
+    const parts = rawInput.split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n) && n >= 1 && n <= yarnNames.length);
+    const queue = [];
+    for (const oneBased of parts) {
+      const yarn = yarnNames[oneBased - 1];
+      if (yarn) {
+        queue.push(yarn);
+      }
+    }
+    if (queue.length > 0) {
+      ctxCopy.pendingYarnQueue = queue;
+      ctxCopy.collectingYarnName = queue[0];
+      ctxCopy.collectingStep = 'quantity';
+      const html = generateHTMLResponse('Quantity', `You selected ${queue.length} yarn(s). How much yarn do you need for <strong>${queue[0]}</strong>?`);
+      return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity for first yarn.' };
     }
   }
 
@@ -8548,7 +8674,7 @@ Format: { "intent": "...", "supplierQuery": "" or string, "yarnHint": "" or stri
  * E.g. "the blue one", "second one", "add 50 more", "same as before but 100 pieces" -> search keyword or list index or quantity.
  * @param {string} userMessage - User's reply
  * @param {Object} context - { yarnNames[], supplierName, collectedItems[], collectingStep?, collectingYarnName? }
- * @returns {Promise<{ action: 'search_keyword'|'list_index'|'quantity'|'rate'|'none', value: string|number } | null>}
+ * @returns {Promise<{ action: 'finalize'|'list_indices'|'search_keyword'|'list_index'|'quantity'|'rate'|'none', value: string|number|boolean|number[] } | null>}
  */
 const interpretPlaceOrderChatMessage = async (userMessage, context = {}) => {
   const text = String(userMessage || '').trim();
@@ -8570,7 +8696,9 @@ Yarn list (numbered 1 to N):
 ${yarnList || 'No list'}
 
 Return ONLY a JSON object:
-- If user is clearly selecting by position/number: { "action": "list_index", "value": <number 1-based> }. Examples: "the second one" -> 2, "number 3" -> 3, "i want 3" -> 3, "3 onw" or "3 one" (typo) -> 3, "the third one" -> 3, "option 2" -> 2.
+- If user clearly wants to STOP adding items and proceed to order summary/finalize: { "action": "finalize", "value": true }. Examples: "done", "that's all", "that's it", "thats all", "finish", "complete", "no more", "finalize", "i'm done", "im done", "place order", "that is all", "stop adding", "nothing else", "no more items", "thats it".
+- If user is selecting MULTIPLE items by position: { "action": "list_indices", "value": [array of 1-based indices] }. Examples: "2,3 and 5" -> [2,3,5], "1, 2, 3" -> [1,2,3], "numbers 2 3 and 5" -> [2,3,5], "second, third and fifth" -> [2,3,5], "2 and 3 and 5" -> [2,3,5]. Only use list_indices when the user clearly means more than one item.
+- If user is clearly selecting ONE item by position/number: { "action": "list_index", "value": <number 1-based> }. Examples: "the second one" -> 2, "number 3" -> 3, "i want 3" -> 3, "3 onw" or "3 one" (typo) -> 3, "the third one" -> 3, "option 2" -> 2.
 - If user is asking for a colour/keyword to search: { "action": "search_keyword", "value": "<keyword>" } e.g. "something blue" -> "blue", "do you have black" -> "black", "does this supplier have anything in 20-blue" -> "20-blue", "anything in 20-blue" -> "20-blue".
 - If user is giving a quantity (number of pieces): { "action": "quantity", "value": <number> }.
 - If user is giving a rate/price: { "action": "rate", "value": <number> }.
@@ -8588,6 +8716,12 @@ Return ONLY a JSON object:
     const parsed = JSON.parse(jsonMatch[0]);
     if (!parsed.action || parsed.action === 'none') return null;
     const value = parsed.value;
+    if (parsed.action === 'finalize') return { action: 'finalize', value: true };
+    if (parsed.action === 'list_indices') {
+      const arr = Array.isArray(value) ? value : (typeof value === 'string' ? value.split(',').map((s) => parseInt(s.trim(), 10)) : [value]);
+      const indices = arr.map((v) => (typeof v === 'number' ? v : parseInt(String(v), 10))).filter((n) => !Number.isNaN(n) && n >= 1);
+      return indices.length >= 2 ? { action: 'list_indices', value: indices } : null;
+    }
     if (parsed.action === 'list_index') return { action: 'list_index', value: typeof value === 'number' ? value : parseInt(String(value), 10) };
     if (parsed.action === 'search_keyword') return { action: 'search_keyword', value: String(value || '').trim() };
     if (parsed.action === 'quantity') return { action: 'quantity', value: typeof value === 'number' ? value : parseFloat(String(value)) };

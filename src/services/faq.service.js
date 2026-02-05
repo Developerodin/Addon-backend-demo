@@ -528,6 +528,53 @@ export const askQuestion = async (question, options = {}) => {
       }
     }
 
+    // When in PO create/edit flow: let GPT decide if the user is asking something else (out of context). If so, break the flow and answer that intent.
+    // Skip this check when the input is purely numeric or looks like a list of numbers (e.g. "55", "2, 3 and 4", "add 2, 3 and 4", "i want 2, 3 and 4 yarn items").
+    const inPoFlow = context?.placeOrderContext != null || (context?.editOrderPo?.purchaseOrderId != null);
+    const isPurelyNumeric = /^\s*\d+(\.\d+)?\s*$/.test(normalizedQuestion.trim());
+    const stopwordsForList = /\b(add|i|want|need|the|and|yarn|items?|please|get|give\s+me)\b/gi;
+    const normalizedForList = normalizedQuestion.replace(/,/g, ' ').replace(stopwordsForList, ' ').replace(/\s+/g, ' ').trim();
+    const looksLikeListOfNumbers = /^\s*\d+(\s+\d+)+\s*$/.test(normalizedForList);
+    const isNumericOrListReply = isPurelyNumeric || looksLikeListOfNumbers;
+    if (inPoFlow && sessionId && !isNumericOrListReply) {
+      const earlyIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+      const nonPoDataActions = new Set([
+        'getStoresList', 'getSalesData', 'getSalesReport', 'getAnalyticsDashboard', 'getTopCitiesBySales',
+        'getProductsList', 'getTopProducts', 'getProductAnalysis', 'getProductForecast', 'getProductCount',
+        'getRawMaterials', 'getStoreAnalysisByName', 'getBrandPerformance',
+        'getYarnCatalog', 'getYarnInventory', 'getLiveInventory', 'getYarnPurchaseOrders', 'getYarnPurchaseOrderById', 'getYarnPurchaseOrderCounts',
+        'getYarnTransactions', 'getYarnRequisitions', 'getYarnTypes', 'getYarnSuppliers', 'getYarnCountSizes', 'getYarnColors', 'getYarnBlends',
+        'getMachineStatistics', 'getMachinesByStatus', 'getMachinesByFloor', 'getProductionOrders', 'getProductionDashboard',
+        'getCapabilities', 'getOrders'
+      ]);
+      const isOtherIntent = earlyIntent && nonPoDataActions.has(earlyIntent.action) && (earlyIntent.confidence ?? 0) >= 0.6;
+      if (isOtherIntent) {
+        aiToolService.clearAgentFlowSession(sessionId);
+        context.placeOrderContext = null;
+        context.editOrderPo = null;
+        context.lastOrderWizardPrompt = null;
+        context.matchingSuppliers = null;
+        try {
+          const aiResponse = await aiToolService.executeAITool(earlyIntent, { sessionId });
+          const html = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? '');
+          const responsePayload = html ? { response: html } : { response: aiResponse?.message || 'Done.' };
+          const out = {
+            type: 'ai_tool',
+            intent: earlyIntent,
+            ...responsePayload,
+            confidence: earlyIntent.confidence ?? 0.9,
+            source: 'ai_tool_service',
+            contextUsed: true
+          };
+          if (aiResponse?.salesDataPagination) out.salesDataPagination = aiResponse.salesDataPagination;
+          const summary = earlyIntent.description || 'Retrieved the requested information.';
+          return await addNaturalReply(out, normalizedQuestion, { action: earlyIntent.action, summary, dataDrivenMessage: aiResponse?.dataDrivenMessage });
+        } catch (err) {
+          console.warn('Out-of-context intent execution failed (continuing in PO flow):', err?.message);
+        }
+      }
+    }
+
     // Sales data pagination: "page 2", "next page", "previous page" when user was viewing sales data
     const salesFlowStored = sessionId ? aiToolService.getAgentFlowSession(sessionId) : null;
     const isSalesPaginationMsg = /^(?:page\s+(\d+)|next\s+page|previous\s+page|prev\s+page)\s*$/i.test(normalizedQuestion.trim());
@@ -676,6 +723,23 @@ export const askQuestion = async (question, options = {}) => {
           console.warn('Disambiguate supplier selection failed:', err?.message);
         }
       }
+    }
+
+    // In supplier selection context but user sent comma-separated or invalid number(s) — keep context and ask for one valid number
+    if ((disambiguatePrompt === 'choose_supplier' || disambiguatePrompt === 'disambiguate_supplier') && disambiguateSuppliers?.length > 0 && /^\d+(\s*,\s*\d+)*$/.test(normalizedQuestion.trim())) {
+      const parts = normalizedQuestion.trim().split(/\s*,\s*/).map((s) => parseInt(s, 10)).filter((n) => !Number.isNaN(n) && n >= 1 && n <= disambiguateSuppliers.length);
+      if (parts.length === 1) {
+        const chosen = disambiguateSuppliers[parts[0] - 1];
+        try {
+          return await showYarnListForSupplier(chosen);
+        } catch (err) {
+          console.warn('Supplier selection failed:', err?.message);
+        }
+      }
+      const n = disambiguateSuppliers.length;
+      const hint = getGlobalDisambiguationResponse();
+      const out = { ...hint, response: `Please pick one supplier by number (1 to ${n}). Reply with a single number, e.g. 1 or 3.` };
+      return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: `Pick a supplier (1–${n}).` });
     }
 
     // choose_supplier / disambiguate_supplier: user selects by NAME (e.g. "WAMPUM", "Premier Threads") → show top 5 yarn items for that supplier
@@ -1175,8 +1239,15 @@ export const askQuestion = async (question, options = {}) => {
               { sessionId }
             );
             const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
-            const responsePayload = isPromptPayload ? { response: aiResponse.html, orderWizardPrompt: aiResponse.orderWizardPrompt } : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
+            const responsePayload = isPromptPayload
+              ? {
+                  response: aiResponse.html,
+                  orderWizardPrompt: aiResponse.orderWizardPrompt,
+                  ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
+                }
+              : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
             const out = { type: 'ai_tool', intent: { action: 'createYarnPurchaseOrder', params: {} }, ...responsePayload, confidence: 0.95, source: 'ai_tool_service', contextUsed: true };
+            persistAgentFlowIfNeeded(sessionId, out);
             return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Choose a supplier and optionally a colour.' });
           }
           if ((interpreted.intent === 'create_order' || interpreted.intent === 'choose_supplier') && interpreted.supplierQuery) {
@@ -1228,7 +1299,8 @@ export const askQuestion = async (question, options = {}) => {
         const responsePayload = isPromptPayload
           ? {
               response: aiResponse.html,
-              orderWizardPrompt: aiResponse.orderWizardPrompt
+              orderWizardPrompt: aiResponse.orderWizardPrompt,
+              ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
             }
           : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
         const out = {
@@ -1239,6 +1311,7 @@ export const askQuestion = async (question, options = {}) => {
           source: 'ai_tool_service',
           contextUsed: true
         };
+        persistAgentFlowIfNeeded(sessionId, out);
         return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Choose a supplier and optionally a colour.' });
       } catch (err) {
         console.warn('Create yarn order (no supplier) failed, continuing:', err?.message);
