@@ -50,10 +50,12 @@ const askQuestion = catchAsync(async (req, res) => {
     context: context || undefined,
     conversationHistory: conversationHistory || undefined
   });
-  
+
+  const responseText = messengerSummaryService.getResponseText(result);
+
   res.status(httpStatus.OK).json({
     status: 'success',
-    data: result
+    data: { ...result, responseText }
   });
 });
 
