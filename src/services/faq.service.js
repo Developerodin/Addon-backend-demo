@@ -22,6 +22,31 @@ const openai = new OpenAI({
 });
 
 /**
+ * Stop words: when in PO flow, messages that are ONLY these words (or short phrases of them) do NOT trigger out-of-context intent search. We stay in flow.
+ */
+const PO_FLOW_STOP_WORDS = new Set([
+  'and', 'or', 'the', 'a', 'an', 'it', 'to', 'is', 'in', 'on', 'at', 'for', 'with', 'of', 'by',
+  'yeah', 'yes', 'yep', 'yup', 'ok', 'okay', 'sure', 'done', 'no', 'nope', 'cancel', 'y', 'n',
+  'confirm', 'place', 'order', 'that', 'all', 'thats', 'that\'s', 'finish', 'complete',
+  'more', 'nothing', 'else', 'stop', 'adding', 'im', 'i\'m', 'please', 'thanks', 'thank you'
+]);
+
+/**
+ * Trigger keywords: when in PO flow, messages containing ANY of these (as whole word or in a phrase) CAN trigger out-of-context intent search (dashboard, sales, analytics, etc.).
+ */
+const OUT_OF_FLOW_TRIGGER_KEYWORDS = [
+  'dashboard', 'capabilities', 'what can you do', 'sales', 'sales data', 'analytics', 'report',
+  'store', 'stores', 'store list', 'stores in', 'city', 'cities', 'list of cities',
+  'product', 'products', 'top products', 'forecast', 'inventory', 'raw material', 'raw materials',
+  'item', 'items', 'item list', 'catalog', 'master catalog',
+  'machine', 'machines', 'machine stat', 'machine status', 'floor', 'production', 'production order', 'production dashboard',
+  'yarn catalog', 'yarn inventory', 'yarn suppliers', 'yarn types', 'yarn colours', 'yarn colors', 'yarn blend', 'yarn blends', 'yarn count', 'count size',
+  'requisition', 'requisitions', 'transaction', 'transactions', 'purchase order', 'purchase orders', 'po status',
+  'process', 'processes', 'attribute', 'attributes', 'category', 'categories',
+  'show me', 'get me', 'list of', 'retrieve', 'fetch', 'display'
+];
+
+/**
  * Add a natural-language agent reply so the chat feels conversational. Mutates and returns the same object.
  * @param {Object} returnObj - The response object to add conversationalMessage to
  * @param {string} userMessage - What the user said
@@ -79,7 +104,8 @@ const persistAgentFlowIfNeeded = (sessionId, out) => {
 };
 
 // --- Session conversation store (context window in backend) ---
-const SESSION_CONVERSATION_MAX_TURNS = 20;
+// Full chat context: keep up to 200 turns (400 messages) per session so the agent has whole conversation
+const SESSION_CONVERSATION_MAX_TURNS = 200;
 /** @type {Map<string, Array<{ role: 'user' | 'assistant'; content: string }>>} */
 const sessionConversationStore = new Map();
 
@@ -136,6 +162,16 @@ export const persistSessionConversationFromResponse = (sessionId, userMessage, r
     : (result.conversationalMessage || result.response || result.html || '').toString().trim().slice(0, 2000) || '(Response)';
   arr.push({ role: 'assistant', content: assistantText });
   while (arr.length > SESSION_CONVERSATION_MAX_TURNS * 2) arr.shift();
+};
+
+/**
+ * End a chat session: remove conversation history and agent flow so the next message starts fresh.
+ * @param {string} sessionId - Session to end
+ */
+export const endSession = (sessionId) => {
+  if (!sessionId || typeof sessionId !== 'string') return;
+  sessionConversationStore.delete(sessionId);
+  aiToolService.clearSession(sessionId);
 };
 
 /** Central disambiguation when intent is null or unclear — same response everywhere so the agent handles ambiguity consistently. */
@@ -515,6 +551,20 @@ export const askQuestion = async (question, options = {}) => {
     }
     const historyBeforeCurrentMessage = conversationHistory ? [...conversationHistory] : [];
 
+    // Build context for GPT: overview of whole chat + recent messages (so we don't send full transcript every time; full chat stays in session/local)
+    let contextForIntent = { conversationHistory: Array.isArray(conversationHistory) ? conversationHistory : [] };
+    if (Array.isArray(conversationHistory) && conversationHistory.length > 20) {
+      try {
+        const overview = await aiToolService.getConversationOverview(conversationHistory);
+        if (overview) {
+          contextForIntent = { conversationOverview: overview, conversationHistory: conversationHistory.slice(-20) };
+        }
+      } catch (e) {
+        console.warn('[askQuestion] getConversationOverview failed, using recent only:', e?.message);
+        contextForIntent = { conversationHistory: conversationHistory.slice(-20) };
+      }
+    }
+
     // Merge session-stored flow context so agent stays in the same flow (e.g. edit PO add-item) and doesn't fetch unrelated data when client didn't send context
     if (sessionId) {
       const stored = aiToolService.getAgentFlowSession(sessionId);
@@ -528,16 +578,48 @@ export const askQuestion = async (question, options = {}) => {
       }
     }
 
+    // Resolve pending confirmation FIRST (place-order yes/no, delete/status confirm) so "yeah"/"yes" at order summary doesn't trigger detectIntent → capabilities
+    if (sessionId) {
+      const resolved = await aiToolService.resolvePendingConfirmation(sessionId, normalizedQuestion);
+      if (resolved.resolved && resolved.response != null) {
+        if (!resolved.isRePrompt) aiToolService.clearAgentFlowSession(sessionId);
+        const out = {
+          type: 'ai_tool',
+          intent: { action: 'confirm_or_cancel' },
+          response: resolved.response,
+          confidence: 1,
+          source: 'ai_tool_service',
+          confirmationResolved: true
+        };
+        if (resolved.agentJobId != null) out.agentJobId = resolved.agentJobId;
+        if (resolved.poNumber && out.agentJobId == null) {
+          console.warn('[faq] Order placed but agentJobId missing from resolvePendingConfirmation', { poNumber: resolved.poNumber });
+        }
+        const summary = resolved.poNumber ? `Order placed with PO number ${resolved.poNumber}.` : 'Done.';
+        const dataDrivenMessage = resolved.isRePrompt ? 'Please type **yes** to confirm or **no** to cancel.' : undefined;
+        return await addNaturalReply(out, normalizedQuestion, { action: 'confirm action', summary, dataDrivenMessage });
+      }
+    }
+
     // When in PO create/edit flow: let GPT decide if the user is asking something else (out of context). If so, break the flow and answer that intent.
-    // Skip this check when the input is purely numeric or looks like a list of numbers (e.g. "55", "2, 3 and 4", "add 2, 3 and 4", "i want 2, 3 and 4 yarn items").
+    // Use PO_FLOW_STOP_WORDS and OUT_OF_FLOW_TRIGGER_KEYWORDS: stay in flow when message is only stop words; run check only when message contains a trigger keyword.
     const inPoFlow = context?.placeOrderContext != null || (context?.editOrderPo?.purchaseOrderId != null);
     const isPurelyNumeric = /^\s*\d+(\.\d+)?\s*$/.test(normalizedQuestion.trim());
     const stopwordsForList = /\b(add|i|want|need|the|and|yarn|items?|please|get|give\s+me)\b/gi;
     const normalizedForList = normalizedQuestion.replace(/,/g, ' ').replace(stopwordsForList, ' ').replace(/\s+/g, ' ').trim();
     const looksLikeListOfNumbers = /^\s*\d+(\s+\d+)+\s*$/.test(normalizedForList);
     const isNumericOrListReply = isPurelyNumeric || looksLikeListOfNumbers;
-    if (inPoFlow && sessionId && !isNumericOrListReply) {
-      const earlyIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+    const finalizePhraseInFlow = /^(?:(?:yeah|yeap|yep|yes|yup|ok|sure)\s+)?done\s*\.?$|^(?:done|that'?s\s+all|thats\s+all|that'?s\s+it|thats\s+it|finish|complete|no\s+more|finalize|place\s+order|i'?m\s+done|im\s+done|stop\s+adding|that\s+is\s+all|nothing\s+else|no\s+more\s+items)\s*\.?$/i.test(normalizedQuestion.trim());
+    const msgTrimmed = normalizedQuestion.trim();
+    const words = msgTrimmed.toLowerCase().split(/\s+/).filter(Boolean);
+    const isOnlyStopWords = words.length > 0 && words.every((w) => {
+      const clean = w.replace(/[^\w']/g, '');
+      return PO_FLOW_STOP_WORDS.has(clean) || PO_FLOW_STOP_WORDS.has(clean.replace(/'/g, ''));
+    });
+    const msgLower = msgTrimmed.toLowerCase();
+    const hasTriggerKeyword = OUT_OF_FLOW_TRIGGER_KEYWORDS.some((kw) => msgLower.includes(kw.toLowerCase()));
+    if (inPoFlow && sessionId && !isNumericOrListReply && !finalizePhraseInFlow && !isOnlyStopWords && hasTriggerKeyword) {
+      const earlyIntent = await aiToolService.detectIntent(normalizedQuestion, contextForIntent);
       const nonPoDataActions = new Set([
         'getStoresList', 'getSalesData', 'getSalesReport', 'getAnalyticsDashboard', 'getTopCitiesBySales',
         'getProductsList', 'getTopProducts', 'getProductAnalysis', 'getProductForecast', 'getProductCount',
@@ -572,6 +654,43 @@ export const askQuestion = async (question, options = {}) => {
         } catch (err) {
           console.warn('Out-of-context intent execution failed (continuing in PO flow):', err?.message);
         }
+      }
+    }
+
+    // When in PO flow and user asks for supplier list / start over / new order — clear flow and show supplier list from the start
+    const wantsSupplierListOrRestart =
+      inPoFlow &&
+      /\b(?:show\s+me\s+)?(?:the\s+)?supplier\s+list\b|\bsupplier\s+list\b|start\s+over|start\s+from\s+start|new\s+order\b|begin\s+again|restart\b/i.test(normalizedQuestion.trim());
+    if (wantsSupplierListOrRestart && sessionId) {
+      aiToolService.clearAgentFlowSession(sessionId);
+      context.placeOrderContext = null;
+      context.lastOrderWizardPrompt = null;
+      context.matchingSuppliers = null;
+      try {
+        const aiResponse = await aiToolService.executeAITool(
+          { action: 'createYarnPurchaseOrder', params: {}, confidence: 0.95 },
+          { sessionId }
+        );
+        const isPromptPayload = aiResponse && typeof aiResponse === 'object' && aiResponse.html != null && aiResponse.orderWizardPrompt != null;
+        const responsePayload = isPromptPayload
+          ? {
+              response: aiResponse.html,
+              orderWizardPrompt: aiResponse.orderWizardPrompt,
+              ...(aiResponse.matchingSuppliers != null && { matchingSuppliers: aiResponse.matchingSuppliers })
+            }
+          : { response: typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? String(aiResponse)) };
+        const out = {
+          type: 'ai_tool',
+          intent: { action: 'createYarnPurchaseOrder', params: {} },
+          ...responsePayload,
+          confidence: 0.95,
+          source: 'ai_tool_service',
+          contextUsed: true
+        };
+        persistAgentFlowIfNeeded(sessionId, out);
+        return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: 'Choose a supplier and optionally a colour.' });
+      } catch (err) {
+        console.warn('Supplier list / restart failed:', err?.message);
       }
     }
 
@@ -614,7 +733,7 @@ export const askQuestion = async (question, options = {}) => {
     // Early sales intent: if message clearly asks for sales data, run detectIntent and handle getSalesData before any yarn/purchase flow (so "sales from Delhi" is never interpreted as supplier)
     const looksLikeSalesRequest = /\bsales\b/i.test(normalizedQuestion) && /\b(?:data|from|in|for|show|list|records|me)\b/i.test(normalizedQuestion);
     if (looksLikeSalesRequest) {
-      const salesIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+      const salesIntent = await aiToolService.detectIntent(normalizedQuestion, contextForIntent);
       if (salesIntent?.action === 'getSalesData') {
         try {
           const salesResponse = await aiToolService.executeAITool(salesIntent, { sessionId });
@@ -742,15 +861,74 @@ export const askQuestion = async (question, options = {}) => {
       return await addNaturalReply(out, normalizedQuestion, { action: 'create purchase order', summary: `Pick a supplier (1–${n}).` });
     }
 
-    // choose_supplier / disambiguate_supplier: user selects by NAME (e.g. "WAMPUM", "Premier Threads") → show top 5 yarn items for that supplier
+    // choose_supplier / disambiguate_supplier + non-numeric reply: first use GPT to see if user is asking something else (e.g. "show me dashboard analytics"). No supplier is named "no show me dashboard analytics".
     if ((disambiguatePrompt === 'choose_supplier' || disambiguatePrompt === 'disambiguate_supplier') && disambiguateSuppliers?.length > 0 && !isNumericReply) {
-      const query = normalizedQuestion.trim();
-      if (query.length >= 2 && query.length <= 80) {
+      const earlyIntent = await aiToolService.detectIntent(normalizedQuestion, contextForIntent);
+      const nonPoDataActions = new Set([
+        'getStoresList', 'getSalesData', 'getSalesReport', 'getAnalyticsDashboard', 'getTopCitiesBySales',
+        'getProductsList', 'getTopProducts', 'getProductAnalysis', 'getProductForecast', 'getProductCount',
+        'getRawMaterials', 'getStoreAnalysisByName', 'getBrandPerformance',
+        'getYarnCatalog', 'getYarnInventory', 'getLiveInventory', 'getYarnPurchaseOrders', 'getYarnPurchaseOrderById', 'getYarnPurchaseOrderCounts',
+        'getYarnTransactions', 'getYarnRequisitions', 'getYarnTypes', 'getYarnSuppliers', 'getYarnCountSizes', 'getYarnColors', 'getYarnBlends',
+        'getMachineStatistics', 'getMachinesByStatus', 'getMachinesByFloor', 'getProductionOrders', 'getProductionDashboard',
+        'getCapabilities', 'getOrders'
+      ]);
+      const isOtherIntent = earlyIntent && nonPoDataActions.has(earlyIntent.action) && (earlyIntent.confidence ?? 0) >= 0.6;
+      if (isOtherIntent) {
+        if (sessionId) aiToolService.clearAgentFlowSession(sessionId);
+        context.placeOrderContext = null;
+        context.lastOrderWizardPrompt = null;
+        context.matchingSuppliers = null;
+        try {
+          const aiResponse = await aiToolService.executeAITool(earlyIntent, { sessionId });
+          const html = typeof aiResponse === 'string' ? aiResponse : (aiResponse?.html ?? '');
+          const responsePayload = html ? { response: html } : { response: aiResponse?.message || 'Done.' };
+          const out = {
+            type: 'ai_tool',
+            intent: earlyIntent,
+            ...responsePayload,
+            confidence: earlyIntent.confidence ?? 0.9,
+            source: 'ai_tool_service',
+            contextUsed: true
+          };
+          if (aiResponse?.salesDataPagination) out.salesDataPagination = aiResponse.salesDataPagination;
+          const summary = earlyIntent.description || 'Retrieved the requested information.';
+          return await addNaturalReply(out, normalizedQuestion, { action: earlyIntent.action, summary, dataDrivenMessage: aiResponse?.dataDrivenMessage });
+        } catch (err) {
+          console.warn('Out-of-context (supplier step) intent execution failed:', err?.message);
+        }
+      }
+    }
+
+    // choose_supplier / disambiguate_supplier: user selects by NAME (e.g. "WAMPUM", "from wampum", "Premier Threads") → show top 5 yarn items for that supplier
+    if ((disambiguatePrompt === 'choose_supplier' || disambiguatePrompt === 'disambiguate_supplier') && disambiguateSuppliers?.length > 0 && !isNumericReply) {
+      const rawQuery = normalizedQuestion.trim();
+      if (rawQuery.length >= 2 && rawQuery.length <= 80) {
+        // Normalize: "from wampum", "buy from wampum", "get yarn from wampum" → "wampum" so we match supplier name
+        const fromPrefix = /^(?:i\s+(?:wanna|want\s+to)\s+)?(?:buy|get|order|purchase)\s+(?:yarn\s+)?from\s+|^from\s+|^go\s+with\s+|^choose\s+(?:option\s+)?/i;
+        let query = rawQuery.replace(fromPrefix, '').trim() || rawQuery;
         const queryLower = query.toLowerCase();
-        const chosen = disambiguateSuppliers.find((s) => {
+        let chosen = disambiguateSuppliers.find((s) => {
           const name = (s.brandName || s.name || '').toLowerCase();
           return name.includes(queryLower) || queryLower.includes(name) || name.replace(/\s+/g, '').includes(queryLower.replace(/\s+/g, ''));
         });
+        // When direct/regex match fails, use GPT to interpret (e.g. "from wampum" → supplier name "wampum")
+        if (!chosen && rawQuery.length >= 2) {
+          try {
+            const gptChoice = await aiToolService.interpretSupplierChoiceWithGPT(rawQuery, disambiguateSuppliers);
+            if (gptChoice?.supplierNumber != null && gptChoice.supplierNumber >= 1 && gptChoice.supplierNumber <= disambiguateSuppliers.length) {
+              chosen = disambiguateSuppliers[gptChoice.supplierNumber - 1];
+            } else if (gptChoice?.supplierQuery && gptChoice.supplierQuery.length >= 2) {
+              const gptQueryLower = gptChoice.supplierQuery.trim().toLowerCase();
+              chosen = disambiguateSuppliers.find((s) => {
+                const name = (s.brandName || s.name || '').toLowerCase();
+                return name.includes(gptQueryLower) || gptQueryLower.includes(name) || name.replace(/\s+/g, '').includes(gptQueryLower.replace(/\s+/g, ''));
+              });
+            }
+          } catch (err) {
+            console.warn('interpretSupplierChoiceWithGPT (choose_supplier) failed:', err?.message);
+          }
+        }
         if (chosen) {
           try {
             return await showYarnListForSupplier(chosen);
@@ -771,29 +949,6 @@ export const askQuestion = async (question, options = {}) => {
     // 3. Update status PO: orderRefForStatus, awaitingFollowUp 'update_status_po' | 'update_status_choice' — change status only.
     // 4. Delete PO: deleteYarnPurchaseOrder intent — delete order (no persistent context).
     // When in edit flow, explicit "update status" or "delete this order" is routed to flow 3 or 4 below.
-
-    // Resolve pending confirmation FIRST (delete/status/place-order yes/no) so "yes" to delete does not trigger place-order or create-PO UI flow
-    if (sessionId) {
-      const resolved = await aiToolService.resolvePendingConfirmation(sessionId, normalizedQuestion);
-      if (resolved.resolved && resolved.response != null) {
-        const out = {
-          type: 'ai_tool',
-          intent: { action: 'confirm_or_cancel' },
-          response: resolved.response,
-          confidence: 1,
-          source: 'ai_tool_service',
-          confirmationResolved: true
-        };
-        if (resolved.agentJobId != null) out.agentJobId = resolved.agentJobId;
-        if (resolved.poNumber && out.agentJobId == null) {
-          console.warn('[faq] Order placed but agentJobId missing from resolvePendingConfirmation', { poNumber: resolved.poNumber });
-        }
-        const summary = resolved.poNumber ? `Order placed with PO number ${resolved.poNumber}.` : 'Done.';
-        // When we re-prompted for yes/no (user typed something else), use a clear message so GPT doesn't say "Action confirmed"
-        const dataDrivenMessage = resolved.isRePrompt ? 'Please type **yes** to confirm or **no** to cancel.' : undefined;
-        return await addNaturalReply(out, normalizedQuestion, { action: 'confirm action', summary, dataDrivenMessage });
-      }
-    }
 
     // Fallback: "add item" / "add more yarn" without editOrderPo — recover edit context from last assistant message (e.g. "What would you like to edit?" + PO-2026-975) so we show order's supplier yarn list, not create-PO supplier list
     const vagueAddItemOnly = /^(?:i\s+)?(?:wanna|want\s+to)\s+add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$|^add\s+(?:an?\s+)?(?:item|more\s+yarn|more\s+items?)\s*\.?$/i.test(normalizedQuestion.trim());
@@ -949,6 +1104,7 @@ export const askQuestion = async (question, options = {}) => {
           else if (responseStr.includes('Item Removed')) editSummary = 'Removed the item.';
           else if (responseStr.includes('Item Added')) editSummary = 'Added the item.';
           else if (responseStr.includes('Order Complete') || responseStr.includes('Edit Cancelled')) editSummary = 'Finished with the order edit.';
+          else if (responseStr.includes('How can I help you?') && result.editOrderContext == null) editSummary = 'No problem! How can I help you?';
           else if (responseStr.includes('Confirm removal') && result.editOrderContext?.removeItemState?.step === 'confirm_remove') editSummary = 'Confirm removal: type yes to remove these items or no to cancel.';
           else if (responseStr.includes('Remove item') && result.editOrderContext?.removeItemState?.step === 'choose_items') editSummary = 'Pick item(s) to remove by number (e.g. 1 or 1, 3).';
           else if ((responseStr.includes('Add item') || responseStr.includes('Here are yarn items from')) && result.editOrderContext?.addItemState) editSummary = 'Showing yarn list to add to order. Pick a yarn by number or name.';
@@ -964,7 +1120,9 @@ export const askQuestion = async (question, options = {}) => {
           ...(result.editOrderContext !== undefined && { editOrderContext: result.editOrderContext })
         };
         persistAgentFlowIfNeeded(sessionId, out);
-        return await addNaturalReply(out, normalizedQuestion, { action: 'edit order', summary: editSummary, poNumber: resolvedPoNum });
+        const replyOpts = { action: 'edit order', summary: editSummary, poNumber: resolvedPoNum };
+        if (result.editOrderContext == null && responseStr.includes('How can I help you?')) replyOpts.dataDrivenMessage = 'No problem! How can I help you?';
+        return await addNaturalReply(out, normalizedQuestion, replyOpts);
       } catch (err) {
         console.warn('Apply edit failed:', err?.message);
       }
@@ -973,7 +1131,7 @@ export const askQuestion = async (question, options = {}) => {
     // Run order-action intent (edit/delete/update status) early so "i wanna edit order PO-2026-979" is never treated as place-order keyword
     const orderActionRegex = /\b(delete|cancel|remove|update|mark|set|edit)\b.*\b(?:purchase\s+)?order\b|edit\s+order|edit\s+po-?[\w\-]+/i;
     if (orderActionRegex.test(normalizedQuestion)) {
-      const orderIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+      const orderIntent = await aiToolService.detectIntent(normalizedQuestion, contextForIntent);
       if (orderIntent && (orderIntent.action === 'deleteYarnPurchaseOrder' || orderIntent.action === 'updateYarnPurchaseOrderStatus' || orderIntent.action === 'editYarnPurchaseOrder')) {
         try {
           const aiResponse = await aiToolService.executeAITool(orderIntent, { sessionId });
@@ -1137,7 +1295,7 @@ export const askQuestion = async (question, options = {}) => {
             } catch (agentErr) {
               console.warn('Agent UI flow create/start failed (order still placed):', agentErr?.message);
             }
-            persistAgentFlowIfNeeded(sessionId, out);
+            if (sessionId) aiToolService.clearAgentFlowSession(sessionId);
             return await addNaturalReply(out, normalizedQuestion, { action: 'place order', summary: `Order placed with PO number ${created.poNumber}.`, poNumber: created.poNumber });
           } catch (placeErr) {
             console.warn('Place order from context failed:', placeErr?.message);
@@ -1146,6 +1304,7 @@ export const askQuestion = async (question, options = {}) => {
         // "no"/"n"/"cancel" at summary step — cancel and clear context
         const isCancelPlace = /^(?:no|n|cancel)\s*$/i.test(normalizedQuestion.trim());
         if (isCancelPlace && hasCollectedItems) {
+          if (sessionId) aiToolService.clearAgentFlowSession(sessionId);
           const out = {
             type: 'ai_tool',
             intent: { action: 'createYarnPurchaseOrder' },
@@ -1156,7 +1315,6 @@ export const askQuestion = async (question, options = {}) => {
             source: 'ai_tool_service',
             contextUsed: true
           };
-          persistAgentFlowIfNeeded(sessionId, out);
           return await addNaturalReply(out, normalizedQuestion, { action: 'cancel order', summary: 'Order cancelled.' });
         }
 
@@ -1492,10 +1650,17 @@ export const askQuestion = async (question, options = {}) => {
       /(?:can\s+you\s+)?(?:tell\s+me\s+)?what\s+we\s+(?:discussed|chatted|talked)/i
     ];
     if (conversationMetaPatterns.some(p => p.test(normalizedQuestion))) {
-      const summary = await aiToolService.summarizeConversation(historyBeforeCurrentMessage, normalizedQuestion);
+      const overview = await aiToolService.getConversationOverview(historyBeforeCurrentMessage);
+      let response;
+      if (overview) {
+        const naturalized = await aiToolService.naturalizeConversationSummaryForUser(overview);
+        response = `Here's what we've been up to so far:\n\n${naturalized}`;
+      } else {
+        response = await aiToolService.summarizeConversation(historyBeforeCurrentMessage, normalizedQuestion);
+      }
       return {
         type: 'conversation_summary',
-        response: summary,
+        response,
         confidence: 0.95,
         source: 'conversation_summary'
       };
@@ -1613,7 +1778,7 @@ Please provide a helpful response based on this FAQ knowledge.`
     if (isCapabilityQuestion) {
       console.log('Capability question detected, checking AI tool intent for:', normalizedQuestion);
       
-    const aiIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+    const aiIntent = await aiToolService.detectIntent(normalizedQuestion, contextForIntent);
     
       if (aiIntent && aiIntent.action === 'getCapabilities') {
         try {
@@ -1634,15 +1799,22 @@ Please provide a helpful response based on this FAQ knowledge.`
     // Step 3: If no good FAQ match and not a capability question, check AI tool intent for data/analytics requests
     console.log('No good FAQ match found, checking AI tool intent for:', normalizedQuestion);
     
-    const aiIntent = await aiToolService.detectIntent(normalizedQuestion, { conversationHistory });
+    const aiIntent = await aiToolService.detectIntent(normalizedQuestion, contextForIntent);
 
-    // Fallback: detectIntent returned null (e.g. conversation-meta PRE-CHECK); if message still looks like "what we discussed/summary", answer from history
+    // Fallback: detectIntent returned null (e.g. conversation-meta PRE-CHECK); if message still looks like "what we discussed/summary", answer with full overview from start
     const conversationMetaLoose = /\b(?:what\s+we\s+discussed|summar(?:y|ies|ize)|our\s+chat|what\s+did\s+we\s+talk|what\s+have\s+we\s+chat|so\s+far)\b/i.test(normalizedQuestion);
     if (!aiIntent && conversationMetaLoose) {
-      const summary = await aiToolService.summarizeConversation(historyBeforeCurrentMessage, normalizedQuestion);
+      const overview = await aiToolService.getConversationOverview(historyBeforeCurrentMessage);
+      let response;
+      if (overview) {
+        const naturalized = await aiToolService.naturalizeConversationSummaryForUser(overview);
+        response = `Here's what we've been up to so far:\n\n${naturalized}`;
+      } else {
+        response = await aiToolService.summarizeConversation(historyBeforeCurrentMessage, normalizedQuestion);
+      }
       return {
         type: 'conversation_summary',
-        response: summary,
+        response,
         confidence: 0.95,
         source: 'conversation_summary'
       };
@@ -2129,5 +2301,6 @@ export default {
   clearAllFaqs,
   appendUserMessageToSession,
   getSessionConversationHistory,
-  persistSessionConversationFromResponse
+  persistSessionConversationFromResponse,
+  endSession
 };

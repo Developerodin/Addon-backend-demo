@@ -117,6 +117,7 @@ export const normalizeTyposForAgent = (text) => {
     [/ordr\b/gi, 'order'],
     [/ordres/gi, 'orders'],
     [/analutics/gi, 'analytics'],
+    [/dashboatd/gi, 'dashboard'],
     [/reciecved/gi, 'received']
   ];
   for (const [regex, replacement] of replacements) {
@@ -375,21 +376,82 @@ const generatePaginationHTML = (currentPage, totalPages, totalCount, categoryNam
 };
 
 /**
+ * Build a short overview (bullet points) of the conversation for GPT context. Used so we send overview + recent messages instead of full chat.
+ * @param {Array<{role: string, content: string}>} messages - Full conversation (user + assistant)
+ * @returns {Promise<string>} Bullet-point overview or empty string on failure
+ */
+export const getConversationOverview = async (messages) => {
+  const arr = Array.isArray(messages) ? messages : [];
+  if (arr.length === 0) return '';
+  try {
+    const transcript = arr
+      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${(m.content || '').toString().trim().slice(0, 500)}`)
+      .join('\n');
+    const bulletGuidance = arr.length <= 4
+      ? 'Summarize this short chat in 2-4 short bullet points. Each bullet: what was asked or done and the outcome.'
+      : 'Summarize this chat in 4-8 short bullet points. Each bullet: what was asked or done and the outcome (e.g. "User asked for X. Assistant showed Y."). Be concise. Output only the bullet list, no intro.';
+    const response = await openai.chat.completions.create({
+      model: config.openai?.model || 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: bulletGuidance },
+        { role: 'user', content: `Conversation:\n${transcript.slice(0, 12000)}` }
+      ],
+      temperature: 0.2,
+      max_tokens: 400
+    });
+    const text = response.choices[0]?.message?.content?.trim();
+    return text || '';
+  } catch (err) {
+    console.warn('[getConversationOverview]', err?.message);
+    return '';
+  }
+};
+
+/**
+ * Rewrite the bullet-point conversation overview into a natural, human-friendly summary for the user.
+ * Keeps the original overview for chatbot context; this version uses "you" and "we", avoids "User"/"Assistant".
+ * @param {string} overview - Bullet-point overview from getConversationOverview
+ * @returns {Promise<string>} Naturalized summary or the original if rewrite fails
+ */
+export const naturalizeConversationSummaryForUser = async (overview) => {
+  if (!overview || typeof overview !== 'string' || overview.trim().length === 0) return overview || '';
+  try {
+    const response = await openai.chat.completions.create({
+      model: config.openai?.model || 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `Rewrite this conversation summary in a friendly, natural way as if you're briefly telling the person what you've done together. Use "you" and "we" (e.g. "You chose Allen Solley for yarn and we looked at 20s-Beige-Bamboo."). Do NOT use "User" or "Assistant". Keep it concise: 2-4 short sentences or a short paragraph. No bullet points in the output. Sound warm and human, not robotic.`
+        },
+        { role: 'user', content: overview.trim() }
+      ],
+      temperature: 0.4,
+      max_tokens: 300
+    });
+    const text = response.choices[0]?.message?.content?.trim();
+    return text || overview;
+  } catch (err) {
+    console.warn('[naturalizeConversationSummaryForUser]', err?.message);
+    return overview;
+  }
+};
+
+/**
  * Use OpenAI to intelligently detect intent and extract parameters
  * @param {string} question - User's question
- * @param {Array<{role: string, content: string}>} [conversationHistory] - Recent chat turns for context (like GPT)
+ * @param {Array<{role: string, content: string}>} [conversationHistory] - Recent chat turns (or full when short)
+ * @param {string} [conversationOverview] - Optional bullet-point overview of whole chat (when long); GPT gets this + recent messages
  * @returns {Promise<Object|null>} Intent object or null if no match
  */
-const detectIntentWithAI = async (question, conversationHistory = []) => {
+const detectIntentWithAI = async (question, conversationHistory = [], conversationOverview = null) => {
   try {
+    // When overview is provided, caller already passed only recent messages; otherwise cap to last 10 turns
     const historyMessages = (Array.isArray(conversationHistory) ? conversationHistory : [])
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
       .map((m) => ({ role: m.role, content: String(m.content).slice(0, 2000) }))
       .slice(-20);
-    const messages = [
-      {
-        role: 'system',
-        content: `You are an AI assistant that analyzes retail business queries and determines the user's intent. 
+    const systemContent = `You are an AI assistant that analyzes retail business queries and determines the user's intent.
+${conversationOverview ? `\nConversation overview so far:\n${conversationOverview}\n` : ''} 
           
           Analyze the user's question and return a JSON object with the following structure:
           {
@@ -866,8 +928,9 @@ const detectIntentWithAI = async (question, conversationHistory = []) => {
             - Previous: "raw materials" → User: "what about Packing Material" → getRawMaterials with groupName="Packing Material"
             - Previous: "machines which are active" → User: "any inactive" → getMachinesByStatus with machineStatus="Idle"
             - Previous: "active machines" → User: "show me idle" → getMachinesByStatus with machineStatus="Idle"
-            - Previous: "machines which are active" → User: "no inactive machines" → getMachinesByStatus with machineStatus="Idle" (will show "No inactive machines found" if none exist)`
-      },
+            - Previous: "machines which are active" → User: "no inactive machines" → getMachinesByStatus with machineStatus="Idle" (will show "No inactive machines found" if none exist)`;
+    const messages = [
+      { role: 'system', content: systemContent },
       ...historyMessages,
       {
         role: 'user',
@@ -1073,7 +1136,7 @@ export const summarizeConversation = async (conversationHistory, userMessage) =>
  * @returns {Object|null} Intent object or null if no match
  */
 export const detectIntent = async (question, options = {}) => {
-  const { conversationHistory } = options;
+  const { conversationHistory, conversationOverview } = options;
   // Global typo normalization (shared with FAQ entry) then lowercase for pattern matching
   let normalizedQuestion = normalizeTyposForAgent(question);
   normalizedQuestion = normalizedQuestion.toLowerCase();
@@ -1907,7 +1970,7 @@ export const detectIntent = async (question, options = {}) => {
   // ALWAYS try GPT-powered detection for natural language understanding
   // This allows GPT to handle natural language variations even for critical keywords
   console.log(`[detectIntent] Attempting GPT detection for natural language understanding: "${normalizedQuestion}"`);
-  const aiIntent = await detectIntentWithAI(question, conversationHistory);
+  const aiIntent = await detectIntentWithAI(question, conversationHistory || [], conversationOverview || null);
   if (aiIntent) {
     console.log(`[detectIntent] ✅ GPT detected intent: ${aiIntent.action} for "${normalizedQuestion}"`);
     return aiIntent;
@@ -8290,10 +8353,11 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
     };
   }
 
-  // Finalize order: literal "done" or common phrases, or GPT intent "finalize"
-  const finalizePhraseRegex = /^(?:done|that'?s\s+all|thats\s+all|that'?s\s+it|thats\s+it|finish|complete|no\s+more|finalize|place\s+order|i'?m\s+done|im\s+done|stop\s+adding|that\s+is\s+all|nothing\s+else|no\s+more\s+items)\s*\.?$/i;
-  let wantsToFinalize = msg === 'done' || finalizePhraseRegex.test(msg);
-  if (!wantsToFinalize && msg.length >= 2 && msg.length <= 80) {
+  // Finalize order: literal "done" or common phrases (yeah/yeap/yep/yes + done, that's all, etc.), or GPT intent "finalize"
+  const finalizePhraseRegex = /^(?:(?:yeah|yeap|yep|yes|yup|ok|sure)\s+)?done\s*\.?$|^(?:done|that'?s\s+all|thats\s+all|that'?s\s+it|thats\s+it|finish|complete|no\s+more|finalize|place\s+order|i'?m\s+done|im\s+done|stop\s+adding|that\s+is\s+all|nothing\s+else|no\s+more\s+items)\s*\.?$/i;
+  let wantsToFinalize = msg === 'done' || finalizePhraseRegex.test(msg.trim());
+  // When regex fails, use GPT for intent detection (e.g. typos, variants like "yea done", "thats it please")
+  if (!wantsToFinalize && msg.length >= 1 && msg.length <= 150) {
     try {
       const interpreted = await interpretPlaceOrderChatMessage((userMessage || '').trim(), {
         yarnNames: ctx.yarnNames || [],
@@ -8500,7 +8564,7 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
     return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter quantity.' };
   }
 
-  // Final GPT fallback: interpret as list index or search keyword (e.g. "the second one", "something in navy")
+  // Final GPT fallback: interpret as finalize, list index, or search keyword (use GPT when regex/name match failed)
   try {
     const interpreted = await interpretPlaceOrderChatMessage(rawInput, {
       yarnNames,
@@ -8509,6 +8573,25 @@ export const handlePlaceOrderYarnChat = async (ctx, userMessage) => {
       collectingStep: ctx.collectingStep,
       collectingYarnName: ctx.collectingYarnName
     });
+    if (interpreted?.action === 'finalize' && (ctxCopy.collectedItems || []).length > 0) {
+      const needsOrderGst = (ctxCopy.collectedItems || []).some((it) => it.gstRate === undefined || it.gstRate === null);
+      if (needsOrderGst) {
+        ctxCopy.collectingStep = 'order_gst';
+        const html = generateHTMLResponse('GST', `What <strong>GST %</strong> for the whole order? (Enter percentage, e.g. 12 or 0)`);
+        return { html, orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy, summary: 'Enter GST % for the order.' };
+      }
+      const html = buildPlaceOrderSummaryHtml(ctxCopy);
+      return {
+        html,
+        orderWizardPrompt: null,
+        placeOrderContext: ctxCopy,
+        needsPlaceOrderConfirmation: true,
+        summary: 'Review your order. Type yes to place or no to cancel.'
+      };
+    }
+    if (interpreted?.action === 'finalize') {
+      return { html: generateHTMLResponse('Order', 'No items added yet. Reply with the number or name of a yarn to add, or start over with "place order".'), orderWizardPrompt: 'choose_yarn_from_supplier', placeOrderContext: ctxCopy };
+    }
     if (interpreted?.action === 'list_index' && !Number.isNaN(interpreted.value) && interpreted.value >= 1 && interpreted.value <= yarnNames.length) {
       const chosen = yarnNames[interpreted.value - 1];
       ctxCopy.collectingYarnName = chosen;
@@ -8696,7 +8779,7 @@ Yarn list (numbered 1 to N):
 ${yarnList || 'No list'}
 
 Return ONLY a JSON object:
-- If user clearly wants to STOP adding items and proceed to order summary/finalize: { "action": "finalize", "value": true }. Examples: "done", "that's all", "that's it", "thats all", "finish", "complete", "no more", "finalize", "i'm done", "im done", "place order", "that is all", "stop adding", "nothing else", "no more items", "thats it".
+- If user clearly wants to STOP adding items and proceed to order summary/finalize: { "action": "finalize", "value": true }. Examples: "done", "yeap done", "yeah done", "yep done", "yes done", "that's all", "that's it", "thats all", "finish", "complete", "no more", "finalize", "i'm done", "im done", "place order", "that is all", "stop adding", "nothing else", "no more items", "thats it".
 - If user is selecting MULTIPLE items by position: { "action": "list_indices", "value": [array of 1-based indices] }. Examples: "2,3 and 5" -> [2,3,5], "1, 2, 3" -> [1,2,3], "numbers 2 3 and 5" -> [2,3,5], "second, third and fifth" -> [2,3,5], "2 and 3 and 5" -> [2,3,5]. Only use list_indices when the user clearly means more than one item.
 - If user is clearly selecting ONE item by position/number: { "action": "list_index", "value": <number 1-based> }. Examples: "the second one" -> 2, "number 3" -> 3, "i want 3" -> 3, "3 onw" or "3 one" (typo) -> 3, "the third one" -> 3, "option 2" -> 2.
 - If user is asking for a colour/keyword to search: { "action": "search_keyword", "value": "<keyword>" } e.g. "something blue" -> "blue", "do you have black" -> "black", "does this supplier have anything in 20-blue" -> "20-blue", "anything in 20-blue" -> "20-blue".
@@ -8740,7 +8823,7 @@ Return ONLY a JSON object:
  * @param {Array<{ _id?: string, id?: string, brandName?: string, name?: string }>} suppliers - List of suppliers (same order as shown to user, 1-based index)
  * @returns {Promise<{ supplierNumber?: number, supplierQuery?: string } | null>}
  */
-const interpretSupplierChoiceWithGPT = async (userMessage, suppliers) => {
+export const interpretSupplierChoiceWithGPT = async (userMessage, suppliers) => {
   const text = String(userMessage || '').trim();
   if (text.length < 1 || !Array.isArray(suppliers) || suppliers.length === 0) return null;
   try {
@@ -9865,16 +9948,29 @@ export const applyYarnPurchaseOrderEdit = async (purchaseOrderId, userMessage, e
   const items = order.poItems || [];
   const orderSupplierId = order.supplier?._id || order.supplier;
 
-  // Complete / done / cancel: handle first so "complete order" exits edit flow and shows only final order (no confirmation table)
-  if (/^(done|cancel|exit|stop|complete)\s*(edit(ing)?|order)?$/.test(msg) || /cancel\s*edit/.test(msg) || /complete\s*(the\s+)?order/.test(msg)) {
-    const isComplete = /complete|done|finish/.test(msg);
+  // Complete / done / cancel / leave: exit edit flow with a friendly "how can I help" style message (no capabilities list)
+  const exitEditPatterns = [
+    /^(done|cancel|exit|stop|complete)\s*(edit(ing)?|order)?$/,
+    /cancel\s*edit/,
+    /complete\s*(the\s+)?order/,
+    /leave\s+it\s*\.?$/,
+    /(?:i\s+)?(?:don't|dont|do\s+not)\s+(?:wanna|want\s+to)\s+edit\s+any\s+more/,
+    /(?:i\s+)?(?:don't|dont|do\s+not)\s+want\s+to\s+edit/,
+    /no\s+more\s+edits?/,
+    /(?:that's|thats)\s+it\s*\.?$/,
+    /(?:that's|thats)\s+all\s*\.?$/,
+    /never\s+mind\s*\.?$/,
+    /(?:i'm|im)\s+done\s*(?:edit(ing)?)?\s*\.?$/,
+    /skip\s*(?:edit(ing)|the\s+edit)?\s*\.?$/,
+    /(?:keep\s+it|leave\s+it)\s*(?:as\s+is)?\s*\.?$/
+  ];
+  const wantsToExitEdit = exitEditPatterns.some((p) => p.test(msg));
+  if (wantsToExitEdit) {
     return {
       html: generateHTMLResponse(
-        isComplete ? 'Order Complete' : 'Edit Cancelled',
-        isComplete
-          ? `Order <strong>${poNumber}</strong> edits are complete. Say "edit order PO-xxx" anytime to edit again.`
-          : `Stopped editing ${poNumber}. You can say "edit order PO-xxx" again to edit another order.`
-      ) + buildOrderDetailsHtml(order),
+        'Edit cancelled',
+        `No problem! Order <strong>${poNumber}</strong> is unchanged. How can I help you?`
+      ),
       editOrderContext: null
     };
   }
@@ -11860,20 +11956,29 @@ export const getSalesData = async (params = {}, options = {}) => {
       const storesInCity = await Store.find({ city: { $regex: cityName, $options: 'i' } }).select('_id storeName city').lean();
       console.log(`[getSalesData] Found ${storesInCity.length} stores in ${cityName}`);
       if (storesInCity.length === 0) {
+        // If term matches a supplier (e.g. "Allen" = Allen Solly), don't treat as city — show helpful message
+        const supplierMatch = await supplierService.querySuppliers({ brandName: cityName }, { limit: 1, page: 1 });
+        const suppliersFound = supplierMatch?.results ?? supplierMatch ?? [];
+        if (suppliersFound.length > 0) {
+          const allCities = await Store.distinct('city');
+          const supplierName = suppliersFound[0].brandName || suppliersFound[0].name || cityName;
+          const cityList = allCities.filter(Boolean).slice(0, 10).join(', ') + (allCities.length > 10 ? '...' : '');
+          return generateHTMLResponse('Yarn supplier, not a store or city', `${supplierName} is a yarn supplier. For sales data, please specify a <strong>store name</strong> or <strong>city</strong>. Available cities include: ${cityList}`);
+        }
         // Try to find similar city names for suggestions
         const allCities = await Store.distinct('city');
-        const similarCities = allCities.filter(c => 
-          c && c.toLowerCase().includes(cityName.toLowerCase()) || 
-          cityName.toLowerCase().includes(c.toLowerCase())
+        const similarCities = allCities.filter(c =>
+          c && (c.toLowerCase().includes(cityName.toLowerCase()) ||
+          cityName.toLowerCase().includes(c.toLowerCase()))
         ).slice(0, 5);
-        
+
         let suggestionMsg = `No stores found in "${cityName}".`;
         if (similarCities.length > 0) {
           suggestionMsg += ` Did you mean: ${similarCities.join(', ')}?`;
         } else {
           suggestionMsg += ` Available cities include: ${allCities.slice(0, 10).join(', ')}${allCities.length > 10 ? '...' : ''}`;
         }
-        
+
         return generateHTMLResponse('No Stores Found', suggestionMsg);
       }
       filter.city = cityName;
@@ -11967,11 +12072,20 @@ export const getSalesData = async (params = {}, options = {}) => {
           { storeId: { $regex: storeName, $options: 'i' } }
         ]
       }).select('_id').lean();
-      
+
       if (store) {
         filter.plant = store._id;
         console.log(`[getSalesData] Found store, set filter.plant`);
       } else {
+        // If term matches a supplier (e.g. "Allen" = Allen Solly), show helpful message instead of "Store not found"
+        const supplierMatch = await supplierService.querySuppliers({ brandName: storeName.trim() }, { limit: 1, page: 1 });
+        const suppliersFound = supplierMatch?.results ?? supplierMatch ?? [];
+        if (suppliersFound.length > 0) {
+          const allCities = await Store.distinct('city');
+          const supplierName = suppliersFound[0].brandName || suppliersFound[0].name || storeName;
+          const cityList = allCities.filter(Boolean).slice(0, 10).join(', ') + (allCities.length > 10 ? '...' : '');
+          return generateHTMLResponse('Yarn supplier, not a store', `${supplierName} is a yarn supplier. For sales data, please specify a <strong>store name</strong> or <strong>city</strong>. Available cities include: ${cityList}`);
+        }
         return generateHTMLResponse('Store Not Found', `Store "${storeName}" not found in the system.`);
       }
     }
@@ -12384,6 +12498,13 @@ export const setAgentFlowSession = (sessionId, flow, context) => {
 /** Clear stored flow when user completes or cancels (e.g. done editing, order placed). */
 export const clearAgentFlowSession = (sessionId) => {
   if (sessionId) agentFlowBySession.delete(sessionId);
+};
+
+/** Clear all session data (flow + pending confirmations). Use when user starts a new chat. */
+export const clearSession = (sessionId) => {
+  if (!sessionId) return;
+  agentFlowBySession.delete(sessionId);
+  pendingConfirmations.delete(sessionId);
 };
 
 /** Set pending "place yarn order" confirmation so that when user says "yes" we create the PO */

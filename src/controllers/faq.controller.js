@@ -86,6 +86,21 @@ const askQuestion = catchAsync(async (req, res) => {
 });
 
 /**
+ * End chat session: clear conversation history and agent flow so the next message starts a new session.
+ * @route POST /v1/faq/end-session
+ * @param {Object} req.body - { sessionId?: string } (optional; if provided, that session is cleared)
+ * @returns {Object} 200 - { status, message }
+ */
+const endSession = catchAsync(async (req, res) => {
+  const sessionId = req.body?.sessionId;
+  faqService.endSession(sessionId);
+  res.status(httpStatus.OK).json({
+    status: 'success',
+    message: 'Session ended. Next message will start a new chat.'
+  });
+});
+
+/**
  * Ask and get text-only summary for messengers (Telegram, WhatsApp).
  * Same FAQ/ask flow as /v1/faq/ask; response is plain text, no HTML.
  * @route POST /v1/faq/ask-summary
@@ -174,6 +189,7 @@ const clearAllFaqs = catchAsync(async (req, res) => {
 export default {
   trainFaq,
   askQuestion,
+  endSession,
   askSummary,
   getFaqVectors,
   deleteFaqVector,

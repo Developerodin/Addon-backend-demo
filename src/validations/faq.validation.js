@@ -73,6 +73,12 @@ const askQuestion = {
   }),
 };
 
+const endSession = {
+  body: Joi.object().keys({
+    sessionId: Joi.string().optional().max(128).trim(),
+  }),
+};
+
 const getFaqVectors = {
   query: Joi.object().keys({
     page: Joi.number().integer().min(1).default(1),
@@ -90,6 +96,7 @@ const deleteFaqVector = {
 export default {
   trainFaq,
   askQuestion,
+  endSession,
   getFaqVectors,
   deleteFaqVector,
 };

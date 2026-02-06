@@ -28,6 +28,17 @@ router.post(
 );
 
 /**
+ * @route POST /v1/faq/end-session
+ * @desc End current chat session (clear history and flow). Next message will start a new session.
+ * @access Public
+ */
+router.post(
+  '/end-session',
+  validate(faqValidation.endSession),
+  faqController.endSession
+);
+
+/**
  * @route POST /v1/faq/ask-summary
  * @desc Same as /ask but returns text-only summary for Telegram/WhatsApp (no HTML)
  * @access Public
